@@ -9,11 +9,12 @@ import math
 import threading
 import wave
 import numpy as np
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
-from music import Project, NAMES, parse_jianpu, pitch_name, numbered
+from music import Note, Project, NAMES, parse_jianpu, pitch_name, numbered
+import json
 import guitar
 from score_cleanup import organize
 from .alphatex_builder import to_alphatex
@@ -25,16 +26,19 @@ INSTALL_ROOT = APP_ROOT.parents[1]
 STATIC_ROOT = APP_ROOT / 'static'
 EXAMPLE_PROJECT = INSTALL_ROOT / 'examples' / 'demo-project.json'
 SIMULATION_ROOT = INSTALL_ROOT / 'work' / 'simulation_demo'
+REPERTOIRE_AUDIO_ROOT = INSTALL_ROOT / 'work' / 'repertoire_audio'
+REPERTOIRE_MANIFEST = REPERTOIRE_AUDIO_ROOT / 'repertoire_manifest.json'
+_STEM_AUDIO_CACHE: dict[tuple[str, int, int], np.ndarray] = {}
 
 try:
     from subpkgs.guitar_reharm import (reharmonize_progression, arrange_advanced,
-        roman_numeral, check_melody_clash, generate_voicings,
+        roman_numeral, check_melody_clash, generate_voicings, suggest_bar_substitutions,
         REHARMONIZE_PRESETS, ADVANCED_STYLES, synthesize_realistic_guitar)
 except ModuleNotFoundError as exc:
     if exc.name not in {'subpkgs.guitar_reharm', 'subpkgs.guitar_reharm.reharmonizer',
                          'subpkgs.guitar_reharm.arrangement_grooves'}:
         raise
-    reharmonize_progression = arrange_advanced = synthesize_realistic_guitar = None
+    reharmonize_progression = arrange_advanced = synthesize_realistic_guitar = suggest_bar_substitutions = None
     REHARMONIZE_PRESETS, ADVANCED_STYLES = {}, ()
 try:
     from subpkgs.singing_lyrics import align_lyrics_to_notes
@@ -49,7 +53,7 @@ def _implemented(function):
 
 
 def _refresh_backends():
-    global reharmonize_progression, arrange_advanced, roman_numeral, check_melody_clash, generate_voicings
+    global reharmonize_progression, arrange_advanced, roman_numeral, check_melody_clash, generate_voicings, suggest_bar_substitutions
     global REHARMONIZE_PRESETS, ADVANCED_STYLES, synthesize_realistic_guitar, align_lyrics_to_notes
     global NATIVE, PRESETS, STYLES
     try:
@@ -60,6 +64,7 @@ def _refresh_backends():
         roman_numeral = getattr(gr, 'roman_numeral', None)
         check_melody_clash = getattr(gr, 'check_melody_clash', None)
         generate_voicings = getattr(gr, 'generate_voicings', None)
+        suggest_bar_substitutions = getattr(gr, 'suggest_bar_substitutions', None)
         REHARMONIZE_PRESETS = getattr(gr, 'REHARMONIZE_PRESETS', {})
         ADVANCED_STYLES = getattr(gr, 'ADVANCED_STYLES', ())
         synthesize_realistic_guitar = getattr(gr, 'synthesize_realistic_guitar', None)
@@ -94,16 +99,20 @@ class Session:
     slap_x: bool = False
     palm_mute: bool = False
     embellish_hp: bool = False
-    intro_mode: str = 'none'
+    intro_mode: str = 'chord_melody'
     raw_lyrics: str = ''
     note_lyrics: list[str] = field(default_factory=list)
     bar_analysis: list[dict] = field(default_factory=list)
     arrangement: dict = field(default_factory=dict)
     undo_stack: list = field(default_factory=list)
+    demo_mode: str = 'mandarin_pop'
+    _cached_guitar_samples: tuple | None = field(default=None, repr=False)
 
 
 def _snapshot(session):
-    return Session(**{key: deepcopy(value) for key, value in vars(session).items() if key != 'undo_stack'})
+    # The cached (sr, samples) pair is read-only, so snapshots share it instead of deep-copying audio.
+    return Session(**{key: (value if key == '_cached_guitar_samples' else deepcopy(value))
+                      for key, value in vars(session).items() if key != 'undo_stack'})
 
 
 def _align(candidate, timestamps=None):
@@ -113,7 +122,7 @@ def _align(candidate, timestamps=None):
     if not _implemented(align_lyrics_to_notes):
         raise HTTPException(503, 'Lyric alignment dependency is unavailable')
     vocal_path = candidate.project.audio.get('vocals')
-    available = vocal_path if vocal_path and Path(vocal_path).is_file() else None
+    available = vocal_path if (vocal_path and Path(vocal_path).is_file() and not candidate.raw_lyrics.strip() and timestamps is None) else None
     alignment = align_lyrics_to_notes(candidate.project, raw_lyrics=candidate.raw_lyrics,
                                      word_timestamps=timestamps, vocal_audio_path=available)
     candidate.note_lyrics = alignment['note_lyrics']
@@ -122,6 +131,7 @@ def _align(candidate, timestamps=None):
 
 def _rebuild(candidate):
     _refresh_backends()
+    candidate._cached_guitar_samples = None
     candidate.project.validate()
     measure = int(candidate.project.meter.split('/')[0])*4/int(candidate.project.meter.split('/')[1])
     count = math.ceil(max((n.start+n.duration for n in candidate.project.notes), default=0)/measure)
@@ -175,6 +185,13 @@ def _rebuild(candidate):
                 chord_tones=sorted({pc for r in reports for pc in r['chord_tones']}),
                 notes_checked=sum(r['notes_checked'] for r in reports))
             row['voicings'] = generate_voicings(row['chord'], candidate.capo)
+            if _implemented(suggest_bar_substitutions) and row['chord'] != 'N.C.':
+                prev_c = analysis[index-1]['chord'] if index > 0 else None
+                next_c = analysis[index+1]['chord'] if index+1 < len(analysis) else None
+                row['candidates'] = suggest_bar_substitutions(
+                    row['chord'], prev_c, next_c, candidate.project.tonic,
+                    candidate.project.notes, index*measure, (index+1)*measure
+                )[:8]
         arrangement = arrange_advanced(candidate.project, chords=[row['chord'] for row in analysis],
             style=candidate.style, capo=candidate.capo, custom_voicings=candidate.custom_voicings,
             split_chords=[row['split_segments'] for row in analysis], passing_bass=candidate.passing_bass,
@@ -210,18 +227,140 @@ def _rebuild(candidate):
     candidate.bar_analysis, candidate.arrangement = analysis, arrangement
 
 
-def _initial_session():
-    project = None
-    if EXAMPLE_PROJECT.is_file():
-        project = Project.load(EXAMPLE_PROJECT)
-    else:
-        notes, _ = parse_jianpu('1:1 3:1 5:2 | 6:1 5:1 3:2')
-        project = Project(title='手动旋律', notes=notes)
-    if not project.reference_notes:
-        project.reference_notes = deepcopy(project.notes)
-    chords = guitar.suggest(project, NAMES.index(project.tonic))
+REPERTOIRE_CATALOG = {
+    'canon_in_d': dict(title='John Denver《Take Me Home, Country Roads》· 世界民谣吉他真人原唱全曲 (3:16)',
+        subtitle='John Denver · 3:16 民谣木吉他传世名曲真人原唱全曲', category='世界名曲真人原唱全曲'),
+    'romance_amor': dict(title='Eric Clapton《Tears in Heaven (Unplugged)》· 殿堂级木吉他真人原唱全曲 (4:36)',
+        subtitle='Eric Clapton Unplugged · 4:36 艺术木吉他真人弹唱全曲', category='世界名曲真人原唱全曲'),
+    'scarborough_fair': dict(title='Simon & Garfunkel《Scarborough Fair》· 英伦指弹民谣真人原唱全曲 (3:12)',
+        subtitle='Simon & Garfunkel · 3:12 真人双声部原唱全曲', category='世界名曲真人原唱全曲'),
+    'greensleeves': dict(title='The Brothers Four《Lady Greensleeves》· 文艺复兴古典吉他真人原唱全曲 (3:05)',
+        subtitle='The Brothers Four · 3:05 真人合唱与古典吉他全曲', category='世界名曲真人原唱全曲'),
+    'mandarin_pop': dict(title='赵雷《成都》· 华语民谣木吉他真人原唱完整全曲 (5:28)',
+        subtitle='赵雷 · 5:28 华语诗意木吉他弹唱真人原唱全曲', category='华语名曲真人原唱全曲'),
+    'real_vocal': dict(title="Karissa Hobbs《Let's Go Fishin'》· 乡村木吉他女声实录完整全曲 (2:13)",
+        subtitle='Karissa Hobbs · 2:13 录音室乡村女声与木吉他全曲', category='真人原声实录全曲'),
+}
+
+_MANIFEST_CACHE: dict | None = None
+
+
+def _get_repertoire_manifest() -> dict:
+    global _MANIFEST_CACHE
+    if _MANIFEST_CACHE is not None:
+        return _MANIFEST_CACHE
+    if REPERTOIRE_MANIFEST.is_file():
+        try:
+            _MANIFEST_CACHE = json.loads(REPERTOIRE_MANIFEST.read_text(encoding='utf-8'))
+            return _MANIFEST_CACHE
+        except Exception:
+            pass
+    return {}
+
+
+# Fallback synthesized pieces used only when the full-length vocal repertoire manifest is absent.
+_DEMO_PIECES = {
+    'canon_in_d': dict(meter='4/4', capo=2, bpm=78.0, style=-1, clip_duration=50.0, passing_bass=True, embellish_hp=True,
+        jianpu="3':2 2':2 | 1':2 7:2 | 6:2 5:2 | 6:2 7:2 | 1':1 3':1 2':1 7:1 | 1':1 5:1 6:1 4:1 | 3:1 6:1 5:1 4:1 | "
+               "5:1 2':1 7:1 5:1 | 1':1 7:0.5 1':0.5 7:1 5:1 | 6:1 1':1 5:1 3:1 | 4:1 6:1 5:0.5 4:0.5 3:1 | "
+               "2:1 4:1 3:1 2:1 | 3:1 1':1 7:1 6:1 | 5:1 3:1 4:1 5:1 | 6:1 4:1 5:1 7:1 | 1':4",
+        chords=['C', 'G/B', 'Am7', 'Em7', 'Fmaj7', 'C/E', 'Fmaj7', 'G7sus4',
+                'C', 'G/B', 'Am7', 'Em7', 'Fmaj7', 'C/E', 'Dm7', 'C'], lyrics=''),
+    'romance_amor': dict(meter='3/4', capo=0, bpm=86.0, style=-1, clip_duration=36.0, passing_bass=False, embellish_hp=False,
+        jianpu="3':1 3':1 3':1 | 3':1 2':1 1':1 | 1':1 7:1 6:1 | 6:1 1':1 3':1 | 7:1 7:1 7:1 | 7:1 1':1 7:1 | "
+               "6:1 3:1 6:1 | 6:3 | 3':1 3':1 3':1 | 4':1 3':1 2':1 | 2':1 1':1 7:1 | 1':1 3':1 5':1 | "
+               "3':1 2':1 1':1 | 2':1 1':1 7:1 | 6:1 7:1 5:1 | 6:3",
+        chords=['Am', 'Am', 'Dm', 'Am', 'E7', 'E7', 'Am', 'Am',
+                'Am', 'Dm', 'G7', 'C', 'Am', 'Dm', 'E7', 'Am'], lyrics=''),
+    'scarborough_fair': dict(meter='3/4', capo=2, bpm=88.0, style=0, clip_duration=35.0, passing_bass=True, embellish_hp=True,
+        jianpu="6,:2 6,:1 | 3:2 3:1 | 7,:1.5 1:0.5 7,:1 | 6,:3 | 3:1 3:1 5:1 | 6:2 5:1 | 3:1 4:1 2:1 | 3:3 | "
+               "6:1 6:1 6:1 | 5:2 3:1 | 3:1 2:1 1:1 | 7,:2 5,:1 | 6,:2 3:1 | 2:2 1:1 | 7,:1 6,:1 5,:1 | 6,:3",
+        chords=['Am', 'Am', 'G', 'Am', 'C', 'Am', 'C', 'G',
+                'Am', 'Am', 'C', 'G', 'Am', 'G', 'Em7', 'Am'],
+        lyrics='Are you going to Scar-bo-rough Fair Pars-ley sage rose-ma-ry and thyme '
+               'Re-mem-ber me to one who lives there She once was a true love of mine'),
+    'greensleeves': dict(meter='3/4', capo=0, bpm=90.0, style=-1, clip_duration=34.0, passing_bass=False, embellish_hp=True,
+        jianpu="6,:1 1:1 2:1 | 3:1.5 4:0.5 3:1 | 2:2 7,:1 | 5,:1.5 6,:0.5 7,:1 | 1:2 6,:1 | 6,:1.5 5,:0.5 6,:1 | "
+               "7,:2 5,:1 | 3,:3 | 5:3 | 5:1.5 4:0.5 3:1 | 2:2 7,:1 | 5,:1.5 6,:0.5 7,:1 | 1:2 6,:1 | "
+               "6,:1.5 5,:0.5 6,:1 | 7,:1.5 6,:0.5 5,:1 | 6,:3",
+        chords=['Am', 'G', 'Am', 'E7', 'Am', 'G', 'Em7', 'Am',
+                'C', 'G/B', 'Am', 'E7', 'C', 'G/B', 'Em7', 'Am'],
+        lyrics='A-las my love you do me wrong to cast me off dis-cour-teous-ly '
+               'Green-sleeves was all my joy Green-sleeves was my de-light and my heart of gold'),
+    'mandarin_pop': dict(meter='4/4', capo=0, bpm=92.0, style=0, clip_duration=32.0, passing_bass=True, embellish_hp=False,
+        jianpu='3:1 5:1 5:1.5 6:0.5 | 5:1 3:1 2:1 1:1 | 6,:1 1:1 2:1 3:1 | 2:1.5 1:0.5 2:2 | '
+               '3:1 5:1 5:1.5 6:0.5 | 5:1 3:1 2:1 1:1 | 6,:1 1:1 2:1 3:1 | 2:1.5 1:0.5 1:2 | '
+               "1':1 7:1 6:1 5:1 | 6:1 5:1 3:1 2:1 | 6,:1 1:1 2:1 3:1 | 2:1.5 1:0.5 1:2",
+        chords=['C', 'G/B', 'Am7', 'G', 'C', 'G/B', 'Am7', 'Fmaj7', 'Fmaj7', 'C/E', 'Dm7', 'C'],
+        lyrics='故事的小黄花飘着童年歌谣守候着窗外的微风吹过仲夏的晴空直到永远在心间停留着不散去'),
+}
+
+
+def _initial_session(demo_mode: str = 'mandarin_pop'):
+    _refresh_backends()
+    if demo_mode == 'manual':
+        demo_mode = 'mandarin_pop'
+    manifest = _get_repertoire_manifest()
+    if demo_mode in manifest:
+        entry = manifest[demo_mode]
+        vocals_wav = Path(entry['vocals_wav'])
+        acc_wav = Path(entry['no_vocals_wav'])
+        if vocals_wav.is_file():
+            notes = [Note(**n) for n in entry['notes']]
+            project = Project(
+                title=entry['title'],
+                tonic=entry['tonic'],
+                meter=entry['meter'],
+                bpm=float(entry['bpm']),
+                beat_origin=float(entry['beat_origin']),
+                clip_duration=float(entry['clip_duration']),
+                source=entry['source'],
+                audio={'vocals': str(vocals_wav), 'no_vocals': str(acc_wav) if acc_wav.is_file() else entry['source']},
+                notes=notes,
+                reference_notes=deepcopy(notes),
+            )
+            chords = list(entry['base_chords'])
+            style_name = entry.get('style') if entry.get('style') in STYLES else STYLES[0]
+            preset_name = entry.get('preset') if entry.get('preset') in PRESETS else 'original'
+            note_lyrics = list(entry['note_lyrics'])[:len(notes)]
+            if len(note_lyrics) < len(notes):
+                note_lyrics.extend([''] * (len(notes) - len(note_lyrics)))
+            session = Session(
+                project=project,
+                base_chords=chords,
+                custom_voicings=[None] * len(chords),
+                preset=preset_name,
+                style=style_name,
+                capo=int(entry.get('capo', 0)),
+                passing_bass=True,
+                embellish_hp=(style_name == '抒情琶音'),
+                intro_mode='none',
+                raw_lyrics=entry['raw_lyrics'],
+                note_lyrics=note_lyrics,
+                demo_mode=demo_mode,
+            )
+            _rebuild(session)
+            return session
+
+    if demo_mode not in _DEMO_PIECES:
+        demo_mode = 'mandarin_pop'
+    piece = _DEMO_PIECES[demo_mode]
+    notes, _ = parse_jianpu(piece['jianpu'], tonic='C', bpm=piece['bpm'])
+    raw_lyrics = piece['lyrics']
+    # Chinese lyrics map one character per note; hyphenated English maps one syllable per note.
+    tokens = raw_lyrics.replace('-', ' ').split() if ' ' in raw_lyrics else list(raw_lyrics)
+    note_lyrics = tokens[:len(notes)] + [''] * max(0, len(notes) - len(tokens))
+    project = Project(
+        title=REPERTOIRE_CATALOG[demo_mode]['title'],
+        tonic='C', meter=piece['meter'], bpm=piece['bpm'], beat_origin=0.0, clip_duration=piece['clip_duration'],
+        audio={},
+        notes=notes, reference_notes=deepcopy(notes),
+    )
+    chords = list(piece['chords'])
     session = Session(project=project, base_chords=chords, custom_voicings=[None]*len(chords),
-                      note_lyrics=['']*len(project.notes))
+                      raw_lyrics=raw_lyrics, note_lyrics=note_lyrics, style=STYLES[piece['style']],
+                      capo=piece['capo'], passing_bass=piece['passing_bass'], embellish_hp=piece['embellish_hp'],
+                      demo_mode=demo_mode)
     _rebuild(session)
     return session
 
@@ -260,6 +399,8 @@ def get_state_payload(session):
         alphatex=to_alphatex(project, session.arrangement, session.note_lyrics),
         publication_html=render_publication_score_html(project, session.arrangement, session.note_lyrics, session.bar_analysis),
         gpu_available=_gpu_available(), simulation_demos=_simulation_demos()['demos'],
+        has_real_vocal=bool(project.audio.get('vocals') and Path(project.audio['vocals']).is_file()),
+        repertoire=REPERTOIRE_CATALOG, active_demo=session.demo_mode,
         accompaniment_backend='advanced' if NATIVE else 'basic triads',
         synthesis_backend='native' if _implemented(synthesize_realistic_guitar) else 'fallback plucked-string synthesis')
     payload['notes_table'] = [dict(index=i, pitch=int(n.pitch), pitch_name=pitch_name(n.pitch),
@@ -319,7 +460,7 @@ class CleanupRequest(RequestModel):
 
 
 class DemoRequest(RequestModel):
-    demo: Literal['manual'] = 'manual'
+    demo: Literal['manual', 'canon_in_d', 'romance_amor', 'scarborough_fair', 'greensleeves', 'mandarin_pop', 'real_vocal'] = 'manual'
 
 
 def _validate_frets(frets):
@@ -328,6 +469,9 @@ def _validate_frets(frets):
 
 
 def _guitar_samples(session, sr=44100):
+    cached = session._cached_guitar_samples
+    if cached is not None and cached[0] == sr:
+        return cached[1]
     _refresh_backends()
     if _implemented(synthesize_realistic_guitar):
         samples = np.asarray(synthesize_realistic_guitar(session.project, session.arrangement, out_wav_path=None, sr=sr), dtype=np.float32)
@@ -366,6 +510,8 @@ def _guitar_samples(session, sr=44100):
             samples[offset:offset+count, 1] += (signal*math.sqrt(.8-.6*pan)).astype(np.float32)
     if samples.ndim != 2 or samples.shape[1] != 2 or not np.isfinite(samples).all():
         raise ValueError('Expected finite stereo guitar audio')
+    samples.flags.writeable = False
+    session._cached_guitar_samples = (sr, samples)
     return samples
 
 
@@ -388,9 +534,98 @@ def _wav_bytes(samples, sr=44100):
     return buffer.getvalue()
 
 
+def _load_stem_audio(path: str | Path, sr: int, origin_sec: float) -> np.ndarray:
+    origin = max(0, round(origin_sec * sr))
+    key = (str(path), sr, origin)
+    cached = _STEM_AUDIO_CACHE.get(key)
+    if cached is not None:
+        return cached
+    import soundfile as sf
+    from scipy.signal import resample_poly
+    audio, source_sr = sf.read(str(path), always_2d=True, dtype='float32')
+    if audio.shape[1] == 1:
+        audio = np.repeat(audio, 2, axis=1)
+    elif audio.shape[1] != 2:
+        audio = audio[:, :2]
+    if source_sr != sr:
+        divisor = math.gcd(source_sr, sr)
+        audio = resample_poly(audio, sr // divisor, source_sr // divisor).astype('float32')
+    audio = np.ascontiguousarray(audio[origin:], dtype=np.float32)
+    audio.flags.writeable = False
+    if len(_STEM_AUDIO_CACHE) < 24:
+        _STEM_AUDIO_CACHE[key] = audio
+    return audio
+
+
+def _vocal_only_samples(session, sr=44100):
+    path = session.project.audio.get('vocals')
+    guitar_len = len(_guitar_samples(session, sr))
+    if not path or not Path(path).is_file():
+        lead_events = []
+        measure = session.arrangement.get('measure_beats', 4.0)
+        for n in session.project.notes:
+            # Lift the lead an octave above the C3–E4 chord voicings onto the bell-register strings 1/2,
+            # then transpose by the capo so it sounds in the same key as the capoed accompaniment.
+            pitch = (int(n.pitch) + 12 if int(n.pitch) < 67 else int(n.pitch)) + int(session.capo)
+            string = 1 if pitch >= 64 else 2
+            tuning = {1: 64, 2: 59}[string]
+            fret = max(0, min(24, pitch - tuning))
+            # Concert phrasing: accent downbeats, sustain long notes, and roll the downbeat slightly behind the chord.
+            beat_in_bar = float(n.start % measure)
+            vel = min(102, max(72, round(88 + (6 if abs(beat_in_bar) < 0.1 else 0) + (4 if n.duration >= 1.5 else -3))))
+            start = float(n.start) + (0.015 if abs(beat_in_bar) < 0.05 and n.start > 0 else 0.0)
+            lead_events.append(dict(
+                bar=int(n.start // measure), beat=beat_in_bar, start=start,
+                duration=float(n.duration), string=string, fret=fret, pitch=pitch,
+                velocity=vel, technique='CM',
+            ))
+        if lead_events and _implemented(synthesize_realistic_guitar):
+            lead_arr = dict(session.arrangement, events=lead_events)
+            lead_samples = np.asarray(synthesize_realistic_guitar(session.project, lead_arr, out_wav_path=None, sr=sr), dtype=np.float32)
+            length = max(len(lead_samples), guitar_len)
+            return np.pad(lead_samples, ((0, length-len(lead_samples)), (0, 0))) * 0.58
+        return np.zeros((max(1, guitar_len), 2), dtype=np.float32)
+    vocal = _load_stem_audio(path, sr, session.project.beat_origin)
+    length = max(len(vocal), guitar_len)
+    return np.pad(vocal[:length], ((0, max(0, length-len(vocal))), (0, 0))) * 0.85
+
+
+def _backing_samples(session, sr=44100):
+    path = session.project.audio.get('no_vocals') or session.project.source
+    guitar_len = len(_guitar_samples(session, sr))
+    if not path or not Path(path).is_file():
+        return np.zeros((max(1, guitar_len), 2), dtype=np.float32)
+    backing = _load_stem_audio(path, sr, session.project.beat_origin)
+    length = max(len(backing), guitar_len)
+    return np.pad(backing[:length], ((0, max(0, length-len(backing))), (0, 0))) * 0.75
+
+
 def _vocal_mix_samples(session, sr=44100):
     path = session.project.audio.get('vocals')
+    guitar_samples = _guitar_samples(session, sr)
     if not path or not Path(path).is_file():
+        # Synthesize the song's own lead melody on a studio-sampled lead acoustic guitar so key & BPM match 100%
+        lead_events = []
+        measure = session.arrangement.get('measure_beats', 4.0)
+        for n in session.project.notes:
+            pitch = (int(n.pitch) + 12 if int(n.pitch) < 67 else int(n.pitch)) + int(session.capo)
+            string = 1 if pitch >= 64 else 2
+            tuning = {1: 64, 2: 59}[string]
+            fret = max(0, min(24, pitch - tuning))
+            beat_in_bar = float(n.start % measure)
+            vel = min(102, max(72, round(88 + (6 if abs(beat_in_bar) < 0.1 else 0) + (4 if n.duration >= 1.5 else -3))))
+            start = float(n.start) + (0.015 if abs(beat_in_bar) < 0.05 and n.start > 0 else 0.0)
+            lead_events.append(dict(
+                bar=int(n.start // measure), beat=beat_in_bar, start=start,
+                duration=float(n.duration), string=string, fret=fret, pitch=pitch,
+                velocity=vel, technique='CM',
+            ))
+        if lead_events and _implemented(synthesize_realistic_guitar):
+            lead_arr = dict(session.arrangement, events=lead_events)
+            lead_samples = np.asarray(synthesize_realistic_guitar(session.project, lead_arr, out_wav_path=None, sr=sr), dtype=np.float32)
+            length = max(len(lead_samples), len(guitar_samples))
+            return (np.pad(lead_samples, ((0, length-len(lead_samples)), (0, 0))) * 0.58 +
+                    np.pad(guitar_samples, ((0, length-len(guitar_samples)), (0, 0))) * 0.82)
         for fallback in [
             SIMULATION_ROOT / '02_extracted_lead_vocal.wav',
             SIMULATION_ROOT / 'real_singer_excerpt_20s.wav',
@@ -410,7 +645,6 @@ def _vocal_mix_samples(session, sr=44100):
     if source_sr != sr:
         divisor = math.gcd(source_sr, sr)
         vocal = resample_poly(vocal, sr//divisor, source_sr//divisor)
-    guitar_samples = _guitar_samples(session, sr)
     origin = round(session.project.beat_origin*sr)
     if origin >= 0:
         guitar_samples = np.pad(guitar_samples, ((origin, 0), (0, 0)))
@@ -428,6 +662,12 @@ def create_app() -> FastAPI:
 
     def snapshot():
         with application.state.session_lock:
+            return _snapshot(application.state.session)
+
+    def audio_snapshot():
+        # Synthesize guitar once per arrangement on the live session; concurrent stem requests wait and reuse it.
+        with application.state.session_lock:
+            _guitar_samples(application.state.session)
             return _snapshot(application.state.session)
 
     def mutate(operation):
@@ -457,6 +697,11 @@ def create_app() -> FastAPI:
     @application.post('/api/reharmonize')
     def reharmonize(request: ReharmonizeRequest):
         def operation(candidate):
+            if any(k in request.model_fields_set for k in ('preset', 'capo', 'tonic', 'split_bar')) and 'custom_voicings' not in request.model_fields_set:
+                candidate.custom_voicings = [None]*len(candidate.base_chords)
+                candidate.custom_segment_voicings.clear()
+            if 'preset' in request.model_fields_set and 'custom_chords' not in request.model_fields_set:
+                candidate.custom_chords.clear()
             for key in request.model_fields_set:
                 value = getattr(request, key)
                 if value is None:
@@ -471,8 +716,6 @@ def create_app() -> FastAPI:
                     import re
                     if any(re.fullmatch(r'\d+(?::\d+)?', identity) is None for identity in value):
                         raise ValueError('Chord override keys must be bar or bar:segment indices')
-                if key == 'intro_mode' and value in ('nc', 'groove'):
-                    value = 'none'
                 setattr(candidate.project if key in ('title', 'tonic', 'bpm', 'meter') else candidate, key, value)
         return mutate(operation)
 
@@ -489,6 +732,10 @@ def create_app() -> FastAPI:
             identity = str(bar_idx)+(f':{request.segment}' if request.segment is not None else '')
             if request.chord is not None:
                 candidate.custom_chords[identity] = request.chord
+                if request.frets is None:
+                    if request.segment is None and bar_idx < len(candidate.custom_voicings):
+                        candidate.custom_voicings[bar_idx] = None
+                    candidate.custom_segment_voicings.pop(identity, None)
             if request.frets is not None:
                 _validate_frets(request.frets)
                 if request.segment is None:
@@ -583,17 +830,25 @@ def create_app() -> FastAPI:
     @application.post('/api/load_demo')
     def load_demo(request: DemoRequest = Body(default=DemoRequest())):
         def operation(candidate):
-            fresh = _initial_session()
+            fresh = _initial_session(request.demo)
             candidate.__dict__.update(vars(fresh))
         return mutate(operation)
 
     @application.get('/api/audio/guitar-only.wav')
     def guitar_audio():
-        return Response(content=_wav_bytes(_guitar_samples(snapshot())), media_type='audio/wav')
+        return Response(content=_wav_bytes(_guitar_samples(audio_snapshot())), media_type='audio/wav')
+
+    @application.get('/api/audio/vocal-only.wav')
+    def vocal_only_audio():
+        return Response(content=_wav_bytes(_vocal_only_samples(audio_snapshot())), media_type='audio/wav')
+
+    @application.get('/api/audio/backing.wav')
+    def backing_audio():
+        return Response(content=_wav_bytes(_backing_samples(audio_snapshot())), media_type='audio/wav')
 
     @application.get('/api/audio/vocal-guitar-mix.wav')
     def vocal_audio():
-        return Response(content=_wav_bytes(_vocal_mix_samples(snapshot())), media_type='audio/wav')
+        return Response(content=_wav_bytes(_vocal_mix_samples(audio_snapshot())), media_type='audio/wav')
 
     @application.get('/api/simulation_demos')
     def simulations():
@@ -608,6 +863,117 @@ def create_app() -> FastAPI:
         if path.parent != SIMULATION_ROOT.resolve():
             raise HTTPException(404, 'Unknown simulation recording')
         return FileResponse(path, media_type='audio/wav')
+
+    application.state.jobs = {}
+
+    @application.post('/api/analyze_audio')
+    async def analyze_audio(file: UploadFile = File(...), lyrics: str = Form('')):
+        import uuid
+        job_id = uuid.uuid4().hex[:10]
+        upload_dir = INSTALL_ROOT / 'work' / 'uploads' / job_id
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = upload_dir / (Path(file.filename or 'song.wav').name)
+        audio_path.write_bytes(await file.read())
+        application.state.jobs[job_id] = {'status': 'running', 'progress': 0.1, 'message': '正在分离人声与伴奏...'}
+
+        def _worker():
+            try:
+                from subpkgs.stem_mir import separate_stems, track_beats_and_downbeats, recognize_accompaniment_chords
+                from subpkgs.singing_lyrics import transcribe_vocal_notes
+                import soundfile as sf
+
+                stems = separate_stems(audio_path, upload_dir / 'stems', prefer_cuda=True)
+                application.state.jobs[job_id] = {'status': 'running', 'progress': 0.4, 'message': '正在提取人声主旋律与生成吉他和弦...'}
+                beat_info = track_beats_and_downbeats(audio_path, prefer_cuda=True)
+                bpm, beat_origin, meter = float(beat_info['bpm']), float(beat_info['beat_origin']), str(beat_info['meter'])
+                while bpm > 132.0:
+                    bpm *= 0.5
+                while bpm < 68.0:
+                    bpm *= 2.0
+                spb = 60.0 / bpm
+                beat_origin = beat_origin % spb
+                info = sf.info(str(audio_path))
+                clip_duration = float(info.duration)
+                tx = transcribe_vocal_notes(stems['vocals'], bpm=bpm, beat_origin=beat_origin, prefer_cuda=True)
+                raw_notes = sorted(tx['notes'], key=lambda n: n.raw_start)
+                slot_map = {}
+                for n in raw_notes:
+                    if n.raw_start < beat_origin:
+                        continue
+                    beat_pos = (n.raw_start - beat_origin) / spb
+                    beat_dur = n.raw_duration / spb
+                    if beat_dur < 0.22:
+                        continue
+                    slot = max(0, int(round(beat_pos / 0.5)))
+                    if slot not in slot_map or beat_dur > slot_map[slot].duration:
+                        q_start = slot * 0.5
+                        q_dur = min(4.0, max(0.5, round(beat_dur / 0.5) * 0.5))
+                        slot_map[slot] = Note(
+                            pitch=int(n.pitch), start=float(q_start), duration=float(q_dur),
+                            raw_start=float(beat_origin + q_start * spb), raw_duration=float(q_dur * spb),
+                        )
+                prelim = [slot_map[k] for k in sorted(slot_map.keys())]
+                for idx_n, n in enumerate(prelim):
+                    if idx_n + 1 < len(prelim):
+                        n.duration = max(0.5, min(n.duration, prelim[idx_n + 1].start - n.start))
+                        n.raw_duration = n.duration * spb
+                try:
+                    notes = organize(prelim, bpm, beat_origin, 'auto') if prelim else []
+                except Exception:
+                    notes = prelim
+                for n in notes:
+                    n.raw_start = round(beat_origin + n.start * spb, 4)
+                    n.raw_duration = round(n.duration * spb, 4)
+                natural_pcs = {0, 2, 4, 5, 7, 9}
+                scale = {0, 2, 4, 5, 7, 9, 11}
+                tonic_pc = max(
+                    range(12),
+                    key=lambda k: sum(n.duration for n in notes if (n.pitch - k) % 12 in scale) + (0.15 if k in natural_pcs else 0.0)
+                ) if notes else 0
+                tonic = NAMES[tonic_pc]
+                project = Project(
+                    title=audio_path.stem, tonic=tonic, meter=meter, bpm=bpm, beat_origin=beat_origin,
+                    clip_duration=clip_duration, source=str(audio_path),
+                    audio={'vocals': stems['vocals'], 'no_vocals': stems['accompaniment']},
+                    notes=notes, reference_notes=deepcopy(notes),
+                )
+                if notes:
+                    vocal_chords = guitar.suggest(project, tonic_pc, minor=False)
+                    turnaround = [
+                        guitar.chord_name(tonic_pc, False),
+                        guitar.chord_name(tonic_pc + 7, False),
+                        guitar.chord_name(tonic_pc + 9, True),
+                        guitar.chord_name(tonic_pc + 5, False),
+                    ]
+                    base_chords = [
+                        (turnaround[i % 4] if (not ch or ch == 'N.C.') else ch)
+                        for i, ch in enumerate(vocal_chords)
+                    ]
+                else:
+                    chord_info = recognize_accompaniment_chords(stems['accompaniment'], bpm=bpm, beat_origin=beat_origin, meter=meter, tonic=tonic)
+                    base_chords = chord_info['chords']
+                def _apply(candidate):
+                    candidate.demo_mode = 'upload'
+                    candidate.project = project
+                    candidate.base_chords = base_chords
+                    candidate.custom_voicings = [None]*len(base_chords)
+                    candidate.raw_lyrics = lyrics
+                    candidate.note_lyrics = ['']*len(notes)
+                    if lyrics:
+                        _align(candidate)
+                mutate(_apply)
+                application.state.jobs[job_id] = {'status': 'done', 'progress': 1.0, 'message': '已完成分析'}
+            except Exception as exc:
+                application.state.jobs[job_id] = {'status': 'error', 'progress': 1.0, 'message': str(exc)}
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return {'job_id': job_id}
+
+    @application.get('/api/job/{job_id}')
+    def job_status(job_id: str):
+        if job_id not in application.state.jobs:
+            raise HTTPException(404, 'Unknown job')
+        return application.state.jobs[job_id]
 
     if STATIC_ROOT.is_dir():
         application.mount('/static', StaticFiles(directory=STATIC_ROOT), name='static')

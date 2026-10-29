@@ -81,15 +81,34 @@ def _make_voicing(symbol, frets, capo, label):
 
 _SHAPES = {
     'C':[-1,3,2,0,1,0], 'Cm':[-1,3,5,5,4,3], 'Cmaj7':[-1,3,2,0,0,0],
+    'Cadd9':[-1,3,2,0,3,0], 'Csus2':[-1,3,0,0,1,3], 'Csus4':[-1,3,3,0,1,1],
+    'C7':[-1,3,2,3,1,0], 'Cm7':[-1,3,5,3,4,3], 'Cmaj9':[-1,3,2,4,3,0],
     'D':[-1,-1,0,2,3,2], 'Dm':[-1,-1,0,2,3,1], 'D7':[-1,-1,0,2,1,2],
-    'Dm7':[-1,-1,0,2,1,1], 'E':[0,2,2,1,0,0], 'Em':[0,2,2,0,0,0],
-    'E7':[0,2,0,1,0,0], 'Em7':[0,2,0,0,0,0], 'F':[1,3,3,2,1,1],
-    'Fmaj7':[1,3,3,2,1,0], 'Fm6':[1,-1,0,1,1,1], 'G':[3,2,0,0,0,3],
-    'G7':[3,2,0,0,0,1], 'G7sus4':[3,-1,0,0,1,1], 'A':[-1,0,2,2,2,0],
-    'Am':[-1,0,2,2,1,0], 'Am7':[-1,0,2,0,1,0], 'C/E':[0,3,2,0,1,0],
-    'G/B':[-1,2,0,0,0,3], 'Am7/G':[3,0,2,0,1,0], 'D/F#':[2,-1,0,2,3,2],
-    'F/G':[3,-1,3,2,1,1],
+    'Dm7':[-1,-1,0,2,1,1], 'Dmaj7':[-1,-1,0,2,2,2], 'Dsus2':[-1,-1,0,2,3,0],
+    'Dsus4':[-1,-1,0,2,3,3], 'Dadd9':[-1,-1,0,2,3,0],
+    'E':[0,2,2,1,0,0], 'Em':[0,2,2,0,0,0], 'E7':[0,2,0,1,0,0],
+    'Em7':[0,2,2,0,3,0], 'Emaj7':[0,2,1,1,0,0], 'Esus4':[0,2,2,2,0,0],
+    'Em9':[0,2,0,0,0,2],
+    'F':[1,3,3,2,1,1], 'Fmaj7':[-1,-1,3,2,1,0], 'Fm6':[1,-1,0,1,1,1],
+    'Fadd9':[-1,-1,3,2,1,3], 'Fsus2':[-1,-1,3,0,1,1], 'Fm':[1,3,3,1,1,1],
+    'G':[3,2,0,0,0,3], 'G7':[3,2,0,0,0,1], 'G7sus4':[3,3,0,0,1,1],
+    'Gadd9':[3,0,0,2,0,3], 'Gsus4':[3,3,0,0,1,3], 'Gmaj7':[3,2,0,0,0,2],
+    'A':[-1,0,2,2,2,0], 'Am':[-1,0,2,2,1,0], 'Am7':[-1,0,2,0,1,0],
+    'Amaj7':[-1,0,2,1,2,0], 'Asus2':[-1,0,2,2,0,0], 'Asus4':[-1,0,2,2,3,0],
+    'Amadd9':[-1,0,2,4,1,0], 'Am9':[-1,0,5,5,5,7],
+    'B':[-1,2,4,4,4,2], 'Bm':[-1,2,4,4,3,2], 'Bm7':[-1,2,4,2,3,2],
+    'B7':[-1,2,1,2,0,2],
+    'C/E':[0,3,2,0,1,0], 'G/B':[-1,2,0,0,0,3], 'Am7/G':[3,0,2,0,1,0],
+    'D/F#':[2,-1,0,2,3,2], 'F/G':[3,-1,3,2,1,1], 'C/G':[3,3,2,0,1,0],
 }
+
+
+def _internal_mutes(frets):
+    active_idx = [i for i, f in enumerate(frets) if f >= 0]
+    if len(active_idx) < 2:
+        return 0
+    lo, hi = active_idx[0], active_idx[-1]
+    return sum(1 for f in frets[lo:hi+1] if f < 0)
 
 
 @lru_cache(maxsize=512)
@@ -98,19 +117,24 @@ def _search(symbol, capo):
     allowed = set(parsed['pcs']) | {parsed['bass_pc']}
     required = _required(parsed) | {parsed['bass_pc']}
     found = {}
+    canonical = set()
 
-    def accept(frets):
+    def accept(frets, is_canon=False):
         try:
             voicing = _make_voicing(symbol, frets, capo, symbol)
         except ValueError:
             return
-        found[tuple(frets)] = voicing
+        t = tuple(frets)
+        found[t] = voicing
+        if is_canon:
+            canonical.add(t)
 
     for name, shape in _SHAPES.items():
         template = parse_extended_chord(name)
-        if template['quality'] == parsed['quality']:
+        if template['quality'] == parsed['quality'] and (template['bass'] is not None) == (parsed['bass'] is not None):
             shift = (parsed['root']-template['root']-capo) % 12
-            accept([f+shift if f >= 0 else -1 for f in shape])
+            shifted = [f+shift if f >= 0 else -1 for f in shape]
+            accept(shifted, is_canon=(shift == 0))
     for window in range(1, 25-capo):
         options = []
         for tuning in STANDARD_TUNING:
@@ -135,8 +159,22 @@ def _search(symbol, capo):
         visit(0, [], set(), [], -1)
     def key(item):
         frets, v = item
-        return (len(set(parsed['pcs'])-{p%12 for p in v['pitches'] if p >= 0}),
-                v['span'], _fingers(frets)[0], max(0,*frets), sum(max(f,0) for f in frets), frets)
+        active_cnt = sum(1 for f in frets if f >= 0)
+        mutes = _internal_mutes(frets)
+        max_f = max(0, *frets)
+        return (
+            0 if frets in canonical else 1,
+            len(set(parsed['pcs'])-{p%12 for p in v['pitches'] if p >= 0}),
+            0 if mutes == 0 else (1 if mutes == 1 and parsed['bass'] else 2 + mutes),
+            0 if active_cnt >= 4 else 1,
+            0 if max_f <= 5 else 1,
+            -min(active_cnt, 5),
+            max_f,
+            v['span'],
+            _fingers(frets)[0],
+            sum(max(f,0) for f in frets),
+            frets,
+        )
     return tuple(frets for frets, _ in sorted(found.items(), key=key))
 
 
@@ -186,10 +224,12 @@ def _optimize_candidates(layers):
         return []
     if any(not layer for layer in layers):
         raise ValueError('Empty candidate layer')
-    costs, pointers = [0]*len(layers[0]), []
+    # Intrinsic rank penalty: canonical #1 voicings win unless a lower-ranked shape saves a real fret jump.
+    rank_penalty = 3.5
+    costs, pointers = [idx*rank_penalty for idx in range(len(layers[0]))], []
     for previous, current in zip(layers,layers[1:]):
         choices = [min(range(len(previous)), key=lambda k: costs[k]+_transition_cost(previous[k],v)) for v in current]
-        costs = [costs[k]+_transition_cost(previous[k],v) for k,v in zip(choices,current)]
+        costs = [costs[k]+_transition_cost(previous[k],v)+j*rank_penalty for j,(k,v) in enumerate(zip(choices,current))]
         pointers.append(choices)
     index = min(range(len(costs)),key=costs.__getitem__)
     path = [layers[-1][index]]

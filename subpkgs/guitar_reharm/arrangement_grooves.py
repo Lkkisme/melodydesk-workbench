@@ -140,18 +140,20 @@ def arrange_advanced(
             played = strings(segment)
             bass = bass_of(segment)
             treble = sorted((x for x in played if x[0] <= 3),key=lambda x:x[2])
+            mid_treble = sorted((x for x in played if x[0] <= 4),key=lambda x:x[2]) or treble
             low = treble[0:1]
             middle = treble[min(1,len(treble)-1):min(1,len(treble)-1)+1] if treble else []
             high = treble[-1:]
             bass_list = [bass] if bass is not None else []
             slot = int(round(beat*2))%8
             patterns = (
-                [bass_list,low,middle,high,bass_list,middle,low,high],
-                [played,[],treble,treble,bass_list,treble,treble,treble],
-                [bass_list+high,low,middle,high,bass_list+middle,high,low,middle],
-                [bass_list+treble,[],treble,high,bass_list,treble,[],treble],
-                [bass_list,low,middle,high,middle,low,middle,high],
+                [bass_list,low,middle,low,high,low,middle,low],
+                [played,[],mid_treble,treble,bass_list,treble,mid_treble,treble],
+                [bass_list+high,low,middle,low,bass_list+middle,high,low,middle],
+                [bass_list+treble,[],mid_treble,high,bass_list,treble,[],treble],
+                [bass_list,low,middle,high,middle,low,middle,low],
             )
+            slot_vels = (90, 45, 68, 44, 84, 46, 72, 44)
             selection = list(patterns[ADVANCED_STYLES.index(style)][slot])
             is_strum = len(selection) >= 3
             if any(abs(beat-s['beat']) < 1e-9 for s in bar['split_segments']) and bass is not None and bass not in selection:
@@ -161,7 +163,7 @@ def arrange_advanced(
                     continue
                 is_bass = bass is not None and item == bass
                 technique = 'PM' if palm_mute and is_bass and any(abs(beat-b) < 1e-9 for b in (0,measure/2)) else ''
-                velocity = 82 if is_strum else 88 if is_bass else 78
+                velocity = (92 if slot == 0 else slot_vels[slot]) if is_strum else (92 if (is_bass and slot == 0) else 86 if is_bass else slot_vels[slot])
                 insert(bar,beat,0.5,item,velocity,technique)
         if cm:
             explicit = instrumental_melody is not None and index in instrumental_melody
@@ -224,8 +226,8 @@ def arrange_advanced(
                         continue
                     for fret in range(25-capo):
                         pitch = STANDARD_TUNING[6-string]+capo+fret
-                        if abs(pitch-target[2]) in (1,2):
-                            candidates.append((abs(pitch-current[2]),pitch%12 not in diatonic,fret,string,pitch))
+                        if abs(pitch-target[2]) in (1,2) and pitch%12 in diatonic:
+                            candidates.append((abs(pitch-current[2]),0,fret,string,pitch))
             if candidates:
                 _, _, fret, string, pitch = min(candidates)
                 insert(bar,tail,0.5,(string,fret,pitch),88,'PB')

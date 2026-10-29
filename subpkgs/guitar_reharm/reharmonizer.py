@@ -9,12 +9,12 @@ _SCALE = (0,2,4,5,7,9,11)
 _MAJOR = {'','7','maj7','add9','6','9','maj9'}
 _MINOR = {'m','m7','madd9','m6','m9'}
 REHARMONIZE_PRESETS = {name: {'name': label, 'description': description} for name, label, description in (
-    ('original', '原版和弦 (Original)', 'Preserve harmony and resolve melody clashes'),
-    ('folk_easy', '民谣简化 (Folk Easy)', 'Simplify extended major and minor harmony'),
-    ('neosoul_jazz', 'Neo-Soul 爵士 (Maj7/m9)', 'Extend harmony with sevenths and ninths'),
-    ('emotional_pop', '流行走心 (Emotional Pop)', 'Add tonic sevenths and melodic color'),
-    ('walking_bass', '顺阶低音 (Walking Bass)', 'Use third and minor-seventh inversions'),
-    ('suspend_dreamy', '空灵挂留 (Sus2/Sus4)', 'Use suspended harmony'),
+    ('original', '原版和弦 (Original)', '保持原曲基础三/七和弦与主旋律严密协和'),
+    ('folk_easy', '民谣简化 (Folk Easy)', '简化复杂延伸音，优先开放把位易按指型'),
+    ('neosoul_jazz', 'Neo-Soul 爵士 (Maj7/m9)', '升级为 Maj9 / m9 / 9 / 7sus4 爵士色彩和弦'),
+    ('emotional_pop', '流行走心 (Emotional Pop)', '加入 Imaj7 / IVadd9 / vi7 华语抒情催泪色彩'),
+    ('walking_bass', '顺阶低音 (Walking Bass)', '使用转位斜杠和弦 (C/E, G/B) 构成顺阶低音线'),
+    ('suspend_dreamy', '空灵挂留 (Sus2/Sus4)', '使用 sus2 / 7sus4 挂留和弦营造开阔空间感'),
 )}
 
 
@@ -26,9 +26,9 @@ def _spell_from(base_name: str, semitones: int, letter_steps: int) -> str:
     target_pc = (_note_pc(base_name) + semitones) % 12
     natural_pc = _note_pc(target_letter)
     diff = ((target_pc - natural_pc + 6) % 12) - 6
-    if diff == 1:
+    if diff == 1 and target_letter not in ('E', 'B'):
         return target_letter + '#'
-    if diff == -1:
+    if diff == -1 and target_letter not in ('C', 'F'):
         return target_letter + 'b'
     return _NAMES[target_pc]
 
@@ -89,11 +89,14 @@ def _resolve_harmony(symbol, previous, following, tonic, notes, start, end):
     report = check_melody_clash(symbol, notes, start, end)
     if report['status'] != 'clash' and generate_voicings(symbol):
         return symbol, report
-    for candidate in suggest_bar_substitutions(symbol,previous,following,tonic,notes,start,end):
+    subs = suggest_bar_substitutions(symbol,previous,following,tonic,notes,start,end)
+    for candidate in subs:
         if candidate['clash']['status'] != 'clash' and generate_voicings(candidate['chord']):
             return candidate['chord'], candidate['clash']
-    pitches = [n.pitch for n in _overlapping_notes(notes,start,end)]
-    raise ValueError(f'No non-clashing playable harmony for interval [{start}, {end}); melody pitches {pitches}')
+    for candidate in subs:
+        if generate_voicings(candidate['chord']):
+            return candidate['chord'], candidate['clash']
+    return symbol, report
 
 
 def roman_numeral(symbol: str, tonic: str = "C") -> str:
@@ -129,18 +132,32 @@ def check_melody_clash(
     if parsed is None:
         return report
     labels = {1:'b9',2:'9',3:'#9',5:'11',6:'#11',8:'b13',9:'13',10:'b7',11:'maj7'}
+    chord_tone_beats = sum(
+        min(bar_end, n.start + n.duration) - max(bar_start, n.start)
+        for n in notes if n.pitch % 12 in tones
+    )
+    seg_len = max(1e-6, bar_end - bar_start)
     for note in notes:
         pitch = note.pitch
         if pitch%12 in tones:
             continue
+        overlap_dur = min(bar_end, note.start + note.duration) - max(bar_start, note.start)
+        if overlap_dur < 0.45:
+            continue
+        is_weak_passing = (chord_tone_beats >= 0.45 * seg_len and note.start >= bar_end - 1.05 and overlap_dur <= 1.05)
         interval = (pitch-parsed['root'])%12
         reason = None
         # Compare the nearest octave-equivalent harmonic representatives below the melody.
         representatives = [pc+12*((pitch-pc-1)//12) for pc in tones]
-        if (parsed['root']+4)%12 in tones and interval == 5:
-            reason = 'fourth_over_major_third'
-        elif any(pitch > ct and (pitch-ct)%12 == 1 for ct in representatives):
-            reason = 'minor_ninth'
+        if not is_weak_passing:
+            if (parsed['root']+4)%12 in tones and interval == 5:
+                reason = 'fourth_over_major_third'
+            elif (parsed['root']+5)%12 in tones and (parsed['root']+3)%12 not in tones and interval == 4:
+                reason = 'third_against_sus4'
+            elif any(pitch > ct and (pitch-ct)%12 == 1 for ct in representatives):
+                reason = 'minor_ninth'
+            elif (parsed['root']+3)%12 in tones and interval in (4, 11) and any((ct-pitch)%12 == 1 for ct in tones):
+                reason = 'semitone_below_chord_tone'
         entry = dict(pitch=pitch, start=note.start, interval=interval, reason=reason or labels.get(interval,'color'))
         report['clashes' if reason else 'tensions'].append(entry)
     report['status'] = _status(report)
@@ -199,15 +216,21 @@ def reharmonize_progression(
         if split_bar and parsed:
             degree = (parsed['root']-tonic_pc)%12
             root = parsed['root_name']
+            first = root+'maj7' if proposal == original and degree in (0, 5) else proposal
             if parsed['quality'] in _MAJOR:
                 if degree == 0:
-                    pair = (root+'maj7',root+'/'+_spell_from(root, 4, 2))
+                    second = {'neosoul_jazz': root+'6', 'suspend_dreamy': root+'sus2'}.get(preset, root+'/'+_spell_from(root, 4, 2))
+                    pair = (first, second)
                 elif degree == 5:
-                    pair = (root+'maj7',root+'m6')
+                    second = {'emotional_pop': root+'m6', 'neosoul_jazz': root+'6', 'suspend_dreamy': root+'sus2'}.get(preset)
+                    pair = (first, second) if second else None
                 elif degree == 7:
-                    pair = (root+'7sus4',root+'7')
+                    pair = ((proposal, root) if parsed['bass'] or '/' in proposal else
+                            (root+'9', root+'7') if preset == 'neosoul_jazz' else (root+'7sus4', root+'7'))
             elif parsed['quality'] in _MINOR and degree == 9:
-                pair = (root+'m7',root+'m7/'+_spell_from(tonic, 7, 4))
+                pair = (proposal, root+'m7' if preset == 'neosoul_jazz' else root+'m7/'+_spell_from(tonic, 7, 4))
+            if pair and pair[0] == pair[1]:
+                pair = None
         proposals = pair if pair else (proposal,)
         duration = measure/len(proposals)
         segments, reports = [], []

@@ -109,7 +109,7 @@ def separate_stems(
             tier_dir = Path(temporary)
             try:
                 command = [sys.executable, "-m", "demucs.separate", "-n", "htdemucs", "--two-stems=vocals", "-d", device, "-o", str(tier_dir), str(audio_path)]
-                subprocess.run(command, check=True, capture_output=True, text=True, timeout=300)
+                subprocess.run(command, check=True, capture_output=True, text=True, errors="replace", timeout=300)
                 model_dir = tier_dir / "htdemucs" / audio_path.stem
                 pair_v, pair_a, sr = _validate_pair(model_dir / "vocals.wav", model_dir / "no_vocals.wav")
                 pair = (pair_v, pair_a)
