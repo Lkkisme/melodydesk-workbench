@@ -1,0 +1,706 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MelodyDesk 2.0 · AI 吉他弹唱与高阶改谱工作台</title>
+  <script src="/static/vendor/alphatab/alphaTab.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --panel-2: #263349;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --primary: #6366f1;
+      --primary-hover: #4f46e5;
+      --accent: #0ea5e9;
+      --success: #10b981;
+      --warn: #f59e0b;
+      --danger: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    header {
+      background: #090e1a;
+      border-bottom: 1px solid var(--border);
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; }
+    .brand h1 {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 700;
+      background: linear-gradient(90deg, #818cf8, #38bdf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .gpu-badge {
+      font-size: 11px;
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+    .top-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    button, .btn {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 5px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    button:hover, .btn:hover { background: #334155; border-color: #475569; }
+    button.primary { background: var(--primary); border-color: var(--primary); font-weight: 600; }
+    button.primary:hover { background: var(--primary-hover); }
+    button.accent { background: #0284c7; border-color: #0369a1; font-weight: 600; }
+
+    /* Audition & Simulation Bar */
+    .audition-bar {
+      background: #111827;
+      border-bottom: 1px solid var(--border);
+      padding: 6px 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      flex-shrink: 0;
+    }
+    .audition-bar audio { height: 28px; width: 220px; }
+    .sim-pill {
+      padding: 3px 9px;
+      border-radius: 999px;
+      background: #1e293b;
+      border: 1px solid #3b82f6;
+      color: #93c5fd;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .sim-pill:hover, .sim-pill.active { background: #2563eb; color: #fff; }
+
+    .workbench {
+      display: grid;
+      grid-template-columns: 310px 1fr 370px;
+      flex: 1;
+      overflow: hidden;
+    }
+    .sidebar-left, .sidebar-right {
+      background: var(--panel);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+      padding: 12px;
+      gap: 12px;
+    }
+    .sidebar-right { border-right: none; border-left: 1px solid var(--border); }
+    .card {
+      background: #151f32;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+    }
+    .card h3 {
+      margin: 0 0 8px 0;
+      font-size: 13px;
+      color: #e2e8f0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .form-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+    }
+    label { font-size: 11px; color: var(--muted); display: flex; flex-direction: column; gap: 3px; }
+    input[type="text"], input[type="number"], select, textarea {
+      background: #0f172a;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 5px 7px;
+      font-size: 12px;
+    }
+    textarea { width: 100%; resize: vertical; min-height: 62px; }
+
+    /* Center Score Viewport */
+    .center-stage {
+      display: flex;
+      flex-direction: column;
+      background: #0b1120;
+      overflow: hidden;
+    }
+    .view-tabs {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 14px;
+      background: #131c2e;
+      border-bottom: 1px solid var(--border);
+    }
+    .tab-group { display: flex; gap: 6px; }
+    .tab-btn {
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--muted);
+    }
+    .tab-btn.active {
+      background: var(--primary);
+      color: #fff;
+    }
+    .score-viewport {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px;
+    }
+    #alphatab-wrap {
+      background: #ffffff;
+      color: #0f172a;
+      border-radius: 10px;
+      padding: 14px;
+      min-height: 460px;
+      display: none;
+    }
+    /* Reharmonization Studio */
+    .preset-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+    }
+    .preset-card {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 7px;
+      cursor: pointer;
+      text-align: left;
+    }
+    .preset-card.active {
+      border-color: var(--primary);
+      background: rgba(99, 102, 241, 0.16);
+    }
+    .preset-card .p-name { font-size: 12px; font-weight: 700; color: #f8fafc; }
+    .preset-card .p-desc { font-size: 10px; color: var(--muted); margin-top: 2px; line-height: 1.3; }
+
+    .opt-switches {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--border);
+    }
+    .opt-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      color: #cbd5e1;
+    }
+
+    .bar-strip {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 5px;
+      max-height: 175px;
+      overflow-y: auto;
+    }
+    .bar-chip {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 5px;
+      cursor: pointer;
+      text-align: center;
+    }
+    .bar-chip.selected { border-color: #38bdf8; background: rgba(14, 165, 233, 0.16); }
+    .bar-chip .b-num { font-size: 10px; color: var(--muted); }
+    .bar-chip .b-chd { font-size: 12px; font-weight: 700; color: #e2e8f0; }
+    .bar-chip .b-rom { font-size: 10px; color: #818cf8; }
+
+    .note-table-wrap { max-height: 190px; overflow-y: auto; }
+    table.note-tbl { width: 100%; border-collapse: collapse; font-size: 11px; }
+    table.note-tbl th, table.note-tbl td {
+      padding: 4px 5px;
+      border-bottom: 1px solid #1e293b;
+      text-align: center;
+    }
+    table.note-tbl input { width: 46px; padding: 2px 4px; font-size: 11px; text-align: center; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>🎸 MelodyDesk 2.0 · AI 吉他弹唱与高阶改谱工作台</h1>
+      <span class="gpu-badge" id="gpu-badge">CUDA 检测中...</span>
+    </div>
+    <div class="top-actions">
+      <button onclick="loadDemo()">载入示例曲</button>
+      <label class="btn" style="margin:0;flex-direction:row;align-items:center;color:#fff;">
+        📂 导入带人声歌曲 (MP3/WAV)
+        <input type="file" id="audio-upload" accept=".mp3,.wav,.flac,.m4a" style="display:none" onchange="uploadAudioFile(this)">
+      </label>
+      <button onclick="undoAction()">↩ 撤销</button>
+      <button onclick="restoreReference()">🔄 恢复参考稿</button>
+      <button class="accent" onclick="window.open('/api/export/score.html','_blank')">📄 导出联谱 HTML</button>
+      <button class="primary" onclick="window.open('/api/export/alphatex.txt','_blank')">🎼 导出 alphaTex</button>
+    </div>
+  </header>
+
+  <div class="audition-bar">
+    <strong>🎧 拟真木吉他声音仿真 & 真人声混音试听台：</strong>
+    <span>当前改编纯木吉他 (44.1kHz 波导+箱体共振)：</span>
+    <audio id="guitar-audio" controls src="/api/audio/guitar-only.wav"></audio>
+    <span>真人主唱 + 改编木吉他混音：</span>
+    <audio id="mix-audio" controls src="/api/audio/vocal-guitar-mix.wav"></audio>
+    <div id="sim-demo-pills" style="display:flex;gap:5px;align-items:center;"></div>
+  </div>
+
+  <div class="workbench">
+    <!-- Left Sidebar -->
+    <aside class="sidebar-left">
+      <div class="card">
+        <h3>1. 曲目调性与节拍设置</h3>
+        <div class="form-grid">
+          <label>歌名 <input type="text" id="inp-title" onchange="applyBasicSettings()"></label>
+          <label>主音 (1=)
+            <select id="inp-tonic" onchange="applyBasicSettings()">
+              <option>C</option><option>C#</option><option>D</option><option>Eb</option>
+              <option>E</option><option>F</option><option>F#</option><option>G</option>
+              <option>Ab</option><option>A</option><option>Bb</option><option>B</option>
+            </select>
+          </label>
+          <label>速度 BPM <input type="number" id="inp-bpm" step="1" onchange="applyBasicSettings()"></label>
+          <label>拍号
+            <select id="inp-meter" onchange="applyBasicSettings()">
+              <option value="4/4">4/4</option>
+              <option value="3/4">3/4</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>2. 双模歌词强制对齐 (一字一音 / 转音 `-`)</h3>
+        <textarea id="inp-lyrics" placeholder="粘贴正确歌词（自动按句/字做 DP 强制对齐并生成一字多音 '-' 延音标记）..."></textarea>
+        <div style="display:flex;gap:6px;margin-top:6px;">
+          <button class="primary" style="flex:1" onclick="alignLyrics('text')">✨ 粘贴歌词强制对齐</button>
+          <button style="flex:1" onclick="alignLyrics('asr')">🎙️ ASR+字级对齐</button>
+        </div>
+      </div>
+
+      <div class="card" style="flex:1;display:flex;flex-direction:column;">
+        <h3>
+          <span>3. 旋律音符与逐字歌词精修</span>
+          <button onclick="cleanupScore()">自动整理时值</button>
+        </h3>
+        <div class="note-table-wrap">
+          <table class="note-tbl">
+            <thead>
+              <tr><th>#</th><th>简谱</th><th>词</th><th>起拍</th><th>时值</th></tr>
+            </thead>
+            <tbody id="notes-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Center Score Stage -->
+    <main class="center-stage">
+      <div class="view-tabs">
+        <div class="tab-group">
+          <button class="tab-btn active" id="tab-pub" onclick="switchView('pub')">📖 有谱么风格·中国标准吉他弹唱联谱 (六线+简谱+逐字歌词+双和弦)</button>
+          <button class="tab-btn" id="tab-alpha" onclick="switchView('alpha')">▶️ alphaTab 交互式跟谱播放器 (SoundFont)</button>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;" id="alpha-controls">
+          <button onclick="alphaPlayPause()">⏯ 播放/暂停跟谱</button>
+        </div>
+      </div>
+      <div class="score-viewport">
+        <div id="pub-score-wrap"></div>
+        <div id="alphatab-wrap"><div id="alphatab-el"></div></div>
+      </div>
+    </main>
+
+    <!-- Right Sidebar: Reharmonization Studio -->
+    <aside class="sidebar-right">
+      <div class="card">
+        <h3>4. 一键高阶改谱风格 (Re-harmonization)</h3>
+        <div class="preset-grid" id="preset-grid"></div>
+
+        <div class="form-grid" style="margin-top:8px;">
+          <label>右手伴奏织体
+            <select id="inp-style" onchange="triggerReharmonize()"></select>
+          </label>
+          <label>变调夹 (Capo)
+            <select id="inp-capo" onchange="triggerReharmonize()">
+              <option value="0">不夹 (Capo 0)</option>
+              <option value="1">Capo 1 品</option>
+              <option value="2">Capo 2 品</option>
+              <option value="3">Capo 3 品</option>
+              <option value="4">Capo 4 品</option>
+              <option value="5">Capo 5 品</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="opt-switches">
+          <div class="opt-row">
+            <span><strong>【选项 A】半小节双和弦加密 (Split-Bar)</strong></span>
+            <input type="checkbox" id="chk-split-bar" onchange="triggerReharmonize()">
+          </div>
+          <div class="opt-row">
+            <span><strong>【选项 B1】第2/4拍右手拍弦打板 (`X`)</strong></span>
+            <input type="checkbox" id="chk-slap-x" onchange="triggerReharmonize()">
+          </div>
+          <div class="opt-row">
+            <span><strong>【选项 B2】低音弦右手鱼际闷音 (`P.M.`)</strong></span>
+            <input type="checkbox" id="chk-palm-mute" onchange="triggerReharmonize()">
+          </div>
+          <div class="opt-row">
+            <span><strong>【选项 B3】小节尾左手击勾弦加花 (`H/P`)</strong></span>
+            <input type="checkbox" id="chk-embellish-hp" onchange="triggerReharmonize()">
+          </div>
+          <div class="opt-row">
+            <span><strong>【选项 B4】小节末经过低音 (`Passing Bass`)</strong></span>
+            <input type="checkbox" id="chk-passing-bass" checked onchange="triggerReharmonize()">
+          </div>
+          <div class="opt-row">
+            <span><strong>【选项 C】前奏/间奏无人声小节编配</strong></span>
+            <select id="sel-intro-mode" onchange="triggerReharmonize()" style="width:145px;">
+              <option value="chord_melody">指弹独奏 (Chord-Melody)</option>
+              <option value="groove">纯和弦伴奏律动</option>
+              <option value="nc">留白 (N.C.)</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>5. 逐小节和弦级数与半小节走向 (<span id="bar-count-lbl">0</span> 小节)</h3>
+        <div class="bar-strip" id="bar-strip"></div>
+      </div>
+
+      <div class="card" style="flex:1;">
+        <h3>6. 单小节代用和弦与 CAGED 多把位指型</h3>
+        <div id="bar-inspector" style="font-size:12px;color:var(--muted);">点击上方任意小节查看乐理代用推荐与把位切换</div>
+      </div>
+    </aside>
+  </div>
+
+  <script>
+    let STATE = null;
+    let SELECTED_BAR = 0;
+    let alphaApi = null;
+    let currentView = 'pub';
+
+    async function fetchState() {
+      const r = await fetch('/api/state');
+      STATE = await r.json();
+      renderAll();
+    }
+
+    function renderAll() {
+      if (!STATE) return;
+      document.getElementById('gpu-badge').textContent = STATE.gpu_available ? '🚀 RTX 4090 CUDA 已加速' : 'CPU 模式';
+      document.getElementById('inp-title').value = STATE.title || '';
+      document.getElementById('inp-tonic').value = STATE.tonic || 'C';
+      document.getElementById('inp-bpm').value = Math.round(STATE.bpm || 120);
+      document.getElementById('inp-meter').value = STATE.meter || '4/4';
+      document.getElementById('inp-lyrics').value = STATE.raw_lyrics || '';
+
+      document.getElementById('chk-split-bar').checked = !!STATE.split_bar;
+      document.getElementById('chk-slap-x').checked = !!STATE.slap_x;
+      document.getElementById('chk-palm-mute').checked = !!STATE.palm_mute;
+      document.getElementById('chk-embellish-hp').checked = !!STATE.embellish_hp;
+      document.getElementById('chk-passing-bass').checked = !!STATE.passing_bass;
+      document.getElementById('sel-intro-mode').value = STATE.intro_mode || 'chord_melody';
+      document.getElementById('inp-capo').value = String(STATE.capo || 0);
+
+      // Styles dropdown
+      const styleSel = document.getElementById('inp-style');
+      styleSel.innerHTML = (STATE.styles || []).map(s => `<option value="${s}" ${s === STATE.style ? 'selected' : ''}>${s}</option>`).join('');
+
+      // Presets grid
+      const pGrid = document.getElementById('preset-grid');
+      const presets = STATE.presets || {};
+      pGrid.innerHTML = Object.entries(presets).map(([k, v]) => `
+        <div class="preset-card ${STATE.preset === k ? 'active' : ''}" onclick="selectPreset('${k}')">
+          <div class="p-name">${v.name}</div>
+          <div class="p-desc">${v.description}</div>
+        </div>
+      `).join('');
+
+      // Publication HTML score
+      document.getElementById('pub-score-wrap').innerHTML = STATE.publication_html || '';
+
+      // Refresh audio players with cache-busting timestamp
+      const ts = Date.now();
+      document.getElementById('guitar-audio').src = `/api/audio/guitar-only.wav?t=${ts}`;
+      document.getElementById('mix-audio').src = `/api/audio/vocal-guitar-mix.wav?t=${ts}`;
+
+      // Render simulation benchmark pills if present
+      const pillsEl = document.getElementById('sim-demo-pills');
+      if (STATE.simulation_demos && STATE.simulation_demos.length) {
+        pillsEl.innerHTML = '<span>🔥 真人声实测对比库：</span>' + STATE.simulation_demos.map(d =>
+          `<span class="sim-pill" onclick="playSimDemo('${d.url}', this)">${d.label}</span>`
+        ).join('');
+      }
+
+      // Bar strip
+      const bars = STATE.bar_analysis || [];
+      document.getElementById('bar-count-lbl').textContent = bars.length;
+      const strip = document.getElementById('bar-strip');
+      strip.innerHTML = bars.map((b, i) => {
+        const segs = b.split_segments || [];
+        const label = segs.length >= 2 ? `${segs[0].chord}→${segs[1].chord}` : b.chord;
+        return `
+          <div class="bar-chip ${i === SELECTED_BAR ? 'selected' : ''}" onclick="selectBar(${i})">
+            <div class="b-num">#${i + 1}</div>
+            <div class="b-chd">${label}</div>
+            <div class="b-rom">${b.roman || ''}</div>
+          </div>
+        `;
+      }).join('');
+
+      renderBarInspector();
+      renderNotesTable();
+      if (currentView === 'alpha') updateAlphaTab();
+    }
+
+    function playSimDemo(url, el) {
+      document.querySelectorAll('.sim-pill').forEach(x => x.classList.remove('active'));
+      el.classList.add('active');
+      const mixAudio = document.getElementById('mix-audio');
+      mixAudio.src = url;
+      mixAudio.play();
+    }
+
+    function selectBar(idx) {
+      SELECTED_BAR = idx;
+      renderAll();
+    }
+
+    function renderBarInspector() {
+      const bars = STATE.bar_analysis || [];
+      const b = bars[SELECTED_BAR];
+      const box = document.getElementById('bar-inspector');
+      if (!b) { box.innerHTML = '无小节数据'; return; }
+      const cands = (b.candidates || []).map(c => `
+        <button style="margin:2px;" onclick="setBarChord(${SELECTED_BAR}, '${c.chord}')">
+          <strong>${c.chord}</strong> (${c.roman}) · ${c.reason}
+        </button>
+      `).join('');
+      const voicings = (b.voicings || []).map((v, vi) => `
+        <button style="margin:2px;" onclick="setBarVoicing(${SELECTED_BAR}, ${JSON.stringify(v.frets)})">
+          指型 ${vi + 1}: [${v.frets.map(f => f < 0 ? 'X' : f).join(' ')}]
+        </button>
+      `).join('');
+      box.innerHTML = `
+        <div style="margin-bottom:6px;">当前第 <strong>${SELECTED_BAR + 1}</strong> 小节：<strong>${b.chord}</strong> (${b.roman}) — ${b.clash ? b.clash.message : ''}</div>
+        <div style="margin-bottom:6px;"><strong>乐理代用和弦推荐：</strong><br>${cands}</div>
+        <div><strong>CAGED / 开放把位切换：</strong><br>${voicings}</div>
+      `;
+    }
+
+    function renderNotesTable() {
+      const tbody = document.getElementById('notes-tbody');
+      const rows = STATE.notes_table || [];
+      tbody.innerHTML = rows.map(n => `
+        <tr>
+          <td>${n.index + 1}</td>
+          <td>${n.jianpu}</td>
+          <td><input type="text" value="${n.lyric || ''}" onchange="editNote(${n.index}, null, null, null, this.value)"></td>
+          <td>${n.start}</td>
+          <td>${n.duration}</td>
+        </tr>
+      `).join('');
+    }
+
+    async function selectPreset(presetKey) {
+      STATE.preset = presetKey;
+      await triggerReharmonize(presetKey);
+    }
+
+    async function triggerReharmonize(presetOverride) {
+      const payload = {
+        preset: presetOverride || STATE.preset || 'original',
+        style: document.getElementById('inp-style').value || '指弹律动',
+        capo: parseInt(document.getElementById('inp-capo').value || '0', 10),
+        passing_bass: document.getElementById('chk-passing-bass').checked,
+        split_bar: document.getElementById('chk-split-bar').checked,
+        slap_x: document.getElementById('chk-slap-x').checked,
+        palm_mute: document.getElementById('chk-palm-mute').checked,
+        embellish_hp: document.getElementById('chk-embellish-hp').checked,
+        intro_mode: document.getElementById('sel-intro-mode').value,
+      };
+      const r = await fetch('/api/reharmonize', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      STATE = await r.json();
+      renderAll();
+    }
+
+    async function applyBasicSettings() {
+      const r = await fetch('/api/reharmonize', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          title: document.getElementById('inp-title').value,
+          tonic: document.getElementById('inp-tonic').value,
+          bpm: parseFloat(document.getElementById('inp-bpm').value || '120'),
+          meter: document.getElementById('inp-meter').value,
+        }),
+      });
+      STATE = await r.json();
+      renderAll();
+    }
+
+    async function setBarChord(barIndex, chord) {
+      const r = await fetch('/api/bar_chord', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({bar_index: barIndex, chord: chord}),
+      });
+      STATE = await r.json();
+      renderAll();
+    }
+
+    async function setBarVoicing(barIndex, frets) {
+      const r = await fetch('/api/bar_chord', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({bar_index: barIndex, frets: frets}),
+      });
+      STATE = await r.json();
+      renderAll();
+    }
+
+    async function alignLyrics(mode) {
+      const r = await fetch('/api/align_lyrics', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({raw_lyrics: document.getElementById('inp-lyrics').value, mode: mode}),
+      });
+      STATE = await r.json();
+      renderAll();
+    }
+
+    async function editNote(index, pitch, start, duration, lyric) {
+      const r = await fetch('/api/edit_note', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({index, pitch, start, duration, lyric}),
+      });
+      STATE = await r.json();
+      renderAll();
+    }
+
+    async function cleanupScore() {
+      const r = await fetch('/api/cleanup', {method: 'POST'});
+      STATE = await r.json();
+      renderAll();
+    }
+
+    async function undoAction() {
+      const r = await fetch('/api/undo', {method: 'POST'});
+      STATE = await r.json();
+      renderAll();
+    }
+
+    async function restoreReference() {
+      const r = await fetch('/api/restore_reference', {method: 'POST'});
+      STATE = await r.json();
+      renderAll();
+    }
+
+    async function loadDemo() {
+      const r = await fetch('/api/load_demo', {method: 'POST'});
+      STATE = await r.json();
+      renderAll();
+    }
+
+    async function uploadAudioFile(input) {
+      if (!input.files || !input.files[0]) return;
+      const fd = new FormData();
+      fd.append('file', input.files[0]);
+      fd.append('lyrics', document.getElementById('inp-lyrics').value || '');
+      const r = await fetch('/api/analyze_audio', {method: 'POST', body: fd});
+      const {job_id} = await r.json();
+      const timer = setInterval(async () => {
+        const jr = await fetch(`/api/job/${job_id}`);
+        const jd = await jr.json();
+        document.getElementById('gpu-badge').textContent = `⏳ ${jd.message || '分析中'} (${Math.round((jd.progress || 0)*100)}%)`;
+        if (jd.status === 'done') {
+          clearInterval(timer);
+          await fetchState();
+        } else if (jd.status === 'error') {
+          clearInterval(timer);
+          alert('音频分析出错: ' + jd.message);
+          await fetchState();
+        }
+      }, 800);
+    }
+
+    function switchView(v) {
+      currentView = v;
+      document.getElementById('tab-pub').classList.toggle('active', v === 'pub');
+      document.getElementById('tab-alpha').classList.toggle('active', v === 'alpha');
+      document.getElementById('pub-score-wrap').style.display = v === 'pub' ? 'block' : 'none';
+      document.getElementById('alphatab-wrap').style.display = v === 'alpha' ? 'block' : 'none';
+      if (v === 'alpha') updateAlphaTab();
+    }
+
+    function updateAlphaTab() {
+      if (!window.alphaTab || !STATE || !STATE.alphatex) return;
+      const el = document.getElementById('alphatab-el');
+      if (!alphaApi) {
+        alphaApi = new alphaTab.AlphaTabApi(el, {
+          core: { tex: true, fontDirectory: '/static/vendor/alphatab/font/' },
+          player: {
+            enablePlayer: true,
+            enableCursor: true,
+            soundFont: '/static/vendor/alphatab/soundfont/sonivox.sf2'
+          }
+        });
+      }
+      alphaApi.tex(STATE.alphatex);
+    }
+
+    function alphaPlayPause() {
+      if (currentView !== 'alpha') switchView('alpha');
+      if (alphaApi) alphaApi.playPause();
+    }
+
+    window.addEventListener('DOMContentLoaded', fetchState);
+  </script>
+</body>
+</html>

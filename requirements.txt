@@ -1,0 +1,16 @@
+librosa==0.11.0
+demucs==4.0.1
+soundfile>=0.12,<1
+numpy>=1.26,<3
+scipy>=1.11,<2
+gdown==6.4.0
+pretty_midi>=0.2.10,<1
+matplotlib>=3.8,<4
+pyworld==0.3.5
+psutil>=5.9,<8
+torchlibrosa==0.1.0
+PyYAML>=6,<7
+requests>=2.31,<3
+faster-whisper==1.2.1
+reportlab>=4,<6
+svglib>=1.5,<3
