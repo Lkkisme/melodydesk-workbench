@@ -314,12 +314,21 @@ def synthesize_melody_conditioned_harmony(
                 upper_score = s / float(np.sum(acc_upper))
 
             if has_vocal:
-                combined = 0.60 * vocal_score + 0.18 * upper_score + 0.22 * bass_score + bias
+                if acc_bass is not None or acc_upper is not None:
+                    combined = 0.60 * vocal_score + 0.18 * upper_score + 0.22 * bass_score + bias
+                else:
+                    combined = 0.92 * vocal_score + bias
             else:
                 t_root = (R + 9) % 12 if minor else R
+                turnaround_roots = (
+                    (t_root, (t_root + 10) % 12, (t_root + 3) % 12, (t_root + 7) % 12)
+                    if minor
+                    else (t_root, (t_root + 7) % 12, (t_root + 9) % 12, (t_root + 5) % 12)
+                )
+                turnaround_prior = 0.14 if (acc_upper is None and root == turnaround_roots[b % 4]) else 0.0
                 tonic_prior = 0.22 if (b == 0 and root == t_root) else (0.05 if root == t_root else 0.0)
-                cadence_prior = 0.06 if (b == n_bars - 1 or b % 4 == 0) and root == t_root else 0.0
-                combined = 0.55 * upper_score + 0.35 * bass_score + tonic_prior + cadence_prior + bias
+                cadence_prior = 0.08 if (b == n_bars - 1 or b % 4 == 0) and root == t_root else 0.0
+                combined = 0.55 * upper_score + 0.35 * bass_score + tonic_prior + cadence_prior + turnaround_prior + bias
 
             # In minor keys, Major V (harmonic minor dominant) contains the raised leading tone (#7).
             # Penalize Major V in bars where #7 is absent so Dorian/Aeolian songs use bVII / v instead of false V.
@@ -410,6 +419,19 @@ def synthesize_melody_conditioned_harmony(
         normalized = raw / peak if peak > 0 else raw
         smoothed = np.convolve(normalized, np.ones(3) / 3, mode="same")
         bar_dynamics = [round(float(np.clip(0.60 + 0.52 * v, 0.60, 1.12)), 4) for v in smoothed]
+    elif notes:
+        vocal_energy = np.zeros(n_bars, dtype=np.float64)
+        for b in range(n_bars):
+            bs_beat, be_beat = b * measure_beats, (b + 1) * measure_beats
+            bar_ns = [n for n in notes if min(n.start + n.duration, be_beat) > max(n.start, bs_beat)]
+            if bar_ns:
+                cov = sum(min(n.start + n.duration, be_beat) - max(n.start, bs_beat) for n in bar_ns) / measure_beats
+                reg = np.clip((np.mean([n.pitch for n in bar_ns]) - 54.0) / 22.0, 0.0, 1.0)
+                vocal_energy[b] = float(np.clip(0.55 * min(1.0, cov) + 0.45 * reg, 0.15, 1.0))
+            else:
+                vocal_energy[b] = 0.25
+        smoothed = np.convolve(vocal_energy, np.ones(3) / 3, mode="same")
+        bar_dynamics = [round(float(np.clip(0.66 + 0.44 * v, 0.66, 1.10)), 4) for v in smoothed]
     else:
         bar_dynamics = [0.85] * n_bars
 

@@ -910,8 +910,8 @@ def create_app() -> FastAPI:
                 import soundfile as sf
 
                 stems = separate_stems(audio_path, upload_dir / 'stems', prefer_cuda=True)
-                application.state.jobs[job_id] = {'status': 'running', 'progress': 0.4, 'message': '正在提取人声主旋律与生成吉他和弦...'}
-                beat_info = track_beats_and_downbeats(audio_path, prefer_cuda=True)
+                application.state.jobs[job_id] = {'status': 'running', 'progress': 0.4, 'message': '正在提取人声节奏、主旋律与生成吉他和弦...'}
+                beat_info = track_beats_and_downbeats(stems['vocals'], prefer_cuda=True)
                 bpm, beat_origin, meter = float(beat_info['bpm']), float(beat_info['beat_origin']), str(beat_info['meter'])
                 while bpm > 132.0:
                     bpm *= 0.5
@@ -1001,7 +1001,7 @@ def create_app() -> FastAPI:
                     if callable(synthesize_melody_conditioned_harmony) and notes:
                         harmony = synthesize_melody_conditioned_harmony(
                             notes, bpm=bpm, beat_origin=beat_origin, meter=meter, tonic=tonic,
-                            accompaniment_path=stems['accompaniment'], clip_duration=clip_duration,
+                            accompaniment_path=None, clip_duration=clip_duration,
                             bar_start_seconds=bar_start_secs or None)
                         if isinstance(harmony, dict):
                             if harmony.get('chords'):

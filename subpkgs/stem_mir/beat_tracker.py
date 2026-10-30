@@ -72,6 +72,7 @@ def track_beats_and_downbeats(
     prefer_cuda: bool = True,
     bpm_range: tuple[float, float] = (60.0, 180.0),
     meter_hint: str | None = None,
+    vocal_onsets_sec: list[float] | None = None,
 ) -> dict:
     """Track beats, downbeats, meter, bpm, and beat_origin from audio.
 
@@ -119,7 +120,8 @@ def track_beats_and_downbeats(
             beats = _timestamps(librosa.frames_to_time(frames, sr=sr, hop_length=hop) - n_fft / sr, duration)
         if len(beats) < 2:
             raise ValueError("Insufficient periodic onsets to estimate tempo")
-    bpm = 60.0 / float(np.median(np.diff(beats)))
+    raw_diffs = np.diff(beats)
+    bpm = 60.0 / float(np.median(raw_diffs))
     while bpm < lo_bpm:
         beats = np.sort(np.concatenate((beats, (beats[:-1] + beats[1:]) / 2)))
         bpm *= 2.0
@@ -129,6 +131,17 @@ def track_beats_and_downbeats(
             parity = int(np.argmin(np.abs(beats - downbeats[0]))) % 2
         beats = beats[parity::2]
         bpm /= 2.0
+    # When tracking a pure vocal stem (with held vowels and breath pauses), fold multi-beat IOIs (k=1..4) into [lo_bpm, hi_bpm]
+    if bpm < lo_bpm or bpm > hi_bpm or vocal_onsets_sec is not None:
+        folded_spbs = []
+        for d in raw_diffs:
+            for mult in (1, 2, 3, 4):
+                cand_bpm = 60.0 / (d / mult) if d > 0 else 0.0
+                if lo_bpm <= cand_bpm <= hi_bpm:
+                    folded_spbs.append(float(d / mult))
+                    break
+        if len(folded_spbs) >= 4:
+            bpm = 60.0 / float(np.median(folded_spbs))
     accent = np.zeros(len(beats), dtype=np.float64)
     for i, time in enumerate(beats):
         frame = int(round((time * sr + n_fft) / hop))
@@ -164,23 +177,41 @@ def track_beats_and_downbeats(
     else:
         downbeats = beats[phase::measure_beats]
 
-    # Build piecewise beat_times grid
+    # Build piecewise beat_times grid anchored to the singer's vocal downbeats & syllable onsets
     spb = 60.0 / bpm
-    beat_origin = float(downbeats[0] if len(downbeats) else beats[0])
+    first_downbeat = float(downbeats[0] if len(downbeats) else beats[0])
+    bar_dur_init = measure_beats * spb
+    if first_downbeat >= bar_dur_init:
+        n_pre_bars = int(first_downbeat // bar_dur_init)
+        beat_origin = round(max(0.0, first_downbeat - n_pre_bars * bar_dur_init), 6)
+    else:
+        beat_origin = first_downbeat
     snap_tol = 0.35 * spb
+    syl_tol = 0.24 * spb
     beat_arr = np.asarray(beats, dtype=np.float64)
+    syl_arr = np.asarray(sorted(vocal_onsets_sec), dtype=np.float64) if vocal_onsets_sec else np.empty(0, dtype=np.float64)
     beat_times_list: list[float] = [beat_origin]
     cur_spb = spb
     pos = beat_origin
     while pos + cur_spb * 0.5 < duration:
         next_pos = pos + cur_spb
+        snapped = False
         candidates = beat_arr[(beat_arr > pos + cur_spb * 0.3) & (beat_arr < pos + cur_spb * 1.7)]
         if len(candidates):
             closest = candidates[np.argmin(np.abs(candidates - next_pos))]
             if abs(closest - next_pos) <= snap_tol:
                 next_pos = float(closest)
                 step = next_pos - pos
-                cur_spb = 0.75 * cur_spb + 0.25 * step
+                cur_spb = float(np.clip(0.75 * cur_spb + 0.25 * step, 60.0 / hi_bpm, 60.0 / lo_bpm))
+                snapped = True
+        if not snapped and len(syl_arr):
+            syl_cands = syl_arr[(syl_arr > pos + cur_spb * 0.4) & (syl_arr < pos + cur_spb * 1.6)]
+            if len(syl_cands):
+                closest_syl = syl_cands[np.argmin(np.abs(syl_cands - next_pos))]
+                if abs(closest_syl - next_pos) <= syl_tol:
+                    next_pos = float(closest_syl)
+                    step = next_pos - pos
+                    cur_spb = float(np.clip(0.82 * cur_spb + 0.18 * step, 60.0 / hi_bpm, 60.0 / lo_bpm))
         pos = next_pos
         beat_times_list.append(pos)
 
