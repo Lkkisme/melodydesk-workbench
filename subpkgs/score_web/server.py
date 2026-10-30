@@ -141,7 +141,9 @@ def _rebuild(candidate):
     candidate.project.validate()
     measure = int(candidate.project.meter.split('/')[0])*4/int(candidate.project.meter.split('/')[1])
     count = math.ceil(max((n.start+n.duration for n in candidate.project.notes), default=0)/measure)
-    if candidate.project.source:
+    if candidate.bar_start_seconds and len(candidate.bar_start_seconds) >= 2:
+        count = max(count, len(candidate.bar_start_seconds) - 1)
+    elif candidate.project.source:
         count = max(count, math.ceil((candidate.project.clip_duration-candidate.project.beat_origin)*candidate.project.bpm/60/measure))
     if len(candidate.base_chords) != count:
         candidate.base_chords = guitar.suggest(candidate.project, NAMES.index(candidate.project.tonic))
@@ -724,6 +726,9 @@ def create_app() -> FastAPI:
                 candidate.custom_segment_voicings.clear()
             if 'preset' in request.model_fields_set and 'custom_chords' not in request.model_fields_set:
                 candidate.custom_chords.clear()
+            if any(k in request.model_fields_set for k in ('bpm', 'meter')):
+                candidate.bar_start_seconds = []
+                candidate.beat_times = []
             for key in request.model_fields_set:
                 value = getattr(request, key)
                 if value is None:

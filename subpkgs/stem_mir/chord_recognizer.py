@@ -172,28 +172,23 @@ def synthesize_melody_conditioned_harmony(
 
     if minor:
         R_min = (R + 9) % 12
-        # Diatonic triads: i, III, iv, v, V, VI, VII
-        _add(R_min, "m", (0, 3, 7), 0.06)          # i
-        _add((R_min + 3) % 12, "", (0, 4, 7), 0.06) # III
-        _add((R_min + 5) % 12, "m", (0, 3, 7), 0.06) # iv
-        _add((R_min + 7) % 12, "m", (0, 3, 7), 0.06) # v
-        _add((R_min + 7) % 12, "", (0, 4, 7), 0.06)  # V
-        _add((R_min + 8) % 12, "", (0, 4, 7), 0.06)  # VI
-        _add((R_min + 10) % 12, "", (0, 4, 7), 0.06) # VII
-        # Harmonic minor dominant V7
-        _add((R_min + 7) % 12, "", (0, 4, 7, 10), 0.04)
-        # Dorian major IV
-        _add((R_min + 5) % 12, "", (0, 4, 7), 0.02)
+        # Diatonic & modal minor triads: i, III, iv, v, V, VI, VII, Dorian IV
+        _add(R_min, "m", (0, 3, 7), 0.08)                 # i (tonic minor)
+        _add((R_min + 3) % 12, "", (0, 4, 7), 0.06)       # bIII (relative major)
+        _add((R_min + 5) % 12, "m", (0, 3, 7), 0.06)      # iv (subdominant minor)
+        _add((R_min + 5) % 12, "", (0, 4, 7), 0.05)       # IV (Dorian major subdominant)
+        _add((R_min + 7) % 12, "m", (0, 3, 7), 0.05)      # v (natural minor dominant)
+        _add((R_min + 7) % 12, "", (0, 4, 7), 0.02)       # V (harmonic minor dominant - only when leading tone present)
+        _add((R_min + 8) % 12, "", (0, 4, 7), 0.06)       # bVI
+        _add((R_min + 10) % 12, "", (0, 4, 7), 0.07)      # bVII (subtonic major - essential in folk/Dorian)
     else:
-        # Diatonic triads: I, ii, iii, IV, V, vi
-        _add(R, "", (0, 4, 7), 0.06)                  # I
+        # Diatonic triads: I, ii, iii, IV, V, vi + functional secondary dominants & borrowed bVII
+        _add(R, "", (0, 4, 7), 0.07)                  # I
         _add((R + 2) % 12, "m", (0, 3, 7), 0.06)      # ii
         _add((R + 4) % 12, "m", (0, 3, 7), 0.06)      # iii
         _add((R + 5) % 12, "", (0, 4, 7), 0.06)        # IV
         _add((R + 7) % 12, "", (0, 4, 7), 0.06)        # V
         _add((R + 9) % 12, "m", (0, 3, 7), 0.06)       # vi
-        # Dominant 7th V7
-        _add((R + 7) % 12, "", (0, 4, 7, 10), 0.03)
         # Secondary dominant V/vi
         _add((R + 4) % 12, "", (0, 4, 7), -0.02)
         # Secondary dominant V/V
@@ -291,7 +286,7 @@ def synthesize_melody_conditioned_harmony(
             bias = candidate_biases[ci]
             is_minor_q = quality == "m"
             third = (root + 3) % 12 if is_minor_q else (root + 4) % 12
-            avoid_pc = (third + 1) % 12 if not is_minor_q else -1
+            avoid_pcs = {(third + 1) % 12, (third - 1) % 12} if not is_minor_q else set()
 
             vocal_score = 0.0
             if has_vocal:
@@ -299,8 +294,8 @@ def synthesize_melody_conditioned_harmony(
                 for pc in range(12):
                     if pc in tones:
                         s += vocal_w[pc] * 1.0
-                    elif pc == avoid_pc:
-                        s += vocal_w[pc] * -0.75
+                    elif pc in avoid_pcs:
+                        s += vocal_w[pc] * -0.85
                     else:
                         s += vocal_w[pc] * -0.25
                 vocal_score = s / float(np.sum(vocal_w))
@@ -322,9 +317,23 @@ def synthesize_melody_conditioned_harmony(
                 combined = 0.60 * vocal_score + 0.18 * upper_score + 0.22 * bass_score + bias
             else:
                 t_root = (R + 9) % 12 if minor else R
-                tonic_prior = 0.05 if root == t_root else 0.0
+                tonic_prior = 0.22 if (b == 0 and root == t_root) else (0.05 if root == t_root else 0.0)
                 cadence_prior = 0.06 if (b == n_bars - 1 or b % 4 == 0) and root == t_root else 0.0
                 combined = 0.55 * upper_score + 0.35 * bass_score + tonic_prior + cadence_prior + bias
+
+            # In minor keys, Major V (harmonic minor dominant) contains the raised leading tone (#7).
+            # Penalize Major V in bars where #7 is absent so Dorian/Aeolian songs use bVII / v instead of false V.
+            if minor and root == (R_min + 7) % 12 and not is_minor_q:
+                leading_pc = (R_min + 11) % 12
+                natural_subtonic_pc = (R_min + 10) % 12
+                has_leading_vocal = has_vocal and vocal_w[leading_pc] > 0.05
+                has_leading_acc = (
+                    acc_upper is not None
+                    and float(np.sum(acc_upper)) > 0
+                    and acc_upper[leading_pc] > 1.15 * acc_upper[natural_subtonic_pc]
+                )
+                if not (has_leading_vocal or has_leading_acc):
+                    combined -= 0.22
 
             if name in bar_scores:
                 bar_scores[name] = max(bar_scores[name], combined)
@@ -366,14 +375,14 @@ def synthesize_melody_conditioned_harmony(
 
                     # Authentic cadences
                     if prev == dom_name and name == tonic_name:
-                        transition += 0.14
+                        transition += 0.06
                     elif not minor and prev == v_of_vi_name and name == vi_name:
-                        transition += 0.14
+                        transition += 0.10
 
-                    # Circle-of-fifths and step progressions
+                    # Circle-of-fifths and whole-step (modal bVII <-> i, IV <-> V) progressions
                     if distance in (5, 7):
                         transition += 0.10
-                    elif distance == 2:
+                    elif distance in (2, 10):
                         transition += 0.10
 
                     # Repetition penalty

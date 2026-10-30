@@ -1,6 +1,7 @@
 """Functional Roman Numeral Analysis, Pure Interval-Algebra Clash/Tension Detector, 6 Re-harmonization Presets, and Split-Bar Dual-Chord Re-harmonizer."""
 from __future__ import annotations
 
+from functools import lru_cache
 import math
 from .chord_voicing import parse_extended_chord, _note_pc, EXTENDED_INTERVALS, generate_voicings, optimize_voice_leading
 
@@ -46,6 +47,7 @@ def _overlapping_notes(notes, start, end):
     return [n for n in notes if n.start < end and n.start+n.duration > start]
 
 
+@lru_cache(maxsize=1024)
 def _parse(symbol):
     parsed = parse_extended_chord(symbol)
     if parsed is None:
@@ -53,6 +55,7 @@ def _parse(symbol):
     return parsed
 
 
+@lru_cache(maxsize=1024)
 def _degree(name, tonic):
     degree = ('CDEFGAB'.index(name[0].upper())-'CDEFGAB'.index(tonic[0].upper())) % 7
     difference = ((_note_pc(name)-_note_pc(tonic)-_SCALE[degree]+6)%12)-6
@@ -89,6 +92,15 @@ def _resolve_harmony(symbol, previous, following, tonic, notes, start, end):
     report = check_melody_clash(symbol, notes, start, end)
     if report['status'] != 'clash' and generate_voicings(symbol):
         return symbol, report
+    parsed = _parse(symbol)
+    root = parsed['root_name']
+    is_min = parsed['quality'] in _MINOR
+    same_root_fallbacks = ([root + 'm7', root + 'm', root + 'madd9', root + 'sus2'] if is_min
+                           else [root + 'add9', root, root + 'sus2', root + '6'])
+    for alt in same_root_fallbacks:
+        alt_rep = check_melody_clash(alt, notes, start, end)
+        if alt_rep['status'] != 'clash' and generate_voicings(alt):
+            return alt, alt_rep
     subs = suggest_bar_substitutions(symbol,previous,following,tonic,notes,start,end)
     for candidate in subs:
         if candidate['clash']['status'] != 'clash' and generate_voicings(candidate['chord']):
@@ -99,6 +111,7 @@ def _resolve_harmony(symbol, previous, following, tonic, notes, start, end):
     return symbol, report
 
 
+@lru_cache(maxsize=1024)
 def roman_numeral(symbol: str, tonic: str = "C") -> str:
     """Compute functional Roman numeral label (e.g. Imaj7, V/7, vi7/5, IVadd9, iv6, V7/vi) relative to tonic."""
     _note_pc(tonic)
@@ -144,7 +157,10 @@ def check_melody_clash(
         overlap_dur = min(bar_end, note.start + note.duration) - max(bar_start, note.start)
         if overlap_dur < 0.45:
             continue
-        is_weak_passing = (chord_tone_beats >= 0.45 * seg_len and note.start >= bar_end - 1.05 and overlap_dur <= 1.05)
+        is_weak_passing = (
+            (chord_tone_beats >= 0.45 * seg_len and note.start >= bar_end - 1.05 and overlap_dur <= 1.05)
+            or (overlap_dur <= 0.55 and chord_tone_beats >= max(1.25, 2.5 * overlap_dur))
+        )
         interval = (pitch-parsed['root'])%12
         reason = None
         # Compare the nearest octave-equivalent harmonic representatives below the melody.
