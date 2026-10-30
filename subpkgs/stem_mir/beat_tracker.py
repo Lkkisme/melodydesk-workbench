@@ -132,7 +132,8 @@ def track_beats_and_downbeats(
         beats = beats[parity::2]
         bpm /= 2.0
     # When tracking a pure vocal stem (with held vowels and breath pauses), fold multi-beat IOIs (k=1..4) into [lo_bpm, hi_bpm]
-    if bpm < lo_bpm or bpm > hi_bpm or vocal_onsets_sec is not None:
+    high_cv = len(raw_diffs) >= 4 and float(np.std(raw_diffs) / max(1e-6, np.mean(raw_diffs))) > 0.25
+    if bpm < lo_bpm or bpm > hi_bpm or vocal_onsets_sec is not None or high_cv:
         folded_spbs = []
         for d in raw_diffs:
             for mult in (1, 2, 3, 4):
@@ -190,20 +191,31 @@ def track_beats_and_downbeats(
     syl_tol = 0.24 * spb
     beat_arr = np.asarray(beats, dtype=np.float64)
     syl_arr = np.asarray(sorted(vocal_onsets_sec), dtype=np.float64) if vocal_onsets_sec else np.empty(0, dtype=np.float64)
+    downbeat_arr = np.asarray(downbeats, dtype=np.float64)
     beat_times_list: list[float] = [beat_origin]
     cur_spb = spb
     pos = beat_origin
     while pos + cur_spb * 0.5 < duration:
         next_pos = pos + cur_spb
         snapped = False
-        candidates = beat_arr[(beat_arr > pos + cur_spb * 0.3) & (beat_arr < pos + cur_spb * 1.7)]
-        if len(candidates):
-            closest = candidates[np.argmin(np.abs(candidates - next_pos))]
-            if abs(closest - next_pos) <= snap_tol:
-                next_pos = float(closest)
-                step = next_pos - pos
-                cur_spb = float(np.clip(0.75 * cur_spb + 0.25 * step, 60.0 / hi_bpm, 60.0 / lo_bpm))
-                snapped = True
+        beat_idx = len(beat_times_list)
+        if beat_idx % measure_beats == 0 and len(downbeat_arr):
+            db_cands = downbeat_arr[(downbeat_arr > pos + cur_spb * 0.35) & (downbeat_arr < pos + cur_spb * 1.65)]
+            if len(db_cands):
+                closest_db = db_cands[np.argmin(np.abs(db_cands - next_pos))]
+                if abs(closest_db - next_pos) <= 0.45 * spb:
+                    next_pos = float(closest_db)
+                    cur_spb = float(np.clip(0.75 * cur_spb + 0.25 * (next_pos - pos), 60.0 / hi_bpm, 60.0 / lo_bpm))
+                    snapped = True
+        if not snapped:
+            candidates = beat_arr[(beat_arr > pos + cur_spb * 0.3) & (beat_arr < pos + cur_spb * 1.7)]
+            if len(candidates):
+                closest = candidates[np.argmin(np.abs(candidates - next_pos))]
+                if abs(closest - next_pos) <= snap_tol:
+                    next_pos = float(closest)
+                    step = next_pos - pos
+                    cur_spb = float(np.clip(0.75 * cur_spb + 0.25 * step, 60.0 / hi_bpm, 60.0 / lo_bpm))
+                    snapped = True
         if not snapped and len(syl_arr):
             syl_cands = syl_arr[(syl_arr > pos + cur_spb * 0.4) & (syl_arr < pos + cur_spb * 1.6)]
             if len(syl_cands):
@@ -212,6 +224,8 @@ def track_beats_and_downbeats(
                     next_pos = float(closest_syl)
                     step = next_pos - pos
                     cur_spb = float(np.clip(0.82 * cur_spb + 0.18 * step, 60.0 / hi_bpm, 60.0 / lo_bpm))
+        if next_pos <= pos + 1e-4:
+            next_pos = pos + cur_spb
         pos = next_pos
         beat_times_list.append(pos)
 

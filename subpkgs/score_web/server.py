@@ -891,96 +891,102 @@ def create_app() -> FastAPI:
         def _worker():
             try:
                 from subpkgs.stem_mir import separate_stems, track_beats_and_downbeats, synthesize_melody_conditioned_harmony
-                from subpkgs.singing_lyrics import transcribe_vocal_notes
+                from subpkgs.singing_lyrics import transcribe_vocal_notes, regulate_singing_notes_for_score
                 import soundfile as sf
 
+                # Step 1 — Stem Separation
                 stems = separate_stems(audio_path, upload_dir / 'stems', prefer_cuda=True)
+                application.state.jobs[job_id] = {'status': 'running', 'progress': 0.3, 'message': '正在提取人声词语时间戳...'}
+
+                # Step 2 — Early Vocal Word/Syllable Timestamp Extraction
+                word_ts: list[dict] = []
+                vocal_onsets: list[float] = []
+                word_boundaries: list[float] = []
+                try:
+                    from subpkgs.singing_lyrics import transcribe_word_timestamps
+                    aligned = transcribe_word_timestamps(stems['vocals'], prefer_cuda=True, ground_truth_text=lyrics or '')
+                    word_ts = aligned.get('word_timestamps') or []
+                    vocal_onsets = sorted({float(w['start']) for w in word_ts if 'start' in w and float(w['start']) >= 0})
+                    word_boundaries = sorted(set(vocal_onsets) | {float(w['end']) for w in word_ts if 'end' in w and float(w['end']) >= 0})
+                except Exception:
+                    pass
+
                 application.state.jobs[job_id] = {'status': 'running', 'progress': 0.4, 'message': '正在提取人声节奏、主旋律与生成吉他和弦...'}
-                beat_info = track_beats_and_downbeats(stems['vocals'], prefer_cuda=True)
-                bpm, beat_origin, meter = float(beat_info['bpm']), float(beat_info['beat_origin']), str(beat_info['meter'])
-                while bpm > 132.0:
-                    bpm *= 0.5
-                while bpm < 68.0:
-                    bpm *= 2.0
-                spb = 60.0 / bpm
-                beat_origin = beat_origin % spb
+
+                # Step 3 — Vocal Beat & Downbeat Tracking
+                beat_info = track_beats_and_downbeats(stems['vocals'], prefer_cuda=True, vocal_onsets_sec=vocal_onsets or None)
+                bpm = float(beat_info['bpm'])
+                beat_origin = float(beat_info['beat_origin'])
+                meter = str(beat_info['meter'])
+                beat_times_secs: list[float] = [float(t) for t in (beat_info.get('beat_times') or [])]
+                bar_start_secs: list[float] = [float(t) for t in (beat_info.get('bar_start_seconds') or [])]
+                if not beat_times_secs:
+                    while bpm > 132.0:
+                        bpm *= 0.5
+                    while bpm < 68.0:
+                        bpm *= 2.0
+
                 info = sf.info(str(audio_path))
                 clip_duration = float(info.duration)
-                tx = transcribe_vocal_notes(stems['vocals'], bpm=bpm, beat_origin=beat_origin, prefer_cuda=True)
+
+                # Step 4 — Vocal Note Transcription & Regulation
+                tx = transcribe_vocal_notes(stems['vocals'], bpm=bpm, beat_origin=beat_origin,
+                                            word_boundaries_sec=word_boundaries or None, prefer_cuda=True,
+                                            beat_times=beat_times_secs or None)
                 raw_notes = sorted(tx['notes'], key=lambda n: n.raw_start)
-                slot_map = {}
-                for n in raw_notes:
-                    if n.raw_start < beat_origin:
-                        continue
-                    beat_pos = (n.raw_start - beat_origin) / spb
-                    beat_dur = n.raw_duration / spb
-                    if beat_dur < 0.22:
-                        continue
-                    slot = max(0, int(round(beat_pos / 0.5)))
-                    if slot not in slot_map or beat_dur > slot_map[slot].duration:
-                        q_start = slot * 0.5
-                        q_dur = min(4.0, max(0.5, round(beat_dur / 0.5) * 0.5))
-                        slot_map[slot] = Note(
-                            pitch=int(n.pitch), start=float(q_start), duration=float(q_dur),
-                            raw_start=float(beat_origin + q_start * spb), raw_duration=float(q_dur * spb),
-                        )
-                prelim = [slot_map[k] for k in sorted(slot_map.keys())]
-                for idx_n, n in enumerate(prelim):
-                    if idx_n + 1 < len(prelim):
-                        n.duration = max(0.5, min(n.duration, prelim[idx_n + 1].start - n.start))
-                        n.raw_duration = n.duration * spb
+                word_boundaries = sorted(set(word_boundaries) | set(tx.get('word_boundaries_sec') or []))
                 try:
-                    notes = organize(prelim, bpm, beat_origin, 'auto') if prelim else []
+                    notes = regulate_singing_notes_for_score(
+                        raw_notes, bpm=bpm, beat_origin=beat_origin,
+                        clip_duration=clip_duration, word_boundaries_sec=word_boundaries or None,
+                        beat_times=beat_times_secs or None)
+                    if not notes and raw_notes:
+                        raise ValueError('regulate returned empty')
                 except Exception:
-                    notes = prelim
-                for n in notes:
-                    n.raw_start = round(beat_origin + n.start * spb, 4)
-                    n.raw_duration = round(n.duration * spb, 4)
-                natural_pcs = {0, 2, 4, 5, 7, 9}
-                scale = {0, 2, 4, 5, 7, 9, 11}
-                tonic_pc = max(
-                    range(12),
-                    key=lambda k: sum(n.duration for n in notes if (n.pitch - k) % 12 in scale) + (0.15 if k in natural_pcs else 0.0)
-                ) if notes else 0
-                tonic = NAMES[tonic_pc]
+                    try:
+                        notes = organize(raw_notes, bpm, beat_origin, 'auto') if raw_notes else []
+                    except Exception:
+                        notes = raw_notes
+
+                # Step 5 — Joint Major/Minor Key Detection (tonic, is_minor)
+                major_scale = {0, 2, 4, 5, 7, 9, 11}
+                minor_scale = {0, 2, 3, 5, 7, 8, 10, 11}
+                final_pc = notes[-1].pitch % 12 if notes else None
+                tonic_pc, is_minor = 0, False
+                if notes:
+                    best_score = -1.0
+                    for k in range(12):
+                        for scale_set, minor_flag in ((major_scale, False), (minor_scale, True)):
+                            score = sum(n.duration for n in notes if (n.pitch - k) % 12 in scale_set)
+                            if final_pc is not None and final_pc == k:
+                                score += 0.8
+                            if score > best_score:
+                                best_score = score
+                                tonic_pc, is_minor = k, minor_flag
+                rel_major_pc = (tonic_pc + 3) % 12 if is_minor else tonic_pc
+                rel_tonic = NAMES[rel_major_pc]
                 project = Project(
-                    title=audio_path.stem, tonic=tonic, meter=meter, bpm=bpm, beat_origin=beat_origin,
+                    title=audio_path.stem, tonic=rel_tonic, meter=meter, bpm=bpm, beat_origin=beat_origin,
                     clip_duration=clip_duration, source=str(audio_path),
                     audio={'vocals': stems['vocals']},
                     notes=notes, reference_notes=deepcopy(notes),
                 )
                 turnaround = [
-                    guitar.chord_name(tonic_pc, False),
-                    guitar.chord_name(tonic_pc + 7, False),
-                    guitar.chord_name(tonic_pc + 9, True),
-                    guitar.chord_name(tonic_pc + 5, False),
+                    guitar.chord_name(tonic_pc, is_minor),
+                    guitar.chord_name(rel_major_pc + 7, False),
+                    guitar.chord_name(rel_major_pc + 9, True),
+                    guitar.chord_name(rel_major_pc + 5, False),
                 ]
-                vocal_chords = guitar.suggest(project, tonic_pc, minor=False) if notes else turnaround
+                vocal_chords = guitar.suggest(project, rel_major_pc, minor=is_minor) if notes else turnaround
                 base_chords = [
                     (turnaround[i % 4] if (not ch or ch == 'N.C.') else ch)
                     for i, ch in enumerate(vocal_chords)
                 ]
-                beat_times_secs: list[float] = [float(t) for t in (beat_info.get('beat_times') or [])]
-                bar_start_secs: list[float] = [float(t) for t in (beat_info.get('bar_start_seconds') or [])]
                 bar_dyn: list[float] = []
-                try:
-                    from subpkgs.singing_lyrics import regulate_singing_notes_for_score
-                    if callable(regulate_singing_notes_for_score) and notes:
-                        regulated = regulate_singing_notes_for_score(
-                            raw_notes, bpm=bpm, beat_origin=beat_origin,
-                            clip_duration=clip_duration, beat_times=beat_times_secs or None)
-                        if regulated and isinstance(regulated, list):
-                            notes = regulated
-                            project.notes = notes
-                            project.reference_notes = deepcopy(notes)
-                except (ImportError, AttributeError):
-                    pass
-                except Exception:
-                    pass
                 try:
                     if callable(synthesize_melody_conditioned_harmony) and notes:
                         harmony = synthesize_melody_conditioned_harmony(
-                            notes, bpm=bpm, beat_origin=beat_origin, meter=meter, tonic=tonic,
+                            notes, bpm=bpm, beat_origin=beat_origin, meter=meter, tonic=rel_tonic, minor=is_minor,
                             clip_duration=clip_duration, bar_start_seconds=bar_start_secs or None)
                         if isinstance(harmony, dict):
                             if harmony.get('chords'):
@@ -993,11 +999,12 @@ def create_app() -> FastAPI:
                     pass
                 except Exception:
                     pass
-                if not bar_start_secs and beat_info.get('downbeat_times'):
-                    bar_start_secs = [float(t) for t in beat_info['downbeat_times']]
+                if not bar_start_secs and beat_info.get('downbeats'):
+                    bar_start_secs = [float(t) for t in beat_info['downbeats']]
                 if not bar_dyn and bar_start_secs:
                     bar_dyn = [1.0] * len(bar_start_secs)
 
+                # Step 6 — Preserve word_timestamps when aligning lyrics
                 def _apply(candidate):
                     candidate.demo_mode = 'upload'
                     candidate.project = project
@@ -1008,6 +1015,7 @@ def create_app() -> FastAPI:
                     candidate.bar_dynamics = bar_dyn
                     candidate.raw_lyrics = lyrics
                     candidate.note_lyrics = ['']*len(notes)
+                    candidate.word_timestamps = word_ts
                     if lyrics:
                         _align(candidate)
                 mutate(_apply)

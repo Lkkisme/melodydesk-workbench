@@ -113,7 +113,13 @@ def regulate_singing_notes_for_score(
             use_piecewise = True
 
     ordered = sorted(copy.deepcopy(notes), key=lambda n: n.raw_start)
-    filtered = [n for n in ordered if n.raw_start >= beat_origin and n.raw_duration >= 0.075]
+
+    for n in ordered:
+        if n.raw_start < beat_origin and beat_origin - n.raw_start <= 0.25 and n.raw_start + n.raw_duration > beat_origin + 0.06:
+            n.raw_duration = (n.raw_start + n.raw_duration) - beat_origin
+            n.raw_start = beat_origin
+
+    filtered = [n for n in ordered if n.raw_start >= beat_origin and n.raw_duration >= 0.065]
     if not filtered:
         return []
 
@@ -130,32 +136,60 @@ def regulate_singing_notes_for_score(
         else:
             merged.append(n)
 
+    if word_boundaries_sec:
+        from music import Note
+        wbs = sorted(set(float(w) for w in word_boundaries_sec if math.isfinite(w) and w >= beat_origin))
+        if wbs:
+            split_merged: list = []
+            for n in merged:
+                if n.raw_duration < 0.34:
+                    split_merged.append(n)
+                    continue
+                n_start = n.raw_start
+                n_end = n.raw_start + n.raw_duration
+                interior = [wb for wb in wbs if n_start + 0.14 <= wb <= n_end - 0.14]
+                cuts = [n_start] + interior[:4] + [n_end]
+                valid_cuts = [cuts[0]]
+                for c in cuts[1:]:
+                    if c - valid_cuts[-1] >= 0.14:
+                        valid_cuts.append(c)
+                    else:
+                        valid_cuts[-1] = c
+                if len(valid_cuts) < 2 or valid_cuts[-1] - valid_cuts[0] < 0.14:
+                    split_merged.append(n)
+                    continue
+                for j in range(len(valid_cuts) - 1):
+                    seg_start = valid_cuts[j]
+                    seg_dur = valid_cuts[j + 1] - seg_start
+                    if seg_dur >= 0.14:
+                        split_merged.append(Note(n.pitch, n.start, n.duration, seg_start, seg_dur, n.confidence, n.edited))
+                if not any(sn for sn in split_merged[-len(valid_cuts)+1:]):
+                    split_merged.append(n)
+            merged = split_merged
+
     for n in merged:
         if use_piecewise and n.raw_start >= 0 and n.raw_duration > 0:
-            beats_from_origin = seconds_to_beats_piecewise(n.raw_start, beat_times, bpm, beat_origin)
+            cont_start = float(seconds_to_beats_piecewise(n.raw_start, beat_times, bpm, beat_origin))
+            cont_end = float(seconds_to_beats_piecewise(n.raw_start + n.raw_duration, beat_times, bpm, beat_origin))
         else:
-            beats_from_origin = (n.raw_start - beat_origin) / spb
-        n.start = max(0.0, round(round(beats_from_origin / grid) * grid, 10))
+            cont_start = (n.raw_start - beat_origin) / spb
+            cont_end = (n.raw_start + n.raw_duration - beat_origin) / spb
+        n.start = max(0.0, cont_start)
+        n.duration = min(4.0, max(0.12, cont_end - cont_start))
 
     deduped: list = []
     for n in merged:
-        if deduped and abs(deduped[-1].start - n.start) < 1e-9:
+        if deduped and abs(deduped[-1].start - n.start) < 0.08:
             if n.raw_duration > deduped[-1].raw_duration:
                 deduped[-1] = n
         else:
             deduped.append(n)
 
     for i, n in enumerate(deduped):
-        if use_piecewise and n.raw_start >= 0 and n.raw_duration > 0:
-            raw_end_beat = seconds_to_beats_piecewise(n.raw_start + n.raw_duration, beat_times, bpm, beat_origin)
-            raw_dur_beats = min(4.0, max(grid, round(round((raw_end_beat - n.start) / grid) * grid, 10)))
-        else:
-            raw_dur_beats = min(4.0, max(grid, round(round((n.raw_duration / spb) / grid) * grid, 10)))
         if i + 1 < len(deduped):
             gap_beats = deduped[i + 1].start - n.start
-            n.duration = max(grid, min(raw_dur_beats if gap_beats - raw_dur_beats > 0.25 else gap_beats, gap_beats))
-        else:
-            n.duration = raw_dur_beats
+            if gap_beats > 0.08:
+                n.duration = max(0.12, min(n.duration if gap_beats - n.duration > 0.25 else gap_beats, gap_beats))
 
     phrases: list[list] = []
     for n in deduped:
@@ -163,10 +197,11 @@ def regulate_singing_notes_for_score(
             phrases.append([])
         phrases[-1].append(n)
 
-    if use_piecewise:
-        for n in deduped:
-            n.raw_start = beat_origin + n.start * spb
-            n.raw_duration = n.duration * spb
+    for n in deduped:
+        n.raw_start = beat_origin + n.start * spb
+        n.raw_duration = max(0.065, n.duration * spb)
+        n.start = max(0.0, round(round(n.start / grid) * grid, 10))
+        n.duration = min(4.0, max(grid, round(round(n.duration / grid) * grid, 10)))
 
     raw_result: list = []
     for phrase in phrases:
@@ -200,11 +235,13 @@ def regulate_singing_notes_for_score(
                 n.duration = max_dur
         n.duration = max(1e-4, float(n.duration))
         if use_piecewise:
-            n.raw_start = round(beats_to_seconds_piecewise(n.start, beat_times, bpm, beat_origin), 4)
-            n.raw_duration = round(beats_to_seconds_piecewise(n.start + n.duration, beat_times, bpm, beat_origin) - n.raw_start, 4)
+            s_sec = float(beats_to_seconds_piecewise(n.start, beat_times, bpm, beat_origin))
+            e_sec = float(beats_to_seconds_piecewise(n.start + n.duration, beat_times, bpm, beat_origin))
+            n.raw_start = round(s_sec, 6)
+            n.raw_duration = round(max(1e-4, e_sec - s_sec), 6)
         else:
-            n.raw_start = round(beat_origin + n.start * spb, 4)
-            n.raw_duration = round(n.duration * spb, 4)
+            n.raw_start = round(beat_origin + n.start * spb, 6)
+            n.raw_duration = round(n.duration * spb, 6)
         cleaned_result.append(n)
 
     return cleaned_result

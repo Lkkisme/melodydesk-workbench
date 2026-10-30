@@ -15,6 +15,7 @@ _CJK_PATTERN = (
 _LATIN_PATTERN = r"[A-Za-z0-9'’]+"
 _SCAN = re.compile(_CJK_PATTERN + "|" + _LATIN_PATTERN + r"|\r\n|[\r\n，,。！？!?;；、]")
 _LOG = logging.getLogger(__name__)
+_MMS_FA_CACHE: dict[str, tuple] = {}
 
 
 def tokenize_lyrics(raw_text: str) -> list[dict]:
@@ -72,48 +73,94 @@ def _is_faster_whisper_real():
     return getattr(wm, "__module__", "").startswith("faster_whisper")
 
 
+def _token_to_mms_chars(token_text: str, dict_chars: set[str]) -> str:
+    text = token_text.lower()
+    if re.search(_CJK_PATTERN, token_text):
+        try:
+            from pypinyin import Style, lazy_pinyin
+            text = "".join(lazy_pinyin(token_text, style=Style.NORMAL)).lower()
+        except ImportError:
+            return ""
+    return "".join(c for c in text if c in dict_chars)
+
+
 def _try_mms_fa(audio_path: Path, ground_truth_text: str, prefer_cuda: bool) -> dict | None:
-    """Tier 2: Meta MMS_FA CTC forced alignment for Latin/English text."""
+    """Tier 2: Meta MMS_FA CTC forced alignment for Latin/English and CJK text."""
     gt = ground_truth_text.strip()
     if not gt:
-        return None
-    if not re.search(_LATIN_PATTERN, gt):
-        return None
-    if re.search(_CJK_PATTERN, gt):
         return None
     try:
         import torch
         import torchaudio
         import librosa
 
-        bundle = torchaudio.pipelines.MMS_FA
-        dictionary = bundle.get_dict()
-        model = bundle.get_model(with_star=True)
         device = "cuda" if prefer_cuda and torch.cuda.is_available() else "cpu"
-        model = model.to(device).eval()
-        aligner = bundle.get_aligner()
 
-        waveform, _ = librosa.load(str(audio_path), sr=bundle.sample_rate, mono=True)
-        if len(waveform) / float(bundle.sample_rate) > 35.0:
-            return None
-        waveform_tensor = torch.from_numpy(waveform).unsqueeze(0).to(device)
+        if device in _MMS_FA_CACHE:
+            bundle, dictionary, model, aligner = _MMS_FA_CACHE[device]
+        else:
+            bundle = torchaudio.pipelines.MMS_FA
+            dictionary = bundle.get_dict()
+            model = bundle.get_model(with_star=True).to(device).eval()
+            aligner = bundle.get_aligner()
+            _MMS_FA_CACHE[device] = (bundle, dictionary, model, aligner)
+
+        sr = bundle.sample_rate
+        waveform, _ = librosa.load(str(audio_path), sr=sr, mono=True)
 
         gt_tokens = tokenize_lyrics(ground_truth_text)
         dict_chars = set(dictionary.keys()) - {"*"}
         transcript_tokens = []
+        any_valid = False
         for tok in gt_tokens:
-            normalized = "".join(c for c in tok["text"].lower() if c in dict_chars)
+            normalized = _token_to_mms_chars(tok["text"], dict_chars)
             if normalized:
                 transcript_tokens.append([dictionary[c] for c in normalized])
+                any_valid = True
             else:
                 transcript_tokens.append([dictionary.get("*", 0)])
 
-        with torch.inference_mode():
-            emission, _ = model(waveform_tensor)
+        if not any_valid:
+            return None
 
-        token_spans = aligner(emission[0].cpu(), transcript_tokens)
+        chunk_sec = 30.0
+        context_sec = 1.0
+        total_samples = len(waveform)
+
+        with torch.inference_mode():
+            if total_samples <= int(chunk_sec * sr):
+                waveform_tensor = torch.from_numpy(waveform).unsqueeze(0).to(device)
+                emission, _ = model(waveform_tensor)
+            else:
+                chunk_samples = int(chunk_sec * sr)
+                context_samples = int(context_sec * sr)
+                chunk_emissions = []
+                pos = 0
+                while pos < total_samples:
+                    chunk_end = min(pos + chunk_samples, total_samples)
+                    pad_left = min(context_samples, pos)
+                    pad_right = min(context_samples, total_samples - chunk_end)
+                    window_start = pos - pad_left
+                    window_end = chunk_end + pad_right
+                    window_tensor = torch.from_numpy(
+                        waveform[window_start:window_end]
+                    ).unsqueeze(0).to(device)
+                    window_emission, _ = model(window_tensor)
+                    total_window_frames = window_emission.shape[1]
+                    window_samples = window_end - window_start
+                    left_frac = pad_left / window_samples
+                    right_frac = pad_right / window_samples
+                    left_frames = int(round(left_frac * total_window_frames))
+                    right_frames = int(round(right_frac * total_window_frames))
+                    end_frame = total_window_frames - right_frames if right_frames > 0 else total_window_frames
+                    chunk_emissions.append(window_emission[:, left_frames:end_frame, :].cpu())
+                    pos = chunk_end
+                emission = torch.cat(chunk_emissions, dim=1)
+
+        token_spans = aligner(emission[0].cpu() if emission.device.type != "cpu" else emission[0], transcript_tokens)
+        total_duration = len(waveform) / float(sr)
         num_frames = emission.shape[1]
-        frame_dur = waveform.shape[-1] / num_frames / bundle.sample_rate
+        frame_dur = total_duration / float(num_frames)
 
         records = []
         for i, spans in enumerate(token_spans):
