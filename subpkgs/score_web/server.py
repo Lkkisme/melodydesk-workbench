@@ -107,6 +107,7 @@ class Session:
     arrangement: dict = field(default_factory=dict)
     undo_stack: list = field(default_factory=list)
     bar_start_seconds: list[float] = field(default_factory=list)
+    beat_times: list[float] = field(default_factory=list)
     bar_dynamics: list[float] = field(default_factory=list)
     word_timestamps: list = field(default_factory=list)
     demo_mode: str = 'mandarin_pop'
@@ -234,6 +235,9 @@ def _rebuild(candidate):
     if candidate.bar_start_seconds:
         offset0 = float(candidate.bar_start_seconds[0])
         arrangement['bar_start_seconds'] = [max(0.0, float(t) - offset0) for t in candidate.bar_start_seconds]
+    if candidate.beat_times:
+        bt0 = float(candidate.beat_times[0])
+        arrangement['beat_times'] = [max(0.0, float(t) - bt0) for t in candidate.beat_times]
     if candidate.bar_dynamics:
         arrangement['bar_dynamics'] = list(candidate.bar_dynamics)
     if len(candidate.note_lyrics) != len(candidate.project.notes):
@@ -352,6 +356,7 @@ def _initial_session(demo_mode: str = 'mandarin_pop'):
                 raw_lyrics=entry['raw_lyrics'],
                 note_lyrics=note_lyrics,
                 bar_start_seconds=list(entry.get('bar_start_seconds', [])),
+                beat_times=list(entry.get('beat_times', [])),
                 bar_dynamics=list(entry.get('bar_dynamics', [])),
                 word_timestamps=list(entry.get('word_timestamps', [])),
                 demo_mode=demo_mode,
@@ -412,7 +417,7 @@ def get_state_payload(session):
     payload = {key: getattr(session, key) for key in ('preset', 'style', 'capo', 'passing_bass', 'split_bar',
         'slap_x', 'palm_mute', 'embellish_hp', 'intro_mode', 'raw_lyrics', 'bar_analysis', 'arrangement')}
     payload.update(title=project.title, tonic=project.tonic, meter=project.meter, bpm=float(project.bpm),
-        presets=PRESETS, styles=STYLES, chords=session.arrangement['chords'],
+        presets=PRESETS, styles=STYLES, chords=session.arrangement['chords'], bar_start_seconds=session.arrangement.get('bar_start_seconds', session.bar_start_seconds),
         alphatex=to_alphatex(project, session.arrangement, session.note_lyrics),
         publication_html=render_publication_score_html(project, session.arrangement, session.note_lyrics, session.bar_analysis),
         gpu_available=_gpu_available(), simulation_demos=_simulation_demos()['demos'],
@@ -969,12 +974,15 @@ def create_app() -> FastAPI:
                 else:
                     chord_info = recognize_accompaniment_chords(stems['accompaniment'], bpm=bpm, beat_origin=beat_origin, meter=meter, tonic=tonic)
                     base_chords = chord_info['chords']
-                bar_start_secs: list[float] = []
+                beat_times_secs: list[float] = [float(t) for t in (beat_info.get('beat_times') or [])]
+                bar_start_secs: list[float] = [float(t) for t in (beat_info.get('bar_start_seconds') or [])]
                 bar_dyn: list[float] = []
                 try:
                     from subpkgs.singing_lyrics import regulate_singing_notes_for_score
                     if callable(regulate_singing_notes_for_score) and notes:
-                        regulated = regulate_singing_notes_for_score(raw_notes, bpm=bpm, beat_origin=beat_origin, clip_duration=clip_duration)
+                        regulated = regulate_singing_notes_for_score(
+                            raw_notes, bpm=bpm, beat_origin=beat_origin,
+                            clip_duration=clip_duration, beat_times=beat_times_secs or None)
                         if regulated and isinstance(regulated, list):
                             notes = regulated
                             project.notes = notes
@@ -988,7 +996,8 @@ def create_app() -> FastAPI:
                     if callable(synthesize_melody_conditioned_harmony) and notes:
                         harmony = synthesize_melody_conditioned_harmony(
                             notes, bpm=bpm, beat_origin=beat_origin, meter=meter, tonic=tonic,
-                            accompaniment_path=stems['accompaniment'], clip_duration=clip_duration)
+                            accompaniment_path=stems['accompaniment'], clip_duration=clip_duration,
+                            bar_start_seconds=bar_start_secs or None)
                         if isinstance(harmony, dict):
                             if harmony.get('chords'):
                                 base_chords = list(harmony['chords'])
@@ -1011,6 +1020,7 @@ def create_app() -> FastAPI:
                     candidate.base_chords = base_chords
                     candidate.custom_voicings = [None]*len(base_chords)
                     candidate.bar_start_seconds = bar_start_secs
+                    candidate.beat_times = beat_times_secs
                     candidate.bar_dynamics = bar_dyn
                     candidate.raw_lyrics = lyrics
                     candidate.note_lyrics = ['']*len(notes)

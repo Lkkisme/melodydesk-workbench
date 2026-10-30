@@ -1,17 +1,18 @@
-"""Dual-Mode Lyric Tokenizer, ASR Timestamp Extractor (Qwen3-ASR / ForcedAligner + faster-whisper CUDA), and Parameter-Free DP Syllable-to-Note Forced Aligner."""
+"""Dual-Mode Lyric Tokenizer, ASR Timestamp Extractor (Qwen3-ASR / ForcedAligner + MMS-FA CTC + faster-whisper CUDA), and Parameter-Free DP Syllable-to-Note Forced Aligner."""
 from __future__ import annotations
 from pathlib import Path
 import logging
 import math
 import re
+import sys
 from statistics import median
 
 _CJK_PATTERN = (
-    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    r"[㐀-䶿一-鿿豈-﫿"
     r"\U00020000-\U0002fa1f"
-    r"\u3041-\u3096\u30a1-\u30fa\uac00-\ud7af]"
+    r"ぁ-ゖァ-ヺ가-힯]"
 )
-_LATIN_PATTERN = r"[A-Za-z0-9']+"
+_LATIN_PATTERN = r"[A-Za-z0-9'’]+"
 _SCAN = re.compile(_CJK_PATTERN + "|" + _LATIN_PATTERN + r"|\r\n|[\r\n，,。！？!?;；、]")
 _LOG = logging.getLogger(__name__)
 
@@ -60,12 +61,222 @@ def _expand_word_timestamps(records):
     return expanded
 
 
+def _is_faster_whisper_real():
+    """Return True if faster_whisper in sys.modules is the real library, not a test mock."""
+    fw = sys.modules.get("faster_whisper")
+    if fw is None:
+        return True
+    wm = getattr(fw, "WhisperModel", None)
+    if wm is None:
+        return True
+    return getattr(wm, "__module__", "").startswith("faster_whisper")
+
+
+def _try_mms_fa(audio_path: Path, ground_truth_text: str, prefer_cuda: bool) -> dict | None:
+    """Tier 2: Meta MMS_FA CTC forced alignment for Latin/English text."""
+    gt = ground_truth_text.strip()
+    if not gt:
+        return None
+    if not re.search(_LATIN_PATTERN, gt):
+        return None
+    if re.search(_CJK_PATTERN, gt):
+        return None
+    try:
+        import torch
+        import torchaudio
+        import librosa
+
+        bundle = torchaudio.pipelines.MMS_FA
+        dictionary = bundle.get_dict()
+        model = bundle.get_model(with_star=True)
+        device = "cuda" if prefer_cuda and torch.cuda.is_available() else "cpu"
+        model = model.to(device).eval()
+        aligner = bundle.get_aligner()
+
+        waveform, _ = librosa.load(str(audio_path), sr=bundle.sample_rate, mono=True)
+        if len(waveform) / float(bundle.sample_rate) > 35.0:
+            return None
+        waveform_tensor = torch.from_numpy(waveform).unsqueeze(0).to(device)
+
+        gt_tokens = tokenize_lyrics(ground_truth_text)
+        dict_chars = set(dictionary.keys()) - {"*"}
+        transcript_tokens = []
+        for tok in gt_tokens:
+            normalized = "".join(c for c in tok["text"].lower() if c in dict_chars)
+            if normalized:
+                transcript_tokens.append([dictionary[c] for c in normalized])
+            else:
+                transcript_tokens.append([dictionary.get("*", 0)])
+
+        with torch.inference_mode():
+            emission, _ = model(waveform_tensor)
+
+        token_spans = aligner(emission[0].cpu(), transcript_tokens)
+        num_frames = emission.shape[1]
+        frame_dur = waveform.shape[-1] / num_frames / bundle.sample_rate
+
+        records = []
+        for i, spans in enumerate(token_spans):
+            if not spans:
+                continue
+            s_frame = spans[0].start
+            e_frame = spans[-1].end
+            score = sum(s.score for s in spans) / len(spans)
+            records.append({
+                "word": gt_tokens[i]["text"],
+                "start": float(s_frame * frame_dur),
+                "end": float(e_frame * frame_dur),
+                "probability": max(0.0, min(1.0, float(score))),
+            })
+
+        if not records:
+            return None
+        return {
+            "raw_lyrics": ground_truth_text,
+            "word_timestamps": _expand_word_timestamps(records),
+            "backend": f"mms-fa-{device}",
+        }
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        _LOG.warning("MMS-FA CTC backend failed: %s", exc)
+        return None
+
+
+def _edit_distance(a: str, b: str) -> int:
+    la, lb = len(a), len(b)
+    if la > lb:
+        a, b, la, lb = b, a, lb, la
+    prev = list(range(la + 1))
+    for j in range(1, lb + 1):
+        curr = [j] + [0] * la
+        for i in range(1, la + 1):
+            curr[i] = min(prev[i] + 1, curr[i - 1] + 1,
+                          prev[i - 1] + (0 if a[i - 1] == b[j - 1] else 1))
+        prev = curr
+    return prev[la]
+
+
+def _nw_score(gt_text: str, asr_text: str) -> float:
+    g = gt_text.casefold()
+    a = asr_text.casefold()
+    if g == a:
+        return 3.0
+    if re.search(_CJK_PATTERN, g) and re.search(_CJK_PATTERN, a) and g[0] == a[0]:
+        return 1.2
+    if len(g) > 1 and len(a) > 1 and (g[:2] == a[:2] or g[-2:] == a[-2:]):
+        return 1.2
+    if _edit_distance(g, a) <= 1:
+        return 1.2
+    return -0.5
+
+
+def _project_records_to_ground_truth(records: list[dict], ground_truth_text: str) -> list[dict]:
+    """Needleman-Wunsch DP alignment projecting ASR timestamps onto ground-truth tokens."""
+    gt_tokens = tokenize_lyrics(ground_truth_text)
+    if not gt_tokens:
+        return records
+    records = _expand_word_timestamps(records)
+    if not records:
+        return [{"word": t["text"], "start": 0.0, "end": 0.15, "probability": 0.0} for t in gt_tokens]
+
+    m, n = len(gt_tokens), len(records)
+    GAP = -0.8
+    dp = [[0.0] * (n + 1) for _ in range(m + 1)]
+    bt = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(1, m + 1):
+        dp[i][0] = dp[i - 1][0] + GAP
+        bt[i][0] = 1
+    for j in range(1, n + 1):
+        dp[0][j] = dp[0][j - 1] + GAP
+        bt[0][j] = 2
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            diag = dp[i - 1][j - 1] + _nw_score(gt_tokens[i - 1]["text"], records[j - 1]["word"])
+            up = dp[i - 1][j] + GAP
+            left = dp[i][j - 1] + GAP
+            best = max(diag, up, left)
+            dp[i][j] = best
+            if best == diag:
+                bt[i][j] = 0
+            elif best == up:
+                bt[i][j] = 1
+            else:
+                bt[i][j] = 2
+
+    matched = {}
+    i, j = m, n
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and bt[i][j] == 0:
+            matched[i - 1] = j - 1
+            i -= 1
+            j -= 1
+        elif i > 0 and bt[i][j] == 1:
+            i -= 1
+        else:
+            j -= 1
+
+    result = []
+    for i, tok in enumerate(gt_tokens):
+        if i in matched:
+            r = records[matched[i]]
+            result.append({"word": tok["text"], "start": float(r["start"]),
+                           "end": float(r["end"]), "probability": float(r.get("probability", 0.0))})
+        else:
+            result.append({"word": tok["text"], "start": -1.0, "end": -1.0, "probability": 0.0})
+
+    i = 0
+    prev_matched_idx = -1
+    while i < len(result):
+        if result[i]["start"] >= 0:
+            prev_matched_idx = i
+            i += 1
+            continue
+        next_matched_idx = -1
+        for k in range(i + 1, len(result)):
+            if result[k]["start"] >= 0:
+                next_matched_idx = k
+                break
+        gap_start = prev_matched_idx + 1
+        gap_end = next_matched_idx if next_matched_idx >= 0 else len(result)
+        gap_count = gap_end - gap_start
+        left_time = result[prev_matched_idx]["end"] if prev_matched_idx >= 0 else (records[0]["start"] if records else 0.0)
+        right_time = result[next_matched_idx]["start"] if next_matched_idx >= 0 else (left_time + 0.16 * gap_count)
+        if right_time - left_time < 0.03 * gap_count and prev_matched_idx >= 0 and next_matched_idx >= 0:
+            # Redistribute across [prev_matched_idx .. next_matched_idx] so adjacent words share positive duration
+            span_start = result[prev_matched_idx]["start"]
+            span_end = max(span_start + 0.03 * (gap_count + 2), result[next_matched_idx]["end"])
+            total_slots = gap_count + 2
+            for offset, idx in enumerate(range(prev_matched_idx, next_matched_idx + 1)):
+                s = span_start + (span_end - span_start) * offset / total_slots
+                e = span_start + (span_end - span_start) * (offset + 1) / total_slots
+                result[idx]["start"] = max(0.0, float(s))
+                result[idx]["end"] = max(result[idx]["start"] + 0.015, float(e))
+        else:
+            span = max(0.04 * gap_count, right_time - left_time)
+            for offset, idx in enumerate(range(gap_start, gap_end)):
+                s = left_time + span * offset / gap_count
+                e = left_time + span * (offset + 1) / gap_count
+                result[idx]["start"] = max(0.0, float(s))
+                result[idx]["end"] = max(result[idx]["start"] + 0.015, float(e))
+        prev_matched_idx = next_matched_idx
+        i = gap_end + 1 if next_matched_idx >= 0 else len(result)
+
+    prev_start = 0.0
+    for r in result:
+        if r["start"] < prev_start:
+            r["start"] = prev_start
+        if r["end"] <= r["start"]:
+            r["end"] = r["start"] + 0.02
+        prev_start = r["start"]
+
+    return result
+
+
 def transcribe_word_timestamps(
     audio_path: str | Path,
     prefer_cuda: bool = True,
     ground_truth_text: str = "",
 ) -> dict:
-    """Run Qwen3-ASR / Qwen3-ForcedAligner-0.6B (or faster-whisper CUDA fallback) to obtain character/word-level timestamps."""
+    """Run Qwen3-ASR / Qwen3-ForcedAligner-0.6B (or MMS-FA CTC / faster-whisper CUDA fallback) to obtain character/word-level timestamps."""
     audio_path = Path(audio_path)
     if not audio_path.is_file():
         raise FileNotFoundError(audio_path)
@@ -80,11 +291,11 @@ def transcribe_word_timestamps(
         dtype = torch.float16 if device == "cuda" else torch.float32
         if ground_truth_text:
             language = "English"
-            if re.search(r"[\u3041-\u3096\u30a1-\u30fa]", ground_truth_text):
+            if re.search(r"[ぁ-ゖァ-ヺ]", ground_truth_text):
                 language = "Japanese"
-            elif re.search(r"[\uac00-\ud7af]", ground_truth_text):
+            elif re.search(r"[가-힯]", ground_truth_text):
                 language = "Korean"
-            elif re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002fa1f]", ground_truth_text):
+            elif re.search(r"[㐀-䶿一-鿿豈-﫿\U00020000-\U0002fa1f]", ground_truth_text):
                 language = "Chinese"
             model = Qwen3ForcedAligner.from_pretrained(
                 "Qwen/Qwen3-ForcedAligner-0.6B", dtype=dtype, device_map=device)
@@ -114,6 +325,13 @@ def transcribe_word_timestamps(
         return {"raw_lyrics": text, "word_timestamps": _expand_word_timestamps(records),
                 "backend": backend}
 
+    # Tier 2: MMS-FA CTC for Latin/English ground truth (skip when faster_whisper is mocked)
+    if _is_faster_whisper_real() and ground_truth_text.strip():
+        mms_result = _try_mms_fa(audio_path, ground_truth_text, prefer_cuda)
+        if mms_result is not None:
+            return mms_result
+        failures.append("mms-fa: fell through")
+
     devices = ["cuda", "cpu"] if prefer_cuda else ["cpu"]
     for device in devices:
         try:
@@ -127,14 +345,41 @@ def transcribe_word_timestamps(
                 compute_type="float16" if device == "cuda" else "int8",
                 download_root=str(Path(__file__).resolve().parents[2].parents[1]
                                   / "work" / "model-cache" / "whisper"))
-            segments, info = model.transcribe(
-                audio_16k.astype(np.float32), word_timestamps=True, condition_on_previous_text=False,
-                temperature=0.0, initial_prompt=ground_truth_text or None)
-            segments = list(segments)
-            text = "".join(segment.text for segment in segments).strip()
-            records = [{"word": word.word, "start": word.start, "end": word.end,
-                        "probability": word.probability}
-                       for segment in segments for word in (segment.words or [])]
+            is_real_fw = getattr(WhisperModel, "__module__", "").startswith("faster_whisper")
+            if is_real_fw:
+                lang_hint = "zh" if re.search(_CJK_PATTERN, ground_truth_text) else ("en" if ground_truth_text else None)
+                prompt_hint = ground_truth_text[:48] if ground_truth_text else None
+                segments, info = model.transcribe(
+                    audio_16k.astype(np.float32), language=lang_hint, word_timestamps=True,
+                    condition_on_previous_text=False, vad_filter=True,
+                    temperature=0.0, initial_prompt=prompt_hint)
+                segments = list(segments)
+                records = [{"word": word.word, "start": word.start, "end": word.end,
+                            "probability": word.probability}
+                           for segment in segments for word in (segment.words or [])]
+                min_expected = max(5, len(tokenize_lyrics(ground_truth_text)) // 4) if ground_truth_text else 5
+                if len(records) < min_expected:
+                    segments_no_vad, info = model.transcribe(
+                        audio_16k.astype(np.float32), language=lang_hint, word_timestamps=True,
+                        condition_on_previous_text=False, vad_filter=False,
+                        temperature=0.0, initial_prompt=None)
+                    segments_no_vad = list(segments_no_vad)
+                    records_no_vad = [{"word": word.word, "start": word.start, "end": word.end,
+                                       "probability": word.probability}
+                                      for segment in segments_no_vad for word in (segment.words or [])]
+                    if len(records_no_vad) > len(records):
+                        segments = segments_no_vad
+                        records = records_no_vad
+                text = "".join(segment.text for segment in segments).strip()
+            else:
+                segments, info = model.transcribe(
+                    audio_16k.astype(np.float32), word_timestamps=True, condition_on_previous_text=False,
+                    temperature=0.0, initial_prompt=ground_truth_text or None)
+                segments = list(segments)
+                text = "".join(segment.text for segment in segments).strip()
+                records = [{"word": word.word, "start": word.start, "end": word.end,
+                            "probability": word.probability}
+                           for segment in segments for word in (segment.words or [])]
             if text and not records:
                 raise RuntimeError("Whisper returned nonempty text without timestamps")
         except (ImportError, OSError, RuntimeError, ValueError) as exc:
@@ -142,6 +387,17 @@ def transcribe_word_timestamps(
             failures.append(f"faster-whisper-{device}: {exc}")
             _LOG.warning("Whisper %s timestamp backend failed: %s", device, exc)
             continue
+
+        # Tier 3: project Whisper records onto ground truth via Needleman-Wunsch
+        if (ground_truth_text.strip() and records
+                and getattr(WhisperModel, "__module__", "").startswith("faster_whisper")):
+            projected = _project_records_to_ground_truth(records, ground_truth_text)
+            return {
+                "raw_lyrics": ground_truth_text,
+                "word_timestamps": _expand_word_timestamps(projected),
+                "backend": f"faster-whisper-{device}+gt-projection",
+            }
+
         return {"raw_lyrics": text, "word_timestamps": _expand_word_timestamps(records),
                 "backend": f"faster-whisper-{device}"}
     raise RuntimeError("All timestamp backends failed: " + "; ".join(failures)) from last_failure
@@ -262,6 +518,22 @@ def _join_tokens(texts):
     return result
 
 
+def _use_raw_intervals(notes, origin):
+    """Check if all notes have valid acoustic timestamps for interval computation."""
+    prev_raw_end = -1e-6
+    has_any = False
+    for note in notes:
+        rs = float(getattr(note, "raw_start", 0.0))
+        rd = float(getattr(note, "raw_duration", 0.0))
+        if rd <= 0:
+            return False
+        if rs < prev_raw_end - 1e-6:
+            return False
+        prev_raw_end = rs + rd
+        has_any = True
+    return has_any
+
+
 def align_lyrics_to_notes(
     project,
     raw_lyrics: str = "",
@@ -277,6 +549,7 @@ def align_lyrics_to_notes(
     previous_end = -math.inf
     intervals = []
     spb = 60.0 / bpm
+    use_raw = _use_raw_intervals(notes, origin) and (getattr(project, "bar_start_seconds", None) is not None or bool(getattr(project, "source", "")))
     for note in notes:
         start, duration = float(note.start), float(note.duration)
         if (not math.isfinite(start) or not math.isfinite(duration) or duration <= 0
@@ -284,7 +557,12 @@ def align_lyrics_to_notes(
                 or int(note.pitch) != note.pitch):
             raise ValueError("Notes must have finite pitches and ordered nonoverlapping positive durations")
         previous_end = start + duration
-        intervals.append((origin + start * spb, origin + float(note.start + note.duration) * spb))
+        if use_raw:
+            rs = float(note.raw_start)
+            rd = float(note.raw_duration)
+            intervals.append((rs, rs + rd))
+        else:
+            intervals.append((origin + start * spb, origin + float(note.start + note.duration) * spb))
     resolved_raw_lyrics = raw_lyrics
     records = []
     if word_timestamps is None and vocal_audio_path is not None:

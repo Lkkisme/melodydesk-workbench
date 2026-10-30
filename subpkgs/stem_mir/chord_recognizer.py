@@ -140,9 +140,10 @@ def synthesize_melody_conditioned_harmony(
     accompaniment_path: str | Path | None = None,
     minor: bool = False,
     clip_duration: float = 0.0,
+    bar_start_seconds: list[float] | None = None,
 ) -> dict:
-    """Melody-primary diatonic harmony with optional accompaniment CQT support
-    and Viterbi smoothing across bars."""
+    """Dual-Band (Bass CQT + Upper CQT) Melody-Conditioned Functional Harmony Engine
+    with expanded 24-chord vocabulary and Viterbi smoothing across bars."""
     import math
 
     NAMES = "C C# D D# E F F# G G# A A# B".split()
@@ -151,44 +152,75 @@ def synthesize_melody_conditioned_harmony(
     measure_beats, seconds_per_beat, bar_seconds = _timing(bpm, beat_origin, meter)
     R = NAMES.index(tonic)
 
-    if minor:
-        R_min = (R + 9) % 12
-        diatonic = [
-            ((R_min + 0) % 12, True),   # i (6m in Jianpu)
-            ((R_min + 3) % 12, False),  # III (1 in Jianpu)
-            ((R_min + 5) % 12, True),   # iv (2m in Jianpu)
-            ((R_min + 7) % 12, True),   # v (3m in Jianpu)
-            ((R_min + 7) % 12, False),  # V (3 in Jianpu, harmonic minor dominant)
-            ((R_min + 8) % 12, False),  # VI (4 in Jianpu)
-            ((R_min + 10) % 12, False), # VII (5 in Jianpu)
-        ]
-    else:
-        diatonic = [
-            ((R + 0) % 12, False),  # I
-            ((R + 2) % 12, True),   # ii
-            ((R + 4) % 12, True),   # iii
-            ((R + 5) % 12, False),  # IV
-            ((R + 7) % 12, False),  # V
-            ((R + 9) % 12, True),   # vi
-        ]
-    seen = set()
-    unique_diatonic = []
-    for pair in diatonic:
-        if pair not in seen:
-            seen.add(pair)
-            unique_diatonic.append(pair)
-    diatonic = unique_diatonic
-
     def _chord_name(root, is_minor):
         return NAMES[root % 12] + ("m" if is_minor else "")
 
-    chord_names = [_chord_name(r, m) for r, m in diatonic]
+    # --- Expanded Functional & Acoustic Guitar Chord Vocabulary ---
+    # Each candidate: (root, quality, tones_set, prior_bias, emit_name)
+    # emit_name uses only major/minor to stay parseable by guitar.parse_chord
+    candidates = []
+    seen_names = set()
+
+    def _add(root, quality, tones, prior_bias):
+        r = root % 12
+        is_minor = quality == "m"
+        name = _chord_name(r, is_minor)
+        key = (name, tones)
+        if key not in seen_names:
+            seen_names.add(key)
+            candidates.append((r, quality, tuple(sorted(set(((r + t) % 12) for t in tones))), prior_bias, name))
+
+    if minor:
+        R_min = (R + 9) % 12
+        # Diatonic triads: i, III, iv, v, V, VI, VII
+        _add(R_min, "m", (0, 3, 7), 0.06)          # i
+        _add((R_min + 3) % 12, "", (0, 4, 7), 0.06) # III
+        _add((R_min + 5) % 12, "m", (0, 3, 7), 0.06) # iv
+        _add((R_min + 7) % 12, "m", (0, 3, 7), 0.06) # v
+        _add((R_min + 7) % 12, "", (0, 4, 7), 0.06)  # V
+        _add((R_min + 8) % 12, "", (0, 4, 7), 0.06)  # VI
+        _add((R_min + 10) % 12, "", (0, 4, 7), 0.06) # VII
+        # Harmonic minor dominant V7
+        _add((R_min + 7) % 12, "", (0, 4, 7, 10), 0.04)
+        # Dorian major IV
+        _add((R_min + 5) % 12, "", (0, 4, 7), 0.02)
+    else:
+        # Diatonic triads: I, ii, iii, IV, V, vi
+        _add(R, "", (0, 4, 7), 0.06)                  # I
+        _add((R + 2) % 12, "m", (0, 3, 7), 0.06)      # ii
+        _add((R + 4) % 12, "m", (0, 3, 7), 0.06)      # iii
+        _add((R + 5) % 12, "", (0, 4, 7), 0.06)        # IV
+        _add((R + 7) % 12, "", (0, 4, 7), 0.06)        # V
+        _add((R + 9) % 12, "m", (0, 3, 7), 0.06)       # vi
+        # Dominant 7th V7
+        _add((R + 7) % 12, "", (0, 4, 7, 10), 0.03)
+        # Secondary dominant V/vi
+        _add((R + 4) % 12, "", (0, 4, 7), -0.02)
+        # Secondary dominant V/V
+        _add((R + 2) % 12, "", (0, 4, 7), -0.03)
+        # Borrowed bVII (Mixolydian)
+        _add((R + 10) % 12, "", (0, 4, 7), -0.03)
+
+    chord_names = [c[4] for c in candidates]
+    candidate_roots = [c[0] for c in candidates]
+    candidate_tones = [c[2] for c in candidates]
+    candidate_biases = [c[3] for c in candidates]
+    candidate_qualities = [c[1] for c in candidates]
 
     max_note_end = max((n.start * seconds_per_beat + beat_origin + n.duration * seconds_per_beat
                         for n in notes), default=0.0) if notes else 0.0
     total_duration = max(clip_duration, max_note_end, beat_origin + bar_seconds)
     n_bars = max(1, int(math.ceil((total_duration - beat_origin) / bar_seconds)))
 
+    # --- True Bar-Boundary Audio Slicing ---
+    if bar_start_seconds is not None and len(bar_start_seconds) >= 2:
+        n_bars = len(bar_start_seconds) - 1
+        computed_bar_starts = [float(t) for t in bar_start_seconds]
+    else:
+        computed_bar_starts = [beat_origin + b * bar_seconds for b in range(n_bars + 1)]
+
+    # --- Dual-Band CQT Extraction ---
+    acc_bass_per_bar = None
     acc_chroma_per_bar = None
     acc_rms_per_bar = None
     if accompaniment_path is not None:
@@ -198,31 +230,38 @@ def synthesize_melody_conditioned_harmony(
             y_acc, sr_acc = librosa.load(str(acc_path), sr=22050, mono=True)
             if y_acc.size and np.all(np.isfinite(y_acc)):
                 hop = 512
-                C = np.abs(librosa.cqt(np.pad(y_acc, (0, max(0, 4096 - len(y_acc)))),
-                                        sr=sr_acc, hop_length=hop,
-                                        fmin=librosa.note_to_hz("C2"), n_bins=48,
-                                        bins_per_octave=12, tuning=0.0, scale=False))
-                ft = librosa.frames_to_time(np.arange(C.shape[1]), sr=sr_acc, hop_length=hop)
+                pad_acc = np.pad(y_acc, (0, max(0, 4096 - len(y_acc))))
+                bass_cqt = np.abs(librosa.cqt(pad_acc, sr=sr_acc, hop_length=hop,
+                                               fmin=librosa.note_to_hz("C2"), n_bins=24,
+                                               bins_per_octave=12, tuning=0.0, scale=False))
+                upper_cqt = np.abs(librosa.cqt(pad_acc, sr=sr_acc, hop_length=hop,
+                                                fmin=librosa.note_to_hz("C3"), n_bins=36,
+                                                bins_per_octave=12, tuning=0.0, scale=False))
+                ft = librosa.frames_to_time(np.arange(bass_cqt.shape[1]), sr=sr_acc, hop_length=hop)
                 rms_frames = librosa.feature.rms(y=y_acc, frame_length=2048, hop_length=hop)[0]
+                acc_bass_per_bar = []
                 acc_chroma_per_bar = []
                 acc_rms_per_bar = []
                 for b in range(n_bars):
-                    bs = beat_origin + b * bar_seconds
-                    be = bs + bar_seconds
+                    bs = float(computed_bar_starts[b])
+                    be = float(computed_bar_starts[b + 1])
                     sel = (ft >= bs) & (ft < be)
-                    chroma = np.zeros(12)
+                    bass_chroma = np.zeros(12)
+                    upper_chroma = np.zeros(12)
                     bar_rms = 0.0
                     if np.any(sel):
-                        spec = np.median(C[:, sel], axis=1)
-                        for octave_start in range(0, len(spec), 12):
-                            chroma += spec[octave_start:octave_start + 12]
+                        bass_spec = np.median(bass_cqt[:, sel], axis=1)
+                        bass_chroma = bass_spec[:12] + bass_spec[12:24]
+                        upper_spec = np.median(upper_cqt[:, sel], axis=1)
+                        for oct_start in range(0, 36, 12):
+                            upper_chroma += upper_spec[oct_start:oct_start + 12]
                         rms_sel = rms_frames[:len(ft)][sel] if len(rms_frames) >= len(ft) else rms_frames[sel[:len(rms_frames)]]
                         bar_rms = float(np.mean(rms_sel)) if len(rms_sel) else 0.0
-                    acc_chroma_per_bar.append(chroma)
+                    acc_bass_per_bar.append(bass_chroma)
+                    acc_chroma_per_bar.append(upper_chroma)
                     acc_rms_per_bar.append(bar_rms)
 
-    bar_start_seconds = [beat_origin + b * bar_seconds for b in range(n_bars + 1)]
-
+    # --- Emission Scoring ---
     emission_scores = []
     vocal_present = []
     for b in range(n_bars):
@@ -240,16 +279,19 @@ def synthesize_melody_conditioned_harmony(
         has_vocal = float(np.sum(vocal_w)) > 0
         vocal_present.append(has_vocal)
 
-        acc_w = None
-        if acc_chroma_per_bar is not None:
-            acc_w = acc_chroma_per_bar[b]
+        acc_bass = acc_bass_per_bar[b] if acc_bass_per_bar is not None else None
+        acc_upper = acc_chroma_per_bar[b] if acc_chroma_per_bar is not None else None
 
         bar_scores = {}
-        for (root, is_minor), name in zip(diatonic, chord_names):
-            third = (root + 3) % 12 if is_minor else (root + 4) % 12
-            fifth = (root + 7) % 12
-            tones = {root, third, fifth}
-            avoid_pc = (third + 1) % 12 if not is_minor else -1
+        for ci in range(len(candidates)):
+            root = candidate_roots[ci]
+            tones = set(candidate_tones[ci])
+            quality = candidate_qualities[ci]
+            name = chord_names[ci]
+            bias = candidate_biases[ci]
+            is_minor_q = quality == "m"
+            third = (root + 3) % 12 if is_minor_q else (root + 4) % 12
+            avoid_pc = (third + 1) % 12 if not is_minor_q else -1
 
             vocal_score = 0.0
             if has_vocal:
@@ -258,50 +300,88 @@ def synthesize_melody_conditioned_harmony(
                     if pc in tones:
                         s += vocal_w[pc] * 1.0
                     elif pc == avoid_pc:
-                        s += vocal_w[pc] * -0.65
+                        s += vocal_w[pc] * -0.75
                     else:
                         s += vocal_w[pc] * -0.25
                 vocal_score = s / float(np.sum(vocal_w))
 
-            acc_score = 0.0
-            if acc_w is not None and float(np.sum(acc_w)) > 0:
+            bass_score = 0.0
+            if acc_bass is not None:
+                max_bass = float(np.max(acc_bass))
+                if max_bass > 0:
+                    bass_score = float(acc_bass[root] / max_bass)
+
+            upper_score = 0.0
+            if acc_upper is not None and float(np.sum(acc_upper)) > 0:
                 s = 0.0
                 for pc in range(12):
-                    s += acc_w[pc] * (1.0 if pc in tones else -0.3)
-                acc_score = s / float(np.sum(acc_w))
+                    s += acc_upper[pc] * (1.0 if pc in tones else -0.3)
+                upper_score = s / float(np.sum(acc_upper))
 
             if has_vocal:
-                combined = 0.72 * vocal_score + 0.28 * acc_score
+                combined = 0.60 * vocal_score + 0.18 * upper_score + 0.22 * bass_score + bias
             else:
                 t_root = (R + 9) % 12 if minor else R
                 tonic_prior = 0.05 if root == t_root else 0.0
                 cadence_prior = 0.06 if (b == n_bars - 1 or b % 4 == 0) and root == t_root else 0.0
-                combined = 1.0 * acc_score + tonic_prior + cadence_prior
+                combined = 0.55 * upper_score + 0.35 * bass_score + tonic_prior + cadence_prior + bias
 
-            bar_scores[name] = combined
+            if name in bar_scores:
+                bar_scores[name] = max(bar_scores[name], combined)
+            else:
+                bar_scores[name] = combined
         emission_scores.append(bar_scores)
 
-    tonic_name = _chord_name((R + 9) % 12 if minor else R, minor)
+    # --- Functional Viterbi Transitions ---
+    tonic_root = (R + 9) % 12 if minor else R
+    tonic_name = _chord_name(tonic_root, minor)
+    dominant_root = (tonic_root + 7) % 12
+    dom_name = _chord_name(dominant_root, False)
+    vi_root = (R + 9) % 12 if not minor else -1
+    vi_name = _chord_name(vi_root, True) if not minor else ""
+    v_of_vi_name = _chord_name((R + 4) % 12, False) if not minor else ""
+
+    name_to_root = {}
+    for ci in range(len(candidates)):
+        n = chord_names[ci]
+        if n not in name_to_root:
+            name_to_root[n] = candidate_roots[ci]
+
+    unique_names = list(dict.fromkeys(chord_names))
+
     states = {None: (0.0, [])}
     for b in range(n_bars):
         updated = {}
-        for name, fit in emission_scores[b].items():
+        for name in unique_names:
+            if name not in emission_scores[b]:
+                continue
+            fit = emission_scores[b][name]
             best = None
+            curr_root = name_to_root.get(name, 0)
             for prev, (cost, path) in states.items():
                 transition = 0.0
                 if prev is not None and prev != "N.C." and name != "N.C.":
-                    prev_parsed = next(((r, m) for (r, m), cn in zip(diatonic, chord_names) if cn == prev), None)
-                    curr_parsed = next(((r, m) for (r, m), cn in zip(diatonic, chord_names) if cn == name), None)
-                    if prev_parsed and curr_parsed:
-                        distance = (curr_parsed[0] - prev_parsed[0]) % 12
-                        if distance in (5, 7):
-                            transition += 0.10
-                        if distance == 2:
-                            transition += 0.08
-                        if prev == name:
-                            transition -= 0.04
-                            if len(path) >= 2 and path[-2] == name:
-                                transition -= 0.22
+                    prev_root = name_to_root.get(prev, 0)
+                    distance = (curr_root - prev_root) % 12
+
+                    # Authentic cadences
+                    if prev == dom_name and name == tonic_name:
+                        transition += 0.14
+                    elif not minor and prev == v_of_vi_name and name == vi_name:
+                        transition += 0.14
+
+                    # Circle-of-fifths and step progressions
+                    if distance in (5, 7):
+                        transition += 0.10
+                    elif distance == 2:
+                        transition += 0.10
+
+                    # Repetition penalty
+                    if prev == name:
+                        transition -= 0.03
+                        if len(path) >= 2 and path[-2] == name:
+                            transition -= 0.14
+
                     if (b % 4 == 0 or b == n_bars - 1) and name == tonic_name:
                         transition += 0.12
                 total = cost + fit + transition
@@ -326,7 +406,7 @@ def synthesize_melody_conditioned_harmony(
 
     return {
         "chords": chords,
-        "bar_start_seconds": [round(t, 6) for t in bar_start_seconds],
+        "bar_start_seconds": [round(t, 6) for t in computed_bar_starts],
         "bar_dynamics": bar_dynamics,
     }
 

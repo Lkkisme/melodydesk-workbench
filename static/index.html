@@ -588,7 +588,7 @@
       const bars = (currentState && currentState.bar_analysis) || [];
       if (!bars.length || !currentState.bpm) return 0;
       const pos = position();
-      const bss = currentState && currentState.bar_start_seconds;
+      const bss = currentState && (currentState.bar_start_seconds || (currentState.arrangement && currentState.arrangement.bar_start_seconds));
       if (Array.isArray(bss) && bss.length >= 2) {
         let lo = 0, hi = Math.min(bars.length - 1, bss.length - 2);
         while (lo <= hi) {

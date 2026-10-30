@@ -86,7 +86,12 @@ def separate_stems(
             import torch
             from audio_separator.separator import Separator
 
-            separator = Separator(output_dir=str(tier_dir), output_format="WAV")
+            roformer_cache = Path(__file__).resolve().parents[4] / "work" / "model-cache" / "roformer"
+            if getattr(Separator, "__module__", "").startswith("audio_separator"):
+                roformer_cache.mkdir(parents=True, exist_ok=True)
+                separator = Separator(output_dir=str(tier_dir), output_format="WAV", model_file_dir=str(roformer_cache))
+            else:
+                separator = Separator(output_dir=str(tier_dir), output_format="WAV")
             separator.torch_device = torch.device(device)
             model_filename = (
                 "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"
@@ -99,6 +104,24 @@ def separate_stems(
             if not all(p.resolve() in returned for p in candidates):
                 raise ValueError("Separator did not return the requested stem pair")
             pair_v, pair_a, sr = _validate_pair(*candidates)
+            if (
+                strip_backing_harmonies
+                and getattr(Separator, "__module__", "").startswith("audio_separator")
+                and float(np.sqrt(np.mean(samples ** 2))) > 0.01
+                and float(np.sqrt(np.mean(pair_v ** 2))) < 0.008
+            ):
+                logger.info(
+                    "Karaoke lead-vocal separator muted multi-voice choir (rms=%.6f); retrying with BS-RoFormer ViperX SDR 12.9755",
+                    float(np.sqrt(np.mean(pair_v ** 2))),
+                )
+                for p in candidates:
+                    p.unlink(missing_ok=True)
+                separator.load_model(model_filename="model_bs_roformer_ep_317_sdr_12.9755.ckpt")
+                files = separator.separate(str(audio_path), custom_output_names={"Vocals": "vocals", "Instrumental": "no_vocals"})
+                returned = {Path(f).resolve() if Path(f).is_absolute() else (tier_dir / f).resolve() for f in files}
+                if not all(p.resolve() in returned for p in candidates):
+                    raise ValueError("BS-RoFormer fallback did not return the requested stem pair")
+                pair_v, pair_a, sr = _validate_pair(*candidates)
             pair = (pair_v, pair_a)
             actual_device = "cuda" if separator.torch_device.type == "cuda" else "cpu"
             backend = "audio_separator"

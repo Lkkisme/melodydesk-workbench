@@ -159,6 +159,8 @@ def _get_blended_studio_base(pitch: int, string: int, layer: int, sr: int, is_pm
     if primary_wave is not None:
         seg = primary_wave[: min(len(primary_wave), max_len)].astype(np.float64)
         seg = _pitch_shift_resample(seg, shift_semi) * 2.45
+        if abs(shift_semi) > 0.5:
+            seg = sosfilt(butter(2, min(0.48 * sr, 9500.0), fs=sr, output='sos'), seg)
         if fss_wave is not None:
             f_seg = fss_wave[: min(len(fss_wave), max_len)].astype(np.float64)
             f_seg = _pitch_shift_resample(f_seg, fss_shift)
@@ -367,6 +369,12 @@ def _schedule(events, bpm, sr, measure_beats=4.0):
                 step_sec = 0.012 if len(unique_strings) >= 3 else 0.005
                 rake = ((max(unique_strings) - event["string"]) if is_downstroke else (event["string"] - min(unique_strings))) * step_sec
         onset = round((event["start"] * spb + rake) * sr)
+        if tech not in {"X", "CM", "H", "P", "PB"}:
+            played = groups[event["start"]]
+            unique_strings = sorted(set(played))
+            if len(unique_strings) == 1 and (event["start"] % 1.0) > 0.1:
+                micro = (((index * 7 + event["string"] * 13) % 17) / 17.0 - 0.5) * 2 * 0.0025
+                onset = max(0, onset + round(micro * sr))
         if tech == "X":
             ring_beats = event["duration"]
         elif tech == "PM":
@@ -493,12 +501,25 @@ def synthesize_realistic_guitar(
         bar_start_seconds = [max(0.0, x - bss_origin) for x in raw_bss]
         avg_bar_dur = (bar_start_seconds[-1] - bar_start_seconds[0]) / max(1, len(bar_start_seconds) - 1)
 
+    beat_times_raw = arrangement.get("beat_times")
+    has_beat_warp = (beat_times_raw is not None
+                     and hasattr(beat_times_raw, '__len__')
+                     and len(beat_times_raw) >= 2)
+    if has_beat_warp:
+        bt = [max(0.0, float(x) - float(beat_times_raw[0])) for x in beat_times_raw]
+        bt_avg_dur = (bt[-1] - bt[0]) / max(1, len(bt) - 1)
+
     bar_dynamics = arrangement.get("bar_dynamics")
     bars_list = arrangement.get("bars", [])
     already_scaled = bool(bars_list and isinstance(bars_list[0], dict) and "dynamic_scale" in bars_list[0])
     has_dynamics = (not already_scaled) and bar_dynamics is not None and hasattr(bar_dynamics, '__len__') and len(bar_dynamics) > 0
 
     def _beat_to_warped_sec(beat_pos: float) -> float:
+        if has_beat_warp:
+            max_idx = len(bt) - 1
+            if beat_pos <= max_idx:
+                return float(np.interp(beat_pos, np.arange(len(bt), dtype=np.float64), bt))
+            return bt[-1] + (beat_pos - max_idx) * bt_avg_dur
         if not has_warp:
             return beat_pos * spb
         b_idx = max(0, int(beat_pos // beats_per_bar))
@@ -517,10 +538,10 @@ def synthesize_realistic_guitar(
 
     scheduled = _schedule(arrangement["events"], bpm, sr, measure_beats=measure_beats)
 
-    if has_warp or has_dynamics:
+    if has_warp or has_beat_warp or has_dynamics:
         for item in scheduled:
             event = item["event"]
-            if has_warp:
+            if has_warp or has_beat_warp:
                 sched_start_beat = item["onset"] / (spb * sr)
                 sched_end_beat = (item["onset"] + item["duration"]) / (spb * sr)
                 t0_sec = _beat_to_warped_sec(sched_start_beat)
@@ -571,14 +592,18 @@ def synthesize_realistic_guitar(
         stereo_dry[item["onset"] : end_idx, 0] += gain_l * seg
         stereo_dry[item["onset"] : end_idx, 1] += gain_r * seg
 
-    # Subtle studio wooden room early reflections (-18 dB)
+    # Warm stereo Haas body resonance: concert-hall unplugged depth (-19 dB, LP 3200 Hz)
     mono_sum = stereo_dry.mean(axis=1)
-    tail = round(0.034 * sr)
+    body_lp = sosfilt(butter(2, 3200.0, fs=sr, output='sos'), mono_sum)
+    haas_gain = 10.0 ** (-19.0 / 20.0)
+    d_l1, d_l2 = round(0.017 * sr), round(0.041 * sr)
+    d_r1, d_r2 = round(0.027 * sr), round(0.053 * sr)
+    tail = max(d_l2, d_r2) + 1
     stereo = np.pad(stereo_dry, ((0, tail), (0, 0)))
-    d_left = round(0.017 * sr)
-    d_right = round(0.027 * sr)
-    stereo[d_left : d_left + len(mono_sum), 0] += 0.085 * mono_sum
-    stereo[d_right : d_right + len(mono_sum), 1] += 0.085 * mono_sum
+    for d in (d_l1, d_l2):
+        stereo[d : d + len(body_lp), 0] += haas_gain * body_lp
+    for d in (d_r1, d_r2):
+        stereo[d : d + len(body_lp), 1] += haas_gain * body_lp
 
     if sf2_path is not None:
         stereo += _sf2_attacks(sf2_path, scheduled, sr, len(stereo))

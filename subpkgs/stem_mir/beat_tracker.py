@@ -1,6 +1,7 @@
 """SOTA Beat & Downbeat Tracker wrapping CPJKU/beat_this (ISMIR SOTA) with librosa fallback."""
 from __future__ import annotations
 from pathlib import Path
+import math
 import numpy as np
 import logging
 
@@ -14,22 +15,80 @@ def _timestamps(values, duration):
     return np.unique(values[(values >= 0) & (values < duration)])
 
 
+def seconds_to_beats_piecewise(
+    sec: float | np.ndarray,
+    beat_times: list[float] | np.ndarray | None,
+    bpm: float,
+    beat_origin: float = 0.0,
+) -> float | np.ndarray:
+    """Map timestamp(s) in seconds to continuous beat coordinates using piecewise grid."""
+    spb = 60.0 / bpm
+    scalar = np.ndim(sec) == 0
+    sec_arr = np.atleast_1d(np.asarray(sec, dtype=np.float64))
+    if beat_times is not None:
+        bt = np.asarray(beat_times, dtype=np.float64).ravel()
+        if len(bt) >= 2 and np.all(np.diff(bt) > 0):
+            beat_indices = np.arange(len(bt), dtype=np.float64)
+            result = np.interp(sec_arr, bt, beat_indices)
+            below = sec_arr < bt[0]
+            if np.any(below):
+                result[below] = (sec_arr[below] - bt[0]) / spb
+            above = sec_arr > bt[-1]
+            if np.any(above):
+                result[above] = beat_indices[-1] + (sec_arr[above] - bt[-1]) / spb
+            return float(result[0]) if scalar else result
+    result = (sec_arr - beat_origin) / spb
+    return float(result[0]) if scalar else result
+
+
+def beats_to_seconds_piecewise(
+    beat: float | np.ndarray,
+    beat_times: list[float] | np.ndarray | None,
+    bpm: float,
+    beat_origin: float = 0.0,
+) -> float | np.ndarray:
+    """Inverse mapping from continuous beat coordinate(s) to seconds."""
+    spb = 60.0 / bpm
+    scalar = np.ndim(beat) == 0
+    beat_arr = np.atleast_1d(np.asarray(beat, dtype=np.float64))
+    if beat_times is not None:
+        bt = np.asarray(beat_times, dtype=np.float64).ravel()
+        if len(bt) >= 2 and np.all(np.diff(bt) > 0):
+            beat_indices = np.arange(len(bt), dtype=np.float64)
+            result = np.interp(beat_arr, beat_indices, bt)
+            below = beat_arr < 0
+            if np.any(below):
+                result[below] = bt[0] + beat_arr[below] * spb
+            above = beat_arr > beat_indices[-1]
+            if np.any(above):
+                result[above] = bt[-1] + (beat_arr[above] - beat_indices[-1]) * spb
+            return float(result[0]) if scalar else result
+    result = beat_origin + beat_arr * spb
+    return float(result[0]) if scalar else result
+
+
 def track_beats_and_downbeats(
     audio_path: str | Path,
     prefer_cuda: bool = True,
+    bpm_range: tuple[float, float] = (60.0, 180.0),
+    meter_hint: str | None = None,
 ) -> dict:
     """Track beats, downbeats, meter, bpm, and beat_origin from audio.
 
     Returns dict:
-        - `bpm`: float (60.0 to 180.0 normalized)
+        - `bpm`: float (normalized to bpm_range)
         - `beat_origin`: float (first downbeat or earliest beat in seconds >= 0.0)
         - `meter`: str ('4/4' or '3/4')
         - `beats`: list[float]
         - `downbeats`: list[float]
         - `backend`: str ('beat_this' or 'librosa')
+        - `beat_times`: list[float] — piecewise beat grid snapped to detected beats
+        - `bar_start_seconds`: list[float] — bar boundary timestamps
     """
     import librosa
     from .separator_engine import resolve_device
+
+    lo_bpm, hi_bpm = float(bpm_range[0]), float(bpm_range[1])
 
     y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
     if not y.size or not np.all(np.isfinite(y)):
@@ -61,10 +120,10 @@ def track_beats_and_downbeats(
         if len(beats) < 2:
             raise ValueError("Insufficient periodic onsets to estimate tempo")
     bpm = 60.0 / float(np.median(np.diff(beats)))
-    while bpm < 60.0:
+    while bpm < lo_bpm:
         beats = np.sort(np.concatenate((beats, (beats[:-1] + beats[1:]) / 2)))
         bpm *= 2.0
-    while bpm > 180.0:
+    while bpm > hi_bpm and len(beats) >= 4:
         parity = 0
         if downbeats is not None and len(downbeats):
             parity = int(np.argmin(np.abs(beats - downbeats[0]))) % 2
@@ -76,25 +135,70 @@ def track_beats_and_downbeats(
         window = onset_env[max(0, frame - 1):min(len(onset_env), frame + 2)]
         accent[i] = float(np.max(window)) if window.size else 0.0
     measure_beats, phase, best_score = 4, 0, -np.inf
-    for m in (4, 3):
-        for p in range(m):
-            indicator = (np.arange(len(beats)) % m == p).astype(np.float64)
-            a, t = accent - accent.mean(), indicator - indicator.mean()
-            denominator = np.linalg.norm(a) * np.linalg.norm(t)
-            score = float(a @ t / denominator) if denominator > 0 else 0.0
-            if score > best_score:
-                measure_beats, phase, best_score = m, p, score
-    if backend == "beat_this" and len(downbeats) >= 2:
-        indices = np.asarray([np.argmin(np.abs(beats - t)) for t in downbeats])
-        intervals = float(np.median(np.diff(indices)))
-        measure_beats = min((4, 3), key=lambda m: abs(intervals - m))
+    if meter_hint in ('3/4', '4/4'):
+        measure_beats = 3 if meter_hint == '3/4' else 4
+        if backend == "beat_this" and downbeats is not None and len(downbeats) >= 2:
+            phase = int(np.argmin(np.abs(beats - downbeats[0]))) % measure_beats
+        else:
+            for p in range(measure_beats):
+                indicator = (np.arange(len(beats)) % measure_beats == p).astype(np.float64)
+                a, t = accent - accent.mean(), indicator - indicator.mean()
+                denominator = np.linalg.norm(a) * np.linalg.norm(t)
+                score = float(a @ t / denominator) if denominator > 0 else 0.0
+                if score > best_score:
+                    phase, best_score = p, score
+    else:
+        for m in (4, 3):
+            for p in range(m):
+                indicator = (np.arange(len(beats)) % m == p).astype(np.float64)
+                a, t = accent - accent.mean(), indicator - indicator.mean()
+                denominator = np.linalg.norm(a) * np.linalg.norm(t)
+                score = float(a @ t / denominator) if denominator > 0 else 0.0
+                if score > best_score:
+                    measure_beats, phase, best_score = m, p, score
+    if backend == "beat_this" and downbeats is not None and len(downbeats) >= 2:
+        if meter_hint not in ('3/4', '4/4'):
+            indices = np.asarray([np.argmin(np.abs(beats - t)) for t in downbeats])
+            intervals = float(np.median(np.diff(indices)))
+            measure_beats = min((4, 3), key=lambda m: abs(intervals - m))
     else:
         downbeats = beats[phase::measure_beats]
+
+    # Build piecewise beat_times grid
+    spb = 60.0 / bpm
+    beat_origin = float(downbeats[0] if len(downbeats) else beats[0])
+    snap_tol = 0.35 * spb
+    beat_arr = np.asarray(beats, dtype=np.float64)
+    beat_times_list: list[float] = [beat_origin]
+    cur_spb = spb
+    pos = beat_origin
+    while pos + cur_spb * 0.5 < duration:
+        next_pos = pos + cur_spb
+        candidates = beat_arr[(beat_arr > pos + cur_spb * 0.3) & (beat_arr < pos + cur_spb * 1.7)]
+        if len(candidates):
+            closest = candidates[np.argmin(np.abs(candidates - next_pos))]
+            if abs(closest - next_pos) <= snap_tol:
+                next_pos = float(closest)
+                step = next_pos - pos
+                cur_spb = 0.75 * cur_spb + 0.25 * step
+        pos = next_pos
+        beat_times_list.append(pos)
+
+    # Build bar_start_seconds
+    n_beat_times = len(beat_times_list)
+    n_bars = max(1, math.ceil((n_beat_times - 1) / measure_beats))
+    needed = n_bars * measure_beats + 1
+    while len(beat_times_list) < needed:
+        beat_times_list.append(beat_times_list[-1] + cur_spb)
+    bar_start_seconds = [beat_times_list[b * measure_beats] for b in range(n_bars + 1)]
+
     return {
         "bpm": float(bpm),
-        "beat_origin": float(downbeats[0] if len(downbeats) else beats[0]),
+        "beat_origin": beat_origin,
         "meter": f"{measure_beats}/4",
         "beats": [float(t) for t in beats],
         "downbeats": [float(t) for t in downbeats],
         "backend": backend,
+        "beat_times": beat_times_list,
+        "bar_start_seconds": bar_start_seconds,
     }

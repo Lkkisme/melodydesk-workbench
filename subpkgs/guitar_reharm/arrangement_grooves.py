@@ -134,8 +134,12 @@ def arrange_advanced(
     tonic_pc = _note_pc(project.tonic)
     pentatonic = {(tonic_pc+x)%12 for x in (0,2,4,7,9)}
     diatonic = {(tonic_pc+x)%12 for x in (0,2,4,5,7,9,11)}
+    _FINGERPICK_STYLES = {'分解和弦', '抒情琶音', '指弹律动'}
+    _PHRASE_VEL_CURVE = [0.97, 1.00, 1.04, 0.98]
+
     for bar in bars:
         index = bar['bar']
+        bar_index = index
         silent = not _overlapping_notes(project.notes,index*measure,(index+1)*measure)
         if intro_mode == 'nc' and silent:
             continue
@@ -143,8 +147,14 @@ def arrange_advanced(
         bar_dyn = bar.get('dynamic_scale')
         use_gentle = bar_dyn is not None and bar_dyn < 0.68 and style in _GENTLE_STYLES
         effective_style_idx = 0 if use_gentle else ADVANCED_STYLES.index(style)
+        phrase_vel_scale = _PHRASE_VEL_CURVE[bar_index % 4]
+        dyn_scale = bar.get('dynamic_scale')
+        is_cadence_bar = (bar_index + 1) % 4 == 0
+        is_fingerpick = style in _FINGERPICK_STYLES
+        is_4_4 = abs(measure - 4.0) < 1e-9
+        segments = bar['split_segments']
         grid = sorted(set([i*0.5 for i in range(math.ceil(measure*2)) if i*0.5 < measure]
-                          +[s['beat'] for s in bar['split_segments']]))
+                          +[s['beat'] for s in segments]))
         for beat in grid:
             segment = active(bar,beat)
             if segment is None:
@@ -158,6 +168,17 @@ def arrange_advanced(
             high = treble[-1:]
             bass_list = [bass] if bass is not None else []
             slot = int(round(beat*2))%8
+            use_alt_bass = False
+            alt_bass_item = None
+            if (is_fingerpick and is_4_4 and len(segments) == 1
+                    and (is_cadence_bar or bar_index % 2 == 0)
+                    and abs(beat - 2.0) < 1e-9 and bass is not None):
+                bass_s = bass[0]
+                for candidate in sorted(played, key=lambda x: -x[0]):
+                    if candidate[0] in (4, 5) and candidate[1] >= 0 and candidate[0] != bass_s:
+                        alt_bass_item = candidate
+                        use_alt_bass = True
+                        break
             patterns = (
                 [bass_list,low,middle,low,high,low,middle,low],
                 [played,[],mid_treble,treble,bass_list,treble,mid_treble,treble],
@@ -167,15 +188,22 @@ def arrange_advanced(
             )
             slot_vels = (90, 45, 68, 44, 84, 46, 72, 44)
             selection = list(patterns[effective_style_idx][slot])
+            if use_alt_bass and alt_bass_item is not None:
+                if bass in selection:
+                    selection = [alt_bass_item if (x == bass) else x for x in selection]
+                elif is_cadence_bar and selection:
+                    selection = [alt_bass_item]
             is_strum = len(selection) >= 3
-            if any(abs(beat-s['beat']) < 1e-9 for s in bar['split_segments']) and bass is not None and bass not in selection:
-                selection.append(bass)
+            if any(abs(beat-s['beat']) < 1e-9 for s in segments) and bass is not None and bass not in selection:
+                if not use_alt_bass:
+                    selection.append(bass)
             for item in selection:
                 if cm and item[0] <= 3:
                     continue
-                is_bass = bass is not None and item == bass
+                is_bass = bass is not None and (item == bass or (use_alt_bass and item == alt_bass_item))
                 technique = 'PM' if palm_mute and is_bass and any(abs(beat-b) < 1e-9 for b in (0,measure/2)) else ''
                 velocity = (92 if slot == 0 else slot_vels[slot]) if is_strum else (92 if (is_bass and slot == 0) else 86 if is_bass else slot_vels[slot])
+                velocity = max(1, min(127, round(velocity * phrase_vel_scale)))
                 insert(bar,beat,0.5,item,velocity,technique)
         if cm:
             explicit = instrumental_melody is not None and index in instrumental_melody
@@ -247,8 +275,9 @@ def arrange_advanced(
             for beat in (1.0,3.0):
                 segment = active(bar,beat) if beat < measure else None
                 if segment is not None:
+                    slap_vel = max(1, min(127, round(82 * phrase_vel_scale * (float(dyn_scale) if dyn_scale is not None else 1.0))))
                     slaps.append(dict(bar=index,beat=beat,start=index*measure+beat,duration=min(0.5,measure-beat),
-                                      string=6,fret=0,pitch=40,velocity=82,technique='X',chord=segment['chord'],
+                                      string=6,fret=0,pitch=40,velocity=slap_vel,technique='X',chord=segment['chord'],
                                       segment=bar['split_segments'].index(segment)))
     ordered = sorted(events.values(),key=lambda e:(e['start'],e['string'],e['technique']))
     previous_by_string = {}
