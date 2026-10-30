@@ -325,7 +325,7 @@
             <span class="aes-top"><span class="aes-idx">A</span><span class="aes-en">Classical Fingerstyle</span><span class="led amber"></span></span>
             <span class="aes-title">古典/原版分解</span>
             <span class="aes-chords">C → G/B → Am → F</span>
-            <span class="aes-desc">忠实原曲和声，古典指弹颗粒感分解拨弦</span>
+            <span class="aes-desc">契合人声主旋律和声，古典指弹颗粒感分解拨弦</span>
           </button>
           <button type="button" class="aes" data-vibe="folk_easy">
             <span class="aes-top"><span class="aes-idx">B</span><span class="aes-en">Open-Chord Strum</span><span class="led amber"></span></span>
@@ -348,16 +348,16 @@
         </div>
       </section>
 
-      <!-- 03 · 3-stem concert mixer -->
+      <!-- 03 · 2-stem vocal & guitar duet mixer -->
       <section class="module">
-        <div class="mod-head"><span class="mod-idx">III.</span><span class="mod-title">制琴工坊三轨母带混音台</span><span class="mod-spec">3-Stem Concert Mixer</span></div>
+        <div class="mod-head"><span class="mod-idx">III.</span><span class="mod-title">制琴工坊人声与木吉他双轨混音台</span><span class="mod-spec">Vocal &amp; Guitar Mixer</span></div>
         <div class="transport">
           <button type="button" id="btn-play-toggle" aria-label="播放 / 暂停" disabled>
             <svg id="play-icon"><use href="#i-play"/></svg>
           </button>
           <div class="transport-body">
             <div class="transport-meta">
-              <span id="play-text">正在载入三轨音频…</span>
+              <span id="play-text">正在载入人声与木吉他音轨…</span>
               <span class="timecode mono"><b id="time-cur">00:00</b> / <span id="time-dur">00:00</span></span>
             </div>
             <div id="seek-bar" role="slider" tabindex="0" aria-label="播放位置" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"><canvas></canvas></div>
@@ -366,23 +366,19 @@
 
         <div class="faders">
           <div>
-            <div class="fader-head"><span id="label-vocal-track">主唱 / 旋律</span><span class="tag">STEM 1</span><span class="fader-val" id="val-vol-vocal">85%</span></div>
+            <div class="fader-head"><span id="label-vocal-track">真人主唱 (Lead Vocal)</span><span class="tag">STEM 1</span><span class="fader-val" id="val-vol-vocal">85%</span></div>
             <input type="range" class="fader" id="slider-vol-vocal" min="0" max="100" value="85">
           </div>
           <div>
-            <div class="fader-head"><span>艺术木吉他</span><span class="tag">STEM 2</span><span class="fader-val" id="val-vol-guitar">95%</span></div>
+            <div class="fader-head"><span>艺术木吉他伴奏 (Guitar)</span><span class="tag">STEM 2</span><span class="fader-val" id="val-vol-guitar">95%</span></div>
             <input type="range" class="fader accent" id="slider-vol-guitar" min="0" max="100" value="95">
-          </div>
-          <div id="row-vol-backing">
-            <div class="fader-head"><span>原曲伴奏对比</span><span class="tag">STEM 3</span><span class="fader-val" id="val-vol-backing">0%</span></div>
-            <input type="range" class="fader" id="slider-vol-backing" min="0" max="100" value="0">
           </div>
         </div>
 
         <div class="scene-row">
           <button type="button" class="scene active" id="btn-mode-duet">弹唱合奏</button>
           <button type="button" class="scene" id="btn-mode-guitar-only">纯享木吉他</button>
-          <button type="button" class="scene" id="btn-mode-reference">对比原曲</button>
+          <button type="button" class="scene" id="btn-mode-reference">纯享真人声</button>
         </div>
         <div class="export-row">
           <a class="btn" id="link-download-mix" href="#" role="button">
@@ -603,13 +599,12 @@
       return Math.max(0, Math.min(bars.length - 1, Math.floor(pos / secPerBar)));
     }
 
-    // ───────── Sample-accurate Web Audio 3-stem engine ─────────
-    const STEMS = ['vocal', 'guitar', 'backing'];
-    const STEM_URLS = { vocal: '/api/audio/vocal-only.wav', guitar: '/api/audio/guitar-only.wav', backing: '/api/audio/backing.wav' };
+    // ───────── Sample-accurate Web Audio 2-stem Vocal & Guitar engine ─────────
+    const STEMS = ['vocal', 'guitar'];
+    const STEM_URLS = { vocal: '/api/audio/vocal-only.wav', guitar: '/api/audio/guitar-only.wav' };
     const sliders = {
       vocal: document.getElementById('slider-vol-vocal'),
-      guitar: document.getElementById('slider-vol-guitar'),
-      backing: document.getElementById('slider-vol-backing')
+      guitar: document.getElementById('slider-vol-guitar')
     };
     const btnPlayToggle = document.getElementById('btn-play-toggle');
     const playIconUse = document.querySelector('#play-icon use');
@@ -651,7 +646,7 @@
 
     function setPlayingUI(on) {
       playIconUse.setAttribute('href', on ? '#i-pause' : '#i-play');
-      playText.textContent = on ? '正在演奏 · 指板按法逐小节同步' : (engine.buffers ? '三轨已对齐 · 点击播放' : '正在载入三轨音频…');
+      playText.textContent = on ? '正在演奏 · 指板按法逐小节同步' : (engine.buffers ? '人声与吉他已对齐 · 点击播放' : '正在载入人声与吉他音频…');
     }
 
     async function play(fromSec) {
@@ -807,12 +802,12 @@
       engine.playing = false;
       stopSources();
       btnPlayToggle.disabled = true;
-      playText.textContent = '正在渲染并对齐三轨…';
+      playText.textContent = '正在渲染并对齐人声与木吉他…';
       try {
         const bust = Date.now();
         const decoded = await Promise.all(STEMS.map(k => fetchStem(k, bust, token)));
         if (token !== engine.loadToken) return;
-        engine.buffers = { vocal: decoded[0], guitar: decoded[1], backing: decoded[2] };
+        engine.buffers = { vocal: decoded[0], guitar: decoded[1] };
         engine.duration = Math.max(...decoded.map(b => b.duration));
         engine.peaks = computePeaks(engine.buffers, 400);
         engine.offset = Math.min(resumeAt, engine.duration);
@@ -835,9 +830,9 @@
 
     // Mixer scenes
     const SCENES = {
-      'btn-mode-duet': { vocal: 85, guitar: 95, backing: 0 },
-      'btn-mode-guitar-only': { vocal: 0, guitar: 100, backing: 0 },
-      'btn-mode-reference': { vocal: 0, guitar: 0, backing: 100 }
+      'btn-mode-duet': { vocal: 85, guitar: 95 },
+      'btn-mode-guitar-only': { vocal: 0, guitar: 100 },
+      'btn-mode-reference': { vocal: 100, guitar: 0 }
     };
     function setScene(id) {
       Object.keys(SCENES).forEach(k => document.getElementById(k).classList.toggle('active', k === id));

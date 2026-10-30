@@ -1,5 +1,7 @@
-"""Locked unit tests for subpkgs/stem_mir."""
+"""Locked unit tests for subpkgs/stem_mir (100% Pure Vocal-Driven Pipeline)."""
+import inspect
 import tempfile
+import types
 import unittest
 from pathlib import Path
 import sys
@@ -16,10 +18,9 @@ from subpkgs.stem_mir import (
     resolve_device,
     separate_stems,
     track_beats_and_downbeats,
-    recognize_accompaniment_chords,
     synthesize_melody_conditioned_harmony,
-    extract_instrumental_melody,
 )
+import subpkgs.stem_mir.chord_recognizer as cr_mod
 
 
 def _write_wav(path: Path, samples: np.ndarray, sr: int = 22050) -> None:
@@ -46,8 +47,10 @@ class StemMirTests(unittest.TestCase):
         spb = 60.0 / bpm
         duration = 8.0
         y = np.zeros(int(sr * duration), dtype=np.float32)
+        vocal_onsets = []
         for beat_idx in range(16):
             t0 = int(beat_idx * spb * sr)
+            vocal_onsets.append(beat_idx * spb)
             length = int(0.03 * sr)
             freq = 1200.0 if (beat_idx % 4 == 0) else 660.0
             t = np.arange(length) / sr
@@ -55,7 +58,7 @@ class StemMirTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             wav_path = Path(tmp) / "clicks.wav"
             _write_wav(wav_path, y, sr=sr)
-            res = track_beats_and_downbeats(wav_path, prefer_cuda=True)
+            res = track_beats_and_downbeats(wav_path, prefer_cuda=True, vocal_onsets_sec=vocal_onsets)
             self.assertIn("bpm", res)
             self.assertGreaterEqual(res["bpm"], 60.0)
             self.assertLessEqual(res["bpm"], 180.0)
@@ -64,105 +67,57 @@ class StemMirTests(unittest.TestCase):
             self.assertIsInstance(res["beats"], list)
             self.assertIsInstance(res["downbeats"], list)
 
-    def test_recognize_accompaniment_chords_and_split_bar_and_slash(self):
-        sr = 22050
-        bpm = 120.0
-        spb = 60.0 / bpm
-        bar_sec = 4 * spb  # 2.0s per bar
-        y = np.zeros(int(sr * bar_sec * 4), dtype=np.float32)
-
-        def synth_chord(midis, start_s, end_s):
-            s0 = int(start_s * sr)
-            s1 = int(end_s * sr)
-            t = np.arange(s1 - s0) / sr
-            sig = np.zeros_like(t)
-            for idx, m in enumerate(midis):
-                f = 440.0 * (2.0 ** ((m - 69.0) / 12.0))
-                amp = 1.35 if idx == 0 else 0.85
-                sig += amp * np.sin(2 * np.pi * f * t) + 0.35 * np.sin(4 * np.pi * f * t)
-            y[s0:s1] = sig
-
-        # Bar 0: C major (C2, C4, E4, G4)
-        synth_chord([36, 60, 64, 67], 0.0, 2.0)
-        # Bar 1: G/B slash chord (B2=47 bass, G3=55, D4=62, G4=67)
-        synth_chord([47, 55, 62, 67], 2.0, 4.0)
-        # Bar 2: Am (A2=45, A3=57, C4=60, E4=64)
-        synth_chord([45, 57, 60, 64], 4.0, 6.0)
-        # Bar 3: Split-bar F (0..1s) -> G (1..2s)
-        synth_chord([41, 53, 65, 69], 6.0, 7.0)
-        synth_chord([43, 55, 59, 67], 7.0, 8.0)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            wav_path = Path(tmp) / "prog.wav"
-            _write_wav(wav_path, y, sr=sr)
-
-            res_full = recognize_accompaniment_chords(
-                wav_path, bpm=120.0, beat_origin=0.0, meter="4/4", bar_count=4, tonic="C", split_bar=False
-            )
-            self.assertEqual(len(res_full["chords"]), 4)
-            self.assertTrue(res_full["chords"][0].startswith("C"))
-            self.assertTrue(res_full["chords"][1].startswith("G"))
-            self.assertIn("/B", res_full["chords"][1])
-            self.assertTrue(res_full["chords"][2].startswith("Am"))
-
-            res_split = recognize_accompaniment_chords(
-                wav_path, bpm=120.0, beat_origin=0.0, meter="4/4", bar_count=4, tonic="C", split_bar=True
-            )
-            self.assertEqual(len(res_split["split_chords"]), 4)
-            # Bar 3 has two distinct half-bar chords (F -> G)
-            bar3_segs = res_split["split_chords"][3]
-            self.assertEqual(len(bar3_segs), 2)
-            self.assertTrue(bar3_segs[0]["chord"].startswith("F"))
-            self.assertTrue(bar3_segs[1]["chord"].startswith("G"))
-
-    def test_extract_instrumental_melody_for_intro_bar(self):
-        sr = 22050
-        bpm = 120.0
-        spb = 60.0 / bpm
-        y = np.zeros(int(sr * 2.0), dtype=np.float32)
-        # 4 quarter notes in Bar 0: E5 (76), D5 (74), C5 (72), G4 (67)
-        for beat_i, midi_p in enumerate([76, 74, 72, 67]):
-            s0 = int(beat_i * spb * sr)
-            s1 = int((beat_i + 0.85) * spb * sr)
-            t = np.arange(s1 - s0) / sr
-            f = 440.0 * (2.0 ** ((midi_p - 69.0) / 12.0))
-            y[s0:s1] = np.sin(2 * np.pi * f * t) * np.exp(-t * 2.0)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            wav_path = Path(tmp) / "intro.wav"
-            _write_wav(wav_path, y, sr=sr)
-            mel = extract_instrumental_melody(
-                wav_path, bpm=120.0, beat_origin=0.0, meter="4/4", silent_bars=[0]
-            )
-            self.assertIn(0, mel)
-            self.assertGreaterEqual(len(mel[0]), 3)
-            pitches = [n["pitch"] for n in mel[0]]
-            self.assertTrue(any(abs(p - 76) <= 1 for p in pitches))
-            self.assertTrue(any(abs(p - 72) <= 1 for p in pitches))
-
-    def test_pure_vocal_driven_harmony_and_dynamics_zero_accompaniment(self):
-        import types
-        vocal_notes = [
-            types.SimpleNamespace(pitch=69, start=0.0, duration=2.0),  # A4 in bar 0
-            types.SimpleNamespace(pitch=73, start=2.0, duration=2.0),  # C#5 in bar 0
-            types.SimpleNamespace(pitch=71, start=4.0, duration=2.0),  # B4 in bar 1
-            types.SimpleNamespace(pitch=68, start=6.0, duration=2.0),  # G#4 in bar 1
+    def test_pure_vocal_driven_harmony_and_dynamics_major_and_minor(self):
+        # Major key (A major): Bar 0 sings A4 + C#5 -> A; Bar 1 sings B4 + G#4 -> E
+        vocal_notes_maj = [
+            types.SimpleNamespace(pitch=69, start=0.0, duration=2.0),
+            types.SimpleNamespace(pitch=73, start=2.0, duration=2.0),
+            types.SimpleNamespace(pitch=71, start=4.0, duration=2.0),
+            types.SimpleNamespace(pitch=68, start=6.0, duration=2.0),
         ]
-        res = synthesize_melody_conditioned_harmony(
-            notes=vocal_notes,
+        res_maj = synthesize_melody_conditioned_harmony(
+            notes=vocal_notes_maj,
             bpm=84.0,
             beat_origin=0.0,
             meter="4/4",
             tonic="A",
-            accompaniment_path=None,
             clip_duration=9.0,
             minor=False,
         )
-        self.assertEqual(len(res["chords"]), 4)
-        self.assertTrue(all(c != "N.C." for c in res["chords"]))
-        self.assertEqual(res["chords"][0], "A")
-        self.assertEqual(res["chords"][1], "E")
-        self.assertEqual(len(res["bar_dynamics"]), 4)
+        self.assertEqual(len(res_maj["chords"]), 4)
+        self.assertTrue(all(c != "N.C." for c in res_maj["chords"]))
+        self.assertEqual(res_maj["chords"][0], "A")
+        self.assertEqual(res_maj["chords"][1], "E")
+        self.assertEqual(len(res_maj["bar_dynamics"]), 4)
+
+        # Dorian / Natural Minor key (E minor, tonic="G", minor=True):
+        # Bar 0 sings E4 + G4 + B4 -> Em; Bar 1 sings D4 + F#4 + A4 -> D (bVII, not B major V!)
+        vocal_notes_min = [
+            types.SimpleNamespace(pitch=64, start=0.0, duration=1.5),
+            types.SimpleNamespace(pitch=67, start=1.5, duration=1.5),
+            types.SimpleNamespace(pitch=62, start=3.0, duration=1.5),
+            types.SimpleNamespace(pitch=69, start=4.5, duration=1.5),
+        ]
+        res_min = synthesize_melody_conditioned_harmony(
+            notes=vocal_notes_min,
+            bpm=90.0,
+            beat_origin=0.0,
+            meter="3/4",
+            tonic="G",
+            clip_duration=4.0,
+            minor=True,
+        )
+        self.assertEqual(res_min["chords"][0], "Em")
+        self.assertEqual(res_min["chords"][1], "D")
+
+    def test_zero_accompaniment_pollution_in_chord_recognizer(self):
+        """Ensure chord_recognizer contains zero accompaniment audio / CQT parameters or functions."""
+        sig = inspect.signature(synthesize_melody_conditioned_harmony)
+        self.assertNotIn("accompaniment_path", sig.parameters)
+        src = inspect.getsource(cr_mod)
+        self.assertNotIn("recognize_accompaniment_chords", src)
+        self.assertNotIn("extract_instrumental_melody", src)
+        self.assertNotIn("librosa.cqt", src)
 
 
 if __name__ == "__main__":

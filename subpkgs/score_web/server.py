@@ -324,7 +324,6 @@ def _initial_session(demo_mode: str = 'mandarin_pop'):
     if demo_mode in manifest:
         entry = manifest[demo_mode]
         vocals_wav = Path(entry['vocals_wav'])
-        acc_wav = Path(entry['no_vocals_wav'])
         if vocals_wav.is_file():
             notes = [Note(**n) for n in entry['notes']]
             project = Project(
@@ -335,7 +334,7 @@ def _initial_session(demo_mode: str = 'mandarin_pop'):
                 beat_origin=float(entry['beat_origin']),
                 clip_duration=float(entry['clip_duration']),
                 source=entry['source'],
-                audio={'vocals': str(vocals_wav), 'no_vocals': str(acc_wav) if acc_wav.is_file() else entry['source']},
+                audio={'vocals': str(vocals_wav)},
                 notes=notes,
                 reference_notes=deepcopy(notes),
             )
@@ -614,16 +613,6 @@ def _vocal_only_samples(session, sr=44100):
     return np.pad(vocal[:length], ((0, max(0, length-len(vocal))), (0, 0))) * 0.85
 
 
-def _backing_samples(session, sr=44100):
-    path = session.project.audio.get('no_vocals') or session.project.source
-    guitar_len = len(_guitar_samples(session, sr))
-    if not path or not Path(path).is_file():
-        return np.zeros((max(1, guitar_len), 2), dtype=np.float32)
-    backing = _load_stem_audio(path, sr, session.project.beat_origin)
-    length = max(len(backing), guitar_len)
-    return np.pad(backing[:length], ((0, max(0, length-len(backing))), (0, 0))) * 0.75
-
-
 def _vocal_mix_samples(session, sr=44100):
     path = session.project.audio.get('vocals')
     guitar_samples = _guitar_samples(session, sr)
@@ -869,10 +858,6 @@ def create_app() -> FastAPI:
     def vocal_only_audio():
         return Response(content=_wav_bytes(_vocal_only_samples(audio_snapshot())), media_type='audio/wav')
 
-    @application.get('/api/audio/backing.wav')
-    def backing_audio():
-        return Response(content=_wav_bytes(_backing_samples(audio_snapshot())), media_type='audio/wav')
-
     @application.get('/api/audio/vocal-guitar-mix.wav')
     def vocal_audio():
         return Response(content=_wav_bytes(_vocal_mix_samples(audio_snapshot())), media_type='audio/wav')
@@ -905,7 +890,7 @@ def create_app() -> FastAPI:
 
         def _worker():
             try:
-                from subpkgs.stem_mir import separate_stems, track_beats_and_downbeats, recognize_accompaniment_chords
+                from subpkgs.stem_mir import separate_stems, track_beats_and_downbeats, synthesize_melody_conditioned_harmony
                 from subpkgs.singing_lyrics import transcribe_vocal_notes
                 import soundfile as sf
 
@@ -961,24 +946,20 @@ def create_app() -> FastAPI:
                 project = Project(
                     title=audio_path.stem, tonic=tonic, meter=meter, bpm=bpm, beat_origin=beat_origin,
                     clip_duration=clip_duration, source=str(audio_path),
-                    audio={'vocals': stems['vocals'], 'no_vocals': stems['accompaniment']},
+                    audio={'vocals': stems['vocals']},
                     notes=notes, reference_notes=deepcopy(notes),
                 )
-                if notes:
-                    vocal_chords = guitar.suggest(project, tonic_pc, minor=False)
-                    turnaround = [
-                        guitar.chord_name(tonic_pc, False),
-                        guitar.chord_name(tonic_pc + 7, False),
-                        guitar.chord_name(tonic_pc + 9, True),
-                        guitar.chord_name(tonic_pc + 5, False),
-                    ]
-                    base_chords = [
-                        (turnaround[i % 4] if (not ch or ch == 'N.C.') else ch)
-                        for i, ch in enumerate(vocal_chords)
-                    ]
-                else:
-                    chord_info = recognize_accompaniment_chords(stems['accompaniment'], bpm=bpm, beat_origin=beat_origin, meter=meter, tonic=tonic)
-                    base_chords = chord_info['chords']
+                turnaround = [
+                    guitar.chord_name(tonic_pc, False),
+                    guitar.chord_name(tonic_pc + 7, False),
+                    guitar.chord_name(tonic_pc + 9, True),
+                    guitar.chord_name(tonic_pc + 5, False),
+                ]
+                vocal_chords = guitar.suggest(project, tonic_pc, minor=False) if notes else turnaround
+                base_chords = [
+                    (turnaround[i % 4] if (not ch or ch == 'N.C.') else ch)
+                    for i, ch in enumerate(vocal_chords)
+                ]
                 beat_times_secs: list[float] = [float(t) for t in (beat_info.get('beat_times') or [])]
                 bar_start_secs: list[float] = [float(t) for t in (beat_info.get('bar_start_seconds') or [])]
                 bar_dyn: list[float] = []
@@ -997,12 +978,10 @@ def create_app() -> FastAPI:
                 except Exception:
                     pass
                 try:
-                    from subpkgs.stem_mir import synthesize_melody_conditioned_harmony
                     if callable(synthesize_melody_conditioned_harmony) and notes:
                         harmony = synthesize_melody_conditioned_harmony(
                             notes, bpm=bpm, beat_origin=beat_origin, meter=meter, tonic=tonic,
-                            accompaniment_path=None, clip_duration=clip_duration,
-                            bar_start_seconds=bar_start_secs or None)
+                            clip_duration=clip_duration, bar_start_seconds=bar_start_secs or None)
                         if isinstance(harmony, dict):
                             if harmony.get('chords'):
                                 base_chords = list(harmony['chords'])
