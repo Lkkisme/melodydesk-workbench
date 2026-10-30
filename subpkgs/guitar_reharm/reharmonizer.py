@@ -203,7 +203,8 @@ def suggest_bar_substitutions(
         pcs = set(parsed['pcs'])
         report = check_melody_clash(symbol,melody_notes,bar_start,bar_end)
         reason_label = '同功能安全代用' if report['status'] == 'safe' else ('色彩张力代用' if report['status'] == 'tension' else '避用音冲突')
-        key = ({'safe':0,'tension':1,'clash':2}[report['status']], len(pcs-scale),
+        is_harsh_q = 1 if parsed['quality'] in {'aug', 'dim', 'dim7', 'm7b5'} else 0
+        key = ({'safe':0,'tension':1,'clash':2}[report['status']], len(pcs-scale), is_harsh_q,
                len(pcs ^ set(current['pcs'])), sum(len(pcs ^ set(n['pcs'])) for n in neighbors), index)
         ranked.append((key,dict(chord=symbol,roman=roman_numeral(symbol,tonic),clash=report,reason=reason_label)))
     return [record for _,record in sorted(ranked,key=lambda pair:pair[0])]
