@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Literal
+import inspect
 import io
 import math
 import threading
@@ -105,6 +106,9 @@ class Session:
     bar_analysis: list[dict] = field(default_factory=list)
     arrangement: dict = field(default_factory=dict)
     undo_stack: list = field(default_factory=list)
+    bar_start_seconds: list[float] = field(default_factory=list)
+    bar_dynamics: list[float] = field(default_factory=list)
+    word_timestamps: list = field(default_factory=list)
     demo_mode: str = 'mandarin_pop'
     _cached_guitar_samples: tuple | None = field(default=None, repr=False)
 
@@ -116,15 +120,16 @@ def _snapshot(session):
 
 
 def _align(candidate, timestamps=None):
-    if not candidate.raw_lyrics and timestamps is None:
+    eff_timestamps = timestamps if timestamps is not None else (candidate.word_timestamps or None)
+    if not candidate.raw_lyrics and eff_timestamps is None:
         candidate.note_lyrics = [''] * len(candidate.project.notes)
         return
     if not _implemented(align_lyrics_to_notes):
         raise HTTPException(503, 'Lyric alignment dependency is unavailable')
     vocal_path = candidate.project.audio.get('vocals')
-    available = vocal_path if (vocal_path and Path(vocal_path).is_file() and not candidate.raw_lyrics.strip() and timestamps is None) else None
+    available = vocal_path if (vocal_path and Path(vocal_path).is_file() and not candidate.raw_lyrics.strip() and eff_timestamps is None) else None
     alignment = align_lyrics_to_notes(candidate.project, raw_lyrics=candidate.raw_lyrics,
-                                     word_timestamps=timestamps, vocal_audio_path=available)
+                                     word_timestamps=eff_timestamps, vocal_audio_path=available)
     candidate.note_lyrics = alignment['note_lyrics']
     candidate.raw_lyrics = alignment['raw_lyrics']
 
@@ -192,11 +197,15 @@ def _rebuild(candidate):
                     row['chord'], prev_c, next_c, candidate.project.tonic,
                     candidate.project.notes, index*measure, (index+1)*measure
                 )[:8]
-        arrangement = arrange_advanced(candidate.project, chords=[row['chord'] for row in analysis],
+        _arrange_kwargs = dict(
+            chords=[row['chord'] for row in analysis],
             style=candidate.style, capo=candidate.capo, custom_voicings=candidate.custom_voicings,
             split_chords=[row['split_segments'] for row in analysis], passing_bass=candidate.passing_bass,
             slap_x=candidate.slap_x, palm_mute=candidate.palm_mute,
             embellish_hp=candidate.embellish_hp, intro_mode=candidate.intro_mode)
+        if candidate.bar_dynamics and 'bar_dynamics' in inspect.signature(arrange_advanced).parameters:
+            _arrange_kwargs['bar_dynamics'] = candidate.bar_dynamics
+        arrangement = arrange_advanced(candidate.project, **_arrange_kwargs)
         for row, bar in zip(analysis, arrangement['bars']):
             row['split_segments'] = deepcopy(bar['split_segments'])
             row['frets'] = list(bar['frets'])
@@ -222,6 +231,11 @@ def _rebuild(candidate):
             bar.update(bar=index, roman='', split_segments=[segment])
             analysis.append(dict(bar=index, chord=bar['chord'], roman='', split_segments=[deepcopy(segment)]))
     build_score_timeline(candidate.project, arrangement)
+    if candidate.bar_start_seconds:
+        offset0 = float(candidate.bar_start_seconds[0])
+        arrangement['bar_start_seconds'] = [max(0.0, float(t) - offset0) for t in candidate.bar_start_seconds]
+    if candidate.bar_dynamics:
+        arrangement['bar_dynamics'] = list(candidate.bar_dynamics)
     if len(candidate.note_lyrics) != len(candidate.project.notes):
         _align(candidate)
     candidate.bar_analysis, candidate.arrangement = analysis, arrangement
@@ -337,6 +351,9 @@ def _initial_session(demo_mode: str = 'mandarin_pop'):
                 intro_mode='none',
                 raw_lyrics=entry['raw_lyrics'],
                 note_lyrics=note_lyrics,
+                bar_start_seconds=list(entry.get('bar_start_seconds', [])),
+                bar_dynamics=list(entry.get('bar_dynamics', [])),
+                word_timestamps=list(entry.get('word_timestamps', [])),
                 demo_mode=demo_mode,
             )
             _rebuild(session)
@@ -952,11 +969,49 @@ def create_app() -> FastAPI:
                 else:
                     chord_info = recognize_accompaniment_chords(stems['accompaniment'], bpm=bpm, beat_origin=beat_origin, meter=meter, tonic=tonic)
                     base_chords = chord_info['chords']
+                bar_start_secs: list[float] = []
+                bar_dyn: list[float] = []
+                try:
+                    from subpkgs.singing_lyrics import regulate_singing_notes_for_score
+                    if callable(regulate_singing_notes_for_score) and notes:
+                        regulated = regulate_singing_notes_for_score(raw_notes, bpm=bpm, beat_origin=beat_origin, clip_duration=clip_duration)
+                        if regulated and isinstance(regulated, list):
+                            notes = regulated
+                            project.notes = notes
+                            project.reference_notes = deepcopy(notes)
+                except (ImportError, AttributeError):
+                    pass
+                except Exception:
+                    pass
+                try:
+                    from subpkgs.stem_mir import synthesize_melody_conditioned_harmony
+                    if callable(synthesize_melody_conditioned_harmony) and notes:
+                        harmony = synthesize_melody_conditioned_harmony(
+                            notes, bpm=bpm, beat_origin=beat_origin, meter=meter, tonic=tonic,
+                            accompaniment_path=stems['accompaniment'], clip_duration=clip_duration)
+                        if isinstance(harmony, dict):
+                            if harmony.get('chords'):
+                                base_chords = list(harmony['chords'])
+                            if harmony.get('bar_start_seconds'):
+                                bar_start_secs = [float(t) for t in harmony['bar_start_seconds']]
+                            if harmony.get('bar_dynamics'):
+                                bar_dyn = [float(d) for d in harmony['bar_dynamics']]
+                except (ImportError, AttributeError):
+                    pass
+                except Exception:
+                    pass
+                if not bar_start_secs and beat_info.get('downbeat_times'):
+                    bar_start_secs = [float(t) for t in beat_info['downbeat_times']]
+                if not bar_dyn and bar_start_secs:
+                    bar_dyn = [1.0] * len(bar_start_secs)
+
                 def _apply(candidate):
                     candidate.demo_mode = 'upload'
                     candidate.project = project
                     candidate.base_chords = base_chords
                     candidate.custom_voicings = [None]*len(base_chords)
+                    candidate.bar_start_seconds = bar_start_secs
+                    candidate.bar_dynamics = bar_dyn
                     candidate.raw_lyrics = lyrics
                     candidate.note_lyrics = ['']*len(notes)
                     if lyrics:

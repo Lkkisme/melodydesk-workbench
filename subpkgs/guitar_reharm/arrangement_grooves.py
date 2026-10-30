@@ -29,6 +29,7 @@ def arrange_advanced(
     embellish_hp: bool = False,
     intro_mode: str = "chord_melody",
     instrumental_melody: dict[int, list[dict]] | None = None,
+    bar_dynamics: list[float] | None = None,
 ) -> dict:
     """Generate rich 6-string guitar tab events with selectable Split-Bar harmony, X/PM/HP/PB articulations, and Intro/Interlude Chord-Melody soloing."""
     if style not in ADVANCED_STYLES:
@@ -93,6 +94,11 @@ def arrange_advanced(
     for bar in bars:
         if bar['split_segments']:
             bar['frets'] = list(bar['split_segments'][0]['frets'])
+        if bar_dynamics is not None and bar['bar'] < len(bar_dynamics):
+            dyn = max(0.55, min(1.15, float(bar_dynamics[bar['bar']])))
+            bar['dynamic_scale'] = round(dyn, 3)
+
+    _GENTLE_STYLES = {'民谣扫弦', '流行扫弦', '拍弦律动', '扫弦伴奏', '指弹律动'}
 
     events = {}
     slaps = []
@@ -114,6 +120,9 @@ def arrange_advanced(
         duration = min(duration,segment['beat']+segment['duration']-beat,measure-beat)
         if duration <= 0:
             return
+        dyn_scale = bar.get('dynamic_scale')
+        if dyn_scale is not None:
+            velocity = max(1, min(127, round(velocity * dyn_scale)))
         start = bar['bar']*measure+beat
         event = dict(bar=bar['bar'],beat=beat,start=start,duration=duration,string=string,fret=fret,
                      pitch=pitch,velocity=velocity,technique=technique,chord=segment['chord'],
@@ -131,6 +140,9 @@ def arrange_advanced(
         if intro_mode == 'nc' and silent:
             continue
         cm = intro_mode == 'chord_melody' and silent
+        bar_dyn = bar.get('dynamic_scale')
+        use_gentle = bar_dyn is not None and bar_dyn < 0.68 and style in _GENTLE_STYLES
+        effective_style_idx = 0 if use_gentle else ADVANCED_STYLES.index(style)
         grid = sorted(set([i*0.5 for i in range(math.ceil(measure*2)) if i*0.5 < measure]
                           +[s['beat'] for s in bar['split_segments']]))
         for beat in grid:
@@ -154,7 +166,7 @@ def arrange_advanced(
                 [bass_list,low,middle,high,middle,low,middle,low],
             )
             slot_vels = (90, 45, 68, 44, 84, 46, 72, 44)
-            selection = list(patterns[ADVANCED_STYLES.index(style)][slot])
+            selection = list(patterns[effective_style_idx][slot])
             is_strum = len(selection) >= 3
             if any(abs(beat-s['beat']) < 1e-9 for s in bar['split_segments']) and bass is not None and bass not in selection:
                 selection.append(bass)

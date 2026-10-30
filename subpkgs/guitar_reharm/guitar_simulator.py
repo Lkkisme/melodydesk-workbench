@@ -472,14 +472,75 @@ def synthesize_realistic_guitar(
        - 'X' Thumb Slap (warm 95/210 Hz cedar-top body tap + subtle string click)
        - 'P.M.' Palm Mute (Vel01 soft layer + bridge palm damping + 1150 Hz low-pass warmth)
        - 'H' / 'P' Hammer-on & Pull-off (suppressed pick transient, smooth legato transition)
+    4. Beat-Synchronous Time-Warping:
+       When `arrangement['bar_start_seconds']` provides real detected bar onset times,
+       events are placed at the actual rubato-following positions instead of a rigid BPM grid.
     """
     _sample_rate(sr)
     measure_beats = float(arrangement.get("measure_beats", 4.0))
-    scheduled = _schedule(arrangement["events"], project.bpm, sr, measure_beats=measure_beats)
+    bpm = project.bpm
+    spb = 60.0 / bpm
+    beats_per_bar = measure_beats
+    n_bars = int(arrangement.get("bar_count", max((e.get("bar", 0) for e in arrangement["events"]), default=0) + 1))
+
+    bar_start_seconds = arrangement.get("bar_start_seconds")
+    has_warp = (bar_start_seconds is not None
+                and hasattr(bar_start_seconds, '__len__')
+                and len(bar_start_seconds) >= 2)
+    if has_warp:
+        raw_bss = [float(x) for x in bar_start_seconds]
+        bss_origin = raw_bss[0]
+        bar_start_seconds = [max(0.0, x - bss_origin) for x in raw_bss]
+        avg_bar_dur = (bar_start_seconds[-1] - bar_start_seconds[0]) / max(1, len(bar_start_seconds) - 1)
+
+    bar_dynamics = arrangement.get("bar_dynamics")
+    bars_list = arrangement.get("bars", [])
+    already_scaled = bool(bars_list and isinstance(bars_list[0], dict) and "dynamic_scale" in bars_list[0])
+    has_dynamics = (not already_scaled) and bar_dynamics is not None and hasattr(bar_dynamics, '__len__') and len(bar_dynamics) > 0
+
+    def _beat_to_warped_sec(beat_pos: float) -> float:
+        if not has_warp:
+            return beat_pos * spb
+        b_idx = max(0, int(beat_pos // beats_per_bar))
+        local_beat = beat_pos - b_idx * beats_per_bar
+        if b_idx + 1 < len(bar_start_seconds):
+            bar_t0 = bar_start_seconds[b_idx]
+            bar_t1 = bar_start_seconds[b_idx + 1]
+        elif b_idx < len(bar_start_seconds):
+            bar_t0 = bar_start_seconds[b_idx]
+            bar_t1 = bar_t0 + avg_bar_dur
+        else:
+            bar_t0 = bar_start_seconds[-1] + (b_idx - len(bar_start_seconds) + 1) * avg_bar_dur
+            bar_t1 = bar_t0 + avg_bar_dur
+        bar_dur = max(0.25, bar_t1 - bar_t0)
+        return bar_t0 + (local_beat / beats_per_bar) * bar_dur
+
+    scheduled = _schedule(arrangement["events"], bpm, sr, measure_beats=measure_beats)
+
+    if has_warp or has_dynamics:
+        for item in scheduled:
+            event = item["event"]
+            if has_warp:
+                sched_start_beat = item["onset"] / (spb * sr)
+                sched_end_beat = (item["onset"] + item["duration"]) / (spb * sr)
+                t0_sec = _beat_to_warped_sec(sched_start_beat)
+                t1_sec = _beat_to_warped_sec(sched_end_beat)
+                item["onset"] = max(0, round(t0_sec * sr))
+                item["duration"] = max(1, round((t1_sec - t0_sec) * sr))
+            if has_dynamics:
+                b_idx = event.get("bar", int(event["start"] // beats_per_bar))
+                if 0 <= b_idx < len(bar_dynamics):
+                    dyn = float(np.clip(bar_dynamics[b_idx], 0.55, 1.15))
+                    item["event"] = dict(event, velocity=max(1, min(127, round(event["velocity"] * dyn))))
+
     length = max(
         (s["onset"] + (round(0.16 * sr) if s["event"]["technique"] == "X" else s["duration"]) for s in scheduled),
         default=1,
     )
+    if has_warp:
+        total_sec = max(float(bar_start_seconds[-1]), n_bars * beats_per_bar * spb) + 0.5
+        length = max(length, round(total_sec * sr))
+
     stereo_dry = np.zeros((length, 2), dtype=np.float64)
     for item in scheduled:
         event = item["event"]

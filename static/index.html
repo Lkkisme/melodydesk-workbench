@@ -587,8 +587,20 @@
     function playheadBar() {
       const bars = (currentState && currentState.bar_analysis) || [];
       if (!bars.length || !currentState.bpm) return 0;
+      const pos = position();
+      const bss = currentState && currentState.bar_start_seconds;
+      if (Array.isArray(bss) && bss.length >= 2) {
+        let lo = 0, hi = Math.min(bars.length - 1, bss.length - 2);
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (pos < bss[mid]) hi = mid - 1;
+          else if (pos >= bss[mid + 1]) lo = mid + 1;
+          else return mid;
+        }
+        return Math.max(0, Math.min(bars.length - 1, lo));
+      }
       const secPerBar = beatsPerBar(currentState.meter) * 60 / currentState.bpm;
-      return Math.max(0, Math.min(bars.length - 1, Math.floor(position() / secPerBar)));
+      return Math.max(0, Math.min(bars.length - 1, Math.floor(pos / secPerBar)));
     }
 
     // ───────── Sample-accurate Web Audio 3-stem engine ─────────

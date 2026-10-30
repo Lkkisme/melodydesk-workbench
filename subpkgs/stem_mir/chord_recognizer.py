@@ -131,6 +131,206 @@ def recognize_accompaniment_chords(
     return {"tonic": tonic, "chords": primary_chords, "split_chords": per_bar_segments, "bar_details": details}
 
 
+def synthesize_melody_conditioned_harmony(
+    notes: list,
+    bpm: float,
+    beat_origin: float = 0.0,
+    meter: str = "4/4",
+    tonic: str = "C",
+    accompaniment_path: str | Path | None = None,
+    minor: bool = False,
+    clip_duration: float = 0.0,
+) -> dict:
+    """Melody-primary diatonic harmony with optional accompaniment CQT support
+    and Viterbi smoothing across bars."""
+    import math
+
+    NAMES = "C C# D D# E F F# G G# A A# B".split()
+    if tonic not in NAMES:
+        raise ValueError("Malformed tonic")
+    measure_beats, seconds_per_beat, bar_seconds = _timing(bpm, beat_origin, meter)
+    R = NAMES.index(tonic)
+
+    if minor:
+        R_min = (R + 9) % 12
+        diatonic = [
+            ((R_min + 0) % 12, True),   # i (6m in Jianpu)
+            ((R_min + 3) % 12, False),  # III (1 in Jianpu)
+            ((R_min + 5) % 12, True),   # iv (2m in Jianpu)
+            ((R_min + 7) % 12, True),   # v (3m in Jianpu)
+            ((R_min + 7) % 12, False),  # V (3 in Jianpu, harmonic minor dominant)
+            ((R_min + 8) % 12, False),  # VI (4 in Jianpu)
+            ((R_min + 10) % 12, False), # VII (5 in Jianpu)
+        ]
+    else:
+        diatonic = [
+            ((R + 0) % 12, False),  # I
+            ((R + 2) % 12, True),   # ii
+            ((R + 4) % 12, True),   # iii
+            ((R + 5) % 12, False),  # IV
+            ((R + 7) % 12, False),  # V
+            ((R + 9) % 12, True),   # vi
+        ]
+    seen = set()
+    unique_diatonic = []
+    for pair in diatonic:
+        if pair not in seen:
+            seen.add(pair)
+            unique_diatonic.append(pair)
+    diatonic = unique_diatonic
+
+    def _chord_name(root, is_minor):
+        return NAMES[root % 12] + ("m" if is_minor else "")
+
+    chord_names = [_chord_name(r, m) for r, m in diatonic]
+
+    max_note_end = max((n.start * seconds_per_beat + beat_origin + n.duration * seconds_per_beat
+                        for n in notes), default=0.0) if notes else 0.0
+    total_duration = max(clip_duration, max_note_end, beat_origin + bar_seconds)
+    n_bars = max(1, int(math.ceil((total_duration - beat_origin) / bar_seconds)))
+
+    acc_chroma_per_bar = None
+    acc_rms_per_bar = None
+    if accompaniment_path is not None:
+        acc_path = Path(accompaniment_path)
+        if acc_path.is_file():
+            import librosa
+            y_acc, sr_acc = librosa.load(str(acc_path), sr=22050, mono=True)
+            if y_acc.size and np.all(np.isfinite(y_acc)):
+                hop = 512
+                C = np.abs(librosa.cqt(np.pad(y_acc, (0, max(0, 4096 - len(y_acc)))),
+                                        sr=sr_acc, hop_length=hop,
+                                        fmin=librosa.note_to_hz("C2"), n_bins=48,
+                                        bins_per_octave=12, tuning=0.0, scale=False))
+                ft = librosa.frames_to_time(np.arange(C.shape[1]), sr=sr_acc, hop_length=hop)
+                rms_frames = librosa.feature.rms(y=y_acc, frame_length=2048, hop_length=hop)[0]
+                acc_chroma_per_bar = []
+                acc_rms_per_bar = []
+                for b in range(n_bars):
+                    bs = beat_origin + b * bar_seconds
+                    be = bs + bar_seconds
+                    sel = (ft >= bs) & (ft < be)
+                    chroma = np.zeros(12)
+                    bar_rms = 0.0
+                    if np.any(sel):
+                        spec = np.median(C[:, sel], axis=1)
+                        for octave_start in range(0, len(spec), 12):
+                            chroma += spec[octave_start:octave_start + 12]
+                        rms_sel = rms_frames[:len(ft)][sel] if len(rms_frames) >= len(ft) else rms_frames[sel[:len(rms_frames)]]
+                        bar_rms = float(np.mean(rms_sel)) if len(rms_sel) else 0.0
+                    acc_chroma_per_bar.append(chroma)
+                    acc_rms_per_bar.append(bar_rms)
+
+    bar_start_seconds = [beat_origin + b * bar_seconds for b in range(n_bars + 1)]
+
+    emission_scores = []
+    vocal_present = []
+    for b in range(n_bars):
+        bs_beat = b * measure_beats
+        be_beat = (b + 1) * measure_beats
+        vocal_w = np.zeros(12)
+        for n in notes:
+            overlap = max(0.0, min(n.start + n.duration, be_beat) - max(n.start, bs_beat))
+            if overlap <= 0:
+                continue
+            on_strong = abs(n.start - bs_beat) < 0.13 or abs(n.start - (bs_beat + measure_beats / 2)) < 0.13
+            weight = overlap * (1.35 if on_strong else 1.0)
+            vocal_w[n.pitch % 12] += weight
+
+        has_vocal = float(np.sum(vocal_w)) > 0
+        vocal_present.append(has_vocal)
+
+        acc_w = None
+        if acc_chroma_per_bar is not None:
+            acc_w = acc_chroma_per_bar[b]
+
+        bar_scores = {}
+        for (root, is_minor), name in zip(diatonic, chord_names):
+            third = (root + 3) % 12 if is_minor else (root + 4) % 12
+            fifth = (root + 7) % 12
+            tones = {root, third, fifth}
+            avoid_pc = (third + 1) % 12 if not is_minor else -1
+
+            vocal_score = 0.0
+            if has_vocal:
+                s = 0.0
+                for pc in range(12):
+                    if pc in tones:
+                        s += vocal_w[pc] * 1.0
+                    elif pc == avoid_pc:
+                        s += vocal_w[pc] * -0.65
+                    else:
+                        s += vocal_w[pc] * -0.25
+                vocal_score = s / float(np.sum(vocal_w))
+
+            acc_score = 0.0
+            if acc_w is not None and float(np.sum(acc_w)) > 0:
+                s = 0.0
+                for pc in range(12):
+                    s += acc_w[pc] * (1.0 if pc in tones else -0.3)
+                acc_score = s / float(np.sum(acc_w))
+
+            if has_vocal:
+                combined = 0.72 * vocal_score + 0.28 * acc_score
+            else:
+                t_root = (R + 9) % 12 if minor else R
+                tonic_prior = 0.05 if root == t_root else 0.0
+                cadence_prior = 0.06 if (b == n_bars - 1 or b % 4 == 0) and root == t_root else 0.0
+                combined = 1.0 * acc_score + tonic_prior + cadence_prior
+
+            bar_scores[name] = combined
+        emission_scores.append(bar_scores)
+
+    tonic_name = _chord_name((R + 9) % 12 if minor else R, minor)
+    states = {None: (0.0, [])}
+    for b in range(n_bars):
+        updated = {}
+        for name, fit in emission_scores[b].items():
+            best = None
+            for prev, (cost, path) in states.items():
+                transition = 0.0
+                if prev is not None and prev != "N.C." and name != "N.C.":
+                    prev_parsed = next(((r, m) for (r, m), cn in zip(diatonic, chord_names) if cn == prev), None)
+                    curr_parsed = next(((r, m) for (r, m), cn in zip(diatonic, chord_names) if cn == name), None)
+                    if prev_parsed and curr_parsed:
+                        distance = (curr_parsed[0] - prev_parsed[0]) % 12
+                        if distance in (5, 7):
+                            transition += 0.10
+                        if distance == 2:
+                            transition += 0.08
+                        if prev == name:
+                            transition -= 0.04
+                            if len(path) >= 2 and path[-2] == name:
+                                transition -= 0.22
+                    if (b % 4 == 0 or b == n_bars - 1) and name == tonic_name:
+                        transition += 0.12
+                total = cost + fit + transition
+                if best is None or total > best[0]:
+                    best = (total, path + [name])
+            if best is not None:
+                if name not in updated or best[0] > updated[name][0]:
+                    updated[name] = best
+        states = updated
+
+    chords = max(states.values(), key=lambda x: x[0])[1] if states else ["N.C."] * n_bars
+
+    bar_dynamics = []
+    if acc_rms_per_bar is not None:
+        raw = np.array(acc_rms_per_bar, dtype=np.float64)
+        peak = float(np.max(raw)) if np.any(raw > 0) else 1.0
+        normalized = raw / peak if peak > 0 else raw
+        smoothed = np.convolve(normalized, np.ones(3) / 3, mode="same")
+        bar_dynamics = [round(float(np.clip(0.60 + 0.52 * v, 0.60, 1.12)), 4) for v in smoothed]
+    else:
+        bar_dynamics = [0.85] * n_bars
+
+    return {
+        "chords": chords,
+        "bar_start_seconds": [round(t, 6) for t in bar_start_seconds],
+        "bar_dynamics": bar_dynamics,
+    }
+
+
 def extract_instrumental_melody(
     audio_path: str | Path,
     bpm: float,

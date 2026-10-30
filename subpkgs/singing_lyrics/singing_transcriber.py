@@ -60,3 +60,99 @@ def transcribe_vocal_notes(
         notes = pitch_notes.extract_vocal_notes(str(vocal_path), bpm, beat_origin)
     return {"notes": notes, "word_boundaries_sec": returned_boundaries,
             "backend": backend_used, "device": device_used}
+
+
+def regulate_singing_notes_for_score(
+    notes: list,
+    bpm: float,
+    beat_origin: float,
+    clip_duration: float = 0.0,
+) -> list:
+    """Clean raw Note objects for score layout: merge micro-glitches, snap to
+    sixteenth-note grid, organize phrases, and synchronize raw timing."""
+    import copy
+    import score_cleanup
+
+    bpm = float(bpm)
+    beat_origin = float(beat_origin)
+    spb = 60.0 / bpm
+
+    ordered = sorted(copy.deepcopy(notes), key=lambda n: n.raw_start)
+    filtered = [n for n in ordered if n.raw_start >= beat_origin and n.raw_duration >= 0.075]
+    if not filtered:
+        return []
+
+    merged: list = []
+    for n in filtered:
+        if (merged
+                and (n.raw_start - (merged[-1].raw_start + merged[-1].raw_duration)) < 0.05
+                and abs(n.pitch - merged[-1].pitch) <= 1
+                and merged[-1].raw_duration < 0.16):
+            merged[-1].raw_duration = (n.raw_start + n.raw_duration) - merged[-1].raw_start
+            merged[-1].pitch = n.pitch if n.raw_duration > merged[-1].raw_duration else merged[-1].pitch
+        else:
+            merged.append(n)
+
+    grid = 0.25
+    for n in merged:
+        beats_from_origin = (n.raw_start - beat_origin) / spb
+        n.start = max(0.0, round(round(beats_from_origin / grid) * grid, 10))
+
+    deduped: list = []
+    for n in merged:
+        if deduped and abs(deduped[-1].start - n.start) < 1e-9:
+            if n.raw_duration > deduped[-1].raw_duration:
+                deduped[-1] = n
+        else:
+            deduped.append(n)
+
+    for i, n in enumerate(deduped):
+        raw_dur_beats = min(4.0, max(grid, round(round((n.raw_duration / spb) / grid) * grid, 10)))
+        if i + 1 < len(deduped):
+            gap_beats = deduped[i + 1].start - n.start
+            n.duration = max(grid, min(raw_dur_beats if gap_beats - raw_dur_beats > 0.25 else gap_beats, gap_beats))
+        else:
+            n.duration = raw_dur_beats
+
+    phrases: list[list] = []
+    for n in deduped:
+        if not phrases or (n.raw_start - (phrases[-1][-1].raw_start + phrases[-1][-1].raw_duration)) > 0.45:
+            phrases.append([])
+        phrases[-1].append(n)
+
+    raw_result: list = []
+    for phrase in phrases:
+        try:
+            organized = score_cleanup.organize(phrase, bpm, beat_origin, 'auto')
+            raw_result.extend(organized)
+        except ValueError:
+            raw_result.extend(phrase)
+
+    raw_result.sort(key=lambda x: x.start)
+    result: list = []
+    for n in raw_result:
+        if result and n.start < result[-1].start + grid - 1e-6:
+            if n.duration > result[-1].duration:
+                n.start = result[-1].start
+                result[-1] = n
+            continue
+        result.append(n)
+
+    if clip_duration > beat_origin:
+        max_beats = max(grid, (clip_duration - beat_origin) / spb)
+        result = [n for n in result if n.start < max_beats - grid]
+
+    cleaned_result: list = []
+    for i, n in enumerate(result):
+        if i + 1 < len(result):
+            max_dur = result[i + 1].start - n.start
+            if max_dur <= 1e-6:
+                continue
+            if n.duration > max_dur:
+                n.duration = max_dur
+        n.duration = max(1e-4, float(n.duration))
+        n.raw_start = round(beat_origin + n.start * spb, 4)
+        n.raw_duration = round(n.duration * spb, 4)
+        cleaned_result.append(n)
+
+    return cleaned_result
