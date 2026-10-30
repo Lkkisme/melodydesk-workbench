@@ -159,7 +159,7 @@ def check_melody_clash(
             continue
         is_weak_passing = (
             (chord_tone_beats >= 0.45 * seg_len and note.start >= bar_end - 1.05 and overlap_dur <= 1.05)
-            or (overlap_dur <= 0.55 and chord_tone_beats >= max(1.25, 2.5 * overlap_dur))
+            or (overlap_dur <= 0.55 and chord_tone_beats >= max(1.0, 2.0 * overlap_dur))
         )
         interval = (pitch-parsed['root'])%12
         reason = None
