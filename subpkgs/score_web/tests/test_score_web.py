@@ -125,6 +125,17 @@ class ScoreWebTests(unittest.TestCase):
         self.assertEqual(r_wav.status_code, 200)
         self.assertGreater(len(r_wav.content), 20000)
 
+    def test_architectural_invariant_100_percent_vocal_driven_pipeline(self):
+        """Hard architectural lock: server.py must track beats from stems['vocals'] and synthesize harmony with accompaniment_path=None."""
+        import inspect
+        import subpkgs.score_web.server as srv
+        src = inspect.getsource(srv)
+        self.assertIn("track_beats_and_downbeats(stems['vocals']", src)
+        self.assertNotIn("track_beats_and_downbeats(audio_path", src)
+        self.assertIn("accompaniment_path=None", src)
+        self.assertNotIn("accompaniment_path=stems.get('no_vocals')", src)
+        self.assertNotIn("accompaniment_path=stems['accompaniment']", src)
+
 
 if __name__ == "__main__":
     unittest.main()

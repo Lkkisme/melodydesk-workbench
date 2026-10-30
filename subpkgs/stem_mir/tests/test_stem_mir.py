@@ -17,6 +17,7 @@ from subpkgs.stem_mir import (
     separate_stems,
     track_beats_and_downbeats,
     recognize_accompaniment_chords,
+    synthesize_melody_conditioned_harmony,
     extract_instrumental_melody,
 )
 
@@ -138,6 +139,30 @@ class StemMirTests(unittest.TestCase):
             pitches = [n["pitch"] for n in mel[0]]
             self.assertTrue(any(abs(p - 76) <= 1 for p in pitches))
             self.assertTrue(any(abs(p - 72) <= 1 for p in pitches))
+
+    def test_pure_vocal_driven_harmony_and_dynamics_zero_accompaniment(self):
+        import types
+        vocal_notes = [
+            types.SimpleNamespace(pitch=69, start=0.0, duration=2.0),  # A4 in bar 0
+            types.SimpleNamespace(pitch=73, start=2.0, duration=2.0),  # C#5 in bar 0
+            types.SimpleNamespace(pitch=71, start=4.0, duration=2.0),  # B4 in bar 1
+            types.SimpleNamespace(pitch=68, start=6.0, duration=2.0),  # G#4 in bar 1
+        ]
+        res = synthesize_melody_conditioned_harmony(
+            notes=vocal_notes,
+            bpm=84.0,
+            beat_origin=0.0,
+            meter="4/4",
+            tonic="A",
+            accompaniment_path=None,
+            clip_duration=9.0,
+            minor=False,
+        )
+        self.assertEqual(len(res["chords"]), 4)
+        self.assertTrue(all(c != "N.C." for c in res["chords"]))
+        self.assertEqual(res["chords"][0], "A")
+        self.assertEqual(res["chords"][1], "E")
+        self.assertEqual(len(res["bar_dynamics"]), 4)
 
 
 if __name__ == "__main__":
