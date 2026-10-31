@@ -137,6 +137,13 @@ def arrange_advanced(
     _FINGERPICK_STYLES = {'分解和弦', '抒情琶音', '指弹律动'}
     _PHRASE_VEL_CURVE = [0.97, 1.00, 1.04, 0.98]
 
+    vocal_counts = {}
+    for bar in bars:
+        idx = bar['bar']
+        bar_start = idx * measure
+        bar_end = (idx + 1) * measure
+        vocal_counts[idx] = len(_overlapping_notes(project.notes, bar_start, bar_end))
+
     for bar in bars:
         index = bar['bar']
         bar_index = index
@@ -271,6 +278,52 @@ def arrange_advanced(
             if candidates:
                 _, _, fret, string, pitch = min(candidates)
                 insert(bar,tail,0.5,(string,fret,pitch),88,'PB')
+        vnc = vocal_counts.get(index, 0)
+        if vnc <= 1 and (passing_bass or embellish_hp) and segment is not None:
+            fill_beat = measure - 1.0
+            fill_seg = active(bar, fill_beat) if fill_beat >= 0 else None
+            if fill_seg is not None:
+                fill_done = False
+                if embellish_hp:
+                    parsed_fill = parse_extended_chord(fill_seg['chord'])
+                    tones_fill = set(parsed_fill['pcs']) | {parsed_fill['bass_pc']} if parsed_fill else set()
+                    for fs in (1, 2, 3):
+                        prev_evts = [e for e in events.values() if e['bar'] == index and e['string'] == fs and e['beat'] < fill_beat]
+                        if not prev_evts:
+                            continue
+                        prev_e = max(prev_evts, key=lambda e: e['beat'])
+                        best = None
+                        for ff in range(max(0, prev_e['fret'] - 2), min(24 - capo, prev_e['fret'] + 2) + 1):
+                            pp = STANDARD_TUNING[6 - fs] + capo + ff
+                            if ff != prev_e['fret'] and pp % 12 in tones_fill:
+                                dist = abs(ff - prev_e['fret'])
+                                if best is None or dist < best[0]:
+                                    best = (dist, fs, ff, pp, prev_e['fret'])
+                        if best is not None:
+                            _, fs2, ff2, pp2, old2 = best
+                            key_check = (index * measure + fill_beat, fs2)
+                            if key_check not in events or events[key_check].get('technique') not in {'CM', 'H', 'P', 'PB'}:
+                                insert(bar, fill_beat, 1.0, (fs2, ff2, pp2), 78, 'H' if ff2 > old2 else 'P', True)
+                                fill_done = True
+                                break
+                if not fill_done and passing_bass and index + 1 < len(bars):
+                    next_seg_fill = active(bars[index + 1], 0)
+                    target_fill = bass_of(next_seg_fill) if next_seg_fill is not None else None
+                    current_fill = bass_of(fill_seg)
+                    tail_pitches = {e['pitch'] for e in events.values() if e['bar'] == index and abs(e['beat'] - (measure - 0.5)) < 1e-6}
+                    cands_fill = []
+                    if target_fill is not None and current_fill is not None:
+                        for fs in (4, 5, 6):
+                            if (index * measure + fill_beat, fs) in events:
+                                continue
+                            for ff in range(25 - capo):
+                                pp = STANDARD_TUNING[6 - fs] + capo + ff
+                                if pp not in tail_pitches and pp != current_fill[2] and abs(pp - target_fill[2]) in (2, 3, 4) and pp % 12 in diatonic:
+                                    cands_fill.append((abs(pp - current_fill[2]), 0, ff, fs, pp))
+                    if cands_fill:
+                        _, _, ff3, fs3, pp3 = min(cands_fill)
+                        insert(bar, fill_beat, 0.5, (fs3, ff3, pp3), 84, 'PB')
+
         if slap_x and bar['split_segments']:
             for beat in (1.0,3.0):
                 segment = active(bar,beat) if beat < measure else None
@@ -280,6 +333,20 @@ def arrange_advanced(
                                       string=6,fret=0,pitch=40,velocity=slap_vel,technique='X',chord=segment['chord'],
                                       segment=bar['split_segments'].index(segment)))
     ordered = sorted(events.values(),key=lambda e:(e['start'],e['string'],e['technique']))
+    for event in ordered:
+        vnc = vocal_counts.get(event['bar'], 0)
+        if vnc >= 5:
+            comp_scale = 0.88
+        elif vnc >= 3:
+            comp_scale = 0.94
+        elif vnc <= 1:
+            comp_scale = 1.05
+        else:
+            comp_scale = 1.0
+        event['velocity'] = max(28, min(122, round(event['velocity'] * comp_scale)))
+        is_beat1_bass = abs(event['beat']) < 1e-9 and event.get('string', 0) >= 4
+        if is_beat1_bass and event['velocity'] < 72:
+            event['velocity'] = 72
     previous_by_string = {}
     for event in ordered:
         previous = previous_by_string.get(event['string'])

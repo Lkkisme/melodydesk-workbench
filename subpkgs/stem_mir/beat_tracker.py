@@ -178,64 +178,177 @@ def track_beats_and_downbeats(
     else:
         downbeats = beats[phase::measure_beats]
 
-    # Build piecewise beat_times grid anchored to the singer's vocal downbeats & syllable onsets
+    # Neural Downbeat Sequence Cleaning & Half-Bar Pairing
     spb = 60.0 / bpm
-    first_downbeat = float(downbeats[0] if len(downbeats) else beats[0])
+    syl_arr = np.asarray(sorted(vocal_onsets_sec), dtype=np.float64) if vocal_onsets_sec else np.empty(0, dtype=np.float64)
+    beat_arr = np.asarray(beats, dtype=np.float64)
+
+    db = np.asarray(downbeats, dtype=np.float64)
+    use_neural_grid = backend == "beat_this" and len(db) >= 4
+
+    if use_neural_grid:
+        median_bar = float(np.median(np.diff(db)))
+        # Clean spurious duplicate downbeats
+        cleaned = [float(db[0])]
+        for i in range(1, len(db)):
+            if float(db[i]) - cleaned[-1] >= 0.55 * median_bar:
+                cleaned.append(float(db[i]))
+        db = np.asarray(cleaned, dtype=np.float64)
+        if len(db) >= 2:
+            median_bar = float(np.median(np.diff(db)))
+
+        # Interpolate missed downbeats across gaps
+        filled: list[float] = [float(db[0])]
+        for i in range(len(db) - 1):
+            gap = float(db[i + 1] - db[i])
+            if gap > 1.65 * median_bar:
+                k = max(2, int(round(gap / median_bar)))
+                for j in range(1, k):
+                    filled.append(float(db[i]) + j * gap / k)
+            filled.append(float(db[i + 1]))
+        db = np.asarray(filled, dtype=np.float64)
+        if len(db) >= 2:
+            median_bar = float(np.median(np.diff(db)))
+
+        # Fast Cut-Time / Half-Bar Consolidation for 4/4
+        if measure_beats == 4 and median_bar < 1.65:
+            best_parity, best_parity_score = 0, np.inf
+            for par in (0, 1):
+                db_cand = db[par::2]
+                if len(db_cand) < 2:
+                    continue
+                if len(syl_arr):
+                    dists = np.array([float(np.min(np.abs(db_cand - s))) for s in syl_arr])
+                    score = float(np.median(dists))
+                else:
+                    db_accent = np.zeros(len(db_cand))
+                    for ai, t in enumerate(db_cand):
+                        frame = int(round((t * sr + n_fft) / hop))
+                        window = onset_env[max(0, frame - 1):min(len(onset_env), frame + 2)]
+                        db_accent[ai] = float(np.max(window)) if window.size else 0.0
+                    score = -float(np.sum(db_accent))
+                if score < best_parity_score:
+                    best_parity, best_parity_score = par, score
+            db = db[best_parity::2]
+            if len(db) >= 2:
+                median_bar = float(np.median(np.diff(db)))
+
+    use_neural_grid = backend == "beat_this" and len(db) >= 3
+
+    # 1-Bar Pre-Vocal Pickup Origin
+    first_downbeat = float(db[0]) if len(db) else float(downbeats[0] if len(downbeats) else beats[0])
     bar_dur_init = measure_beats * spb
-    if first_downbeat >= bar_dur_init:
+
+    if use_neural_grid:
+        while float(db[0]) - median_bar >= 0.0:
+            db = np.insert(db, 0, float(db[0]) - median_bar)
+        if len(syl_arr) >= 1:
+            first_vocal = float(syl_arr[0])
+            if first_vocal > float(db[0]) + 1.2 * median_bar:
+                vocal_bar_idx = 0
+                for idx in range(len(db)):
+                    if float(db[idx]) <= first_vocal + 0.38:
+                        vocal_bar_idx = idx
+                    else:
+                        break
+                start_bar_idx = max(0, vocal_bar_idx - 1)
+                db = db[start_bar_idx:]
+        beat_origin = round(float(db[0]), 6)
+        if len(db) >= 2:
+            median_bar = float(np.median(np.diff(db)))
+    elif len(syl_arr) >= 1:
+        first_vocal = float(syl_arr[0])
+        beat_origin = round(max(0.0, first_vocal - bar_dur_init), 6)
+    elif first_downbeat >= bar_dur_init:
         n_pre_bars = int(first_downbeat // bar_dur_init)
         beat_origin = round(max(0.0, first_downbeat - n_pre_bars * bar_dur_init), 6)
     else:
         beat_origin = first_downbeat
-    snap_tol = 0.35 * spb
-    syl_tol = 0.24 * spb
-    beat_arr = np.asarray(beats, dtype=np.float64)
-    syl_arr = np.asarray(sorted(vocal_onsets_sec), dtype=np.float64) if vocal_onsets_sec else np.empty(0, dtype=np.float64)
-    downbeat_arr = np.asarray(downbeats, dtype=np.float64)
-    beat_times_list: list[float] = [beat_origin]
-    cur_spb = spb
-    pos = beat_origin
-    while pos + cur_spb * 0.5 < duration:
-        next_pos = pos + cur_spb
-        snapped = False
-        beat_idx = len(beat_times_list)
-        if beat_idx % measure_beats == 0 and len(downbeat_arr):
-            db_cands = downbeat_arr[(downbeat_arr > pos + cur_spb * 0.35) & (downbeat_arr < pos + cur_spb * 1.65)]
-            if len(db_cands):
-                closest_db = db_cands[np.argmin(np.abs(db_cands - next_pos))]
-                if abs(closest_db - next_pos) <= 0.45 * spb:
-                    next_pos = float(closest_db)
-                    cur_spb = float(np.clip(0.75 * cur_spb + 0.25 * (next_pos - pos), 60.0 / hi_bpm, 60.0 / lo_bpm))
-                    snapped = True
-        if not snapped:
-            candidates = beat_arr[(beat_arr > pos + cur_spb * 0.3) & (beat_arr < pos + cur_spb * 1.7)]
-            if len(candidates):
-                closest = candidates[np.argmin(np.abs(candidates - next_pos))]
-                if abs(closest - next_pos) <= snap_tol:
-                    next_pos = float(closest)
-                    step = next_pos - pos
-                    cur_spb = float(np.clip(0.75 * cur_spb + 0.25 * step, 60.0 / hi_bpm, 60.0 / lo_bpm))
-                    snapped = True
-        if not snapped and len(syl_arr):
-            syl_cands = syl_arr[(syl_arr > pos + cur_spb * 0.4) & (syl_arr < pos + cur_spb * 1.6)]
-            if len(syl_cands):
-                closest_syl = syl_cands[np.argmin(np.abs(syl_cands - next_pos))]
-                if abs(closest_syl - next_pos) <= syl_tol:
-                    next_pos = float(closest_syl)
-                    step = next_pos - pos
-                    cur_spb = float(np.clip(0.82 * cur_spb + 0.18 * step, 60.0 / hi_bpm, 60.0 / lo_bpm))
-        if next_pos <= pos + 1e-4:
-            next_pos = pos + cur_spb
-        pos = next_pos
-        beat_times_list.append(pos)
 
-    # Build bar_start_seconds
-    n_beat_times = len(beat_times_list)
-    n_bars = max(1, math.ceil((n_beat_times - 1) / measure_beats))
-    needed = n_bars * measure_beats + 1
-    while len(beat_times_list) < needed:
-        beat_times_list.append(beat_times_list[-1] + cur_spb)
-    bar_start_seconds = [beat_times_list[b * measure_beats] for b in range(n_bars + 1)]
+    use_neural_grid = backend == "beat_this" and len(db) >= 3
+
+    # Downbeat-Locked beat_times & bar_start_seconds Construction
+    if use_neural_grid:
+        # Extrapolate db forward until db[-1] >= duration
+        while float(db[-1]) < duration:
+            db = np.append(db, float(db[-1]) + median_bar)
+
+        bpm = float(np.clip(60.0 * measure_beats / float(np.median(np.diff(db))), lo_bpm, hi_bpm))
+        spb = 60.0 / bpm
+
+        beat_times_list: list[float] = []
+        for b in range(len(db) - 1):
+            db_start = float(db[b])
+            db_end = float(db[b + 1])
+            bar_span = db_end - db_start
+            local_spb = bar_span / measure_beats
+            interior_beats = beat_arr[(beat_arr > db_start + local_spb * 0.3) & (beat_arr < db_end - local_spb * 0.3)]
+            snap_interior = len(interior_beats) == measure_beats - 1
+            snap_tol_bar = 0.25 * local_spb
+            for k in range(measure_beats):
+                t = db_start + k * local_spb
+                if snap_interior and k > 0:
+                    det_beat = float(interior_beats[k - 1])
+                    if abs(det_beat - t) <= snap_tol_bar:
+                        candidate = det_beat
+                        if (not beat_times_list or candidate > beat_times_list[-1] + 1e-4) and candidate < db_end - 1e-4:
+                            t = candidate
+                if beat_times_list and t <= beat_times_list[-1] + 1e-4:
+                    t = beat_times_list[-1] + 1e-4
+                beat_times_list.append(t)
+        beat_times_list.append(max(beat_times_list[-1] + 1e-4, float(db[-1])) if beat_times_list else float(db[-1]))
+
+        max_bar_idx = (len(beat_times_list) - 1) // measure_beats
+        bar_start_seconds = [float(beat_times_list[b * measure_beats]) for b in range(max_bar_idx + 1)]
+    else:
+        # Fallback: adaptive snap grid (librosa backend or sparse downbeats)
+        downbeat_arr = np.asarray(downbeats, dtype=np.float64)
+        snap_tol = 0.35 * spb
+        syl_tol = 0.24 * spb
+        beat_times_list = [beat_origin]
+        cur_spb = spb
+        pos = beat_origin
+        while pos + cur_spb * 0.5 < duration:
+            next_pos = pos + cur_spb
+            snapped = False
+            beat_idx = len(beat_times_list)
+            if beat_idx % measure_beats == 0 and len(downbeat_arr):
+                db_cands = downbeat_arr[(downbeat_arr > pos + cur_spb * 0.35) & (downbeat_arr < pos + cur_spb * 1.65)]
+                if len(db_cands):
+                    closest_db = db_cands[np.argmin(np.abs(db_cands - next_pos))]
+                    if abs(closest_db - next_pos) <= 0.45 * spb:
+                        next_pos = float(closest_db)
+                        cur_spb = float(np.clip(0.75 * cur_spb + 0.25 * (next_pos - pos), 60.0 / hi_bpm, 60.0 / lo_bpm))
+                        snapped = True
+            if not snapped:
+                candidates = beat_arr[(beat_arr > pos + cur_spb * 0.3) & (beat_arr < pos + cur_spb * 1.7)]
+                if len(candidates):
+                    closest = candidates[np.argmin(np.abs(candidates - next_pos))]
+                    if abs(closest - next_pos) <= snap_tol:
+                        next_pos = float(closest)
+                        step = next_pos - pos
+                        cur_spb = float(np.clip(0.75 * cur_spb + 0.25 * step, 60.0 / hi_bpm, 60.0 / lo_bpm))
+                        snapped = True
+            if not snapped and len(syl_arr):
+                syl_cands = syl_arr[(syl_arr > pos + cur_spb * 0.4) & (syl_arr < pos + cur_spb * 1.6)]
+                if len(syl_cands):
+                    closest_syl = syl_cands[np.argmin(np.abs(syl_cands - next_pos))]
+                    if abs(closest_syl - next_pos) <= syl_tol:
+                        next_pos = float(closest_syl)
+                        step = next_pos - pos
+                        cur_spb = float(np.clip(0.82 * cur_spb + 0.18 * step, 60.0 / hi_bpm, 60.0 / lo_bpm))
+            if next_pos <= pos + 1e-4:
+                next_pos = pos + cur_spb
+            pos = next_pos
+            beat_times_list.append(pos)
+
+        # Build bar_start_seconds for fallback path
+        n_beat_times = len(beat_times_list)
+        n_bars = max(1, math.ceil((n_beat_times - 1) / measure_beats))
+        needed = n_bars * measure_beats + 1
+        while len(beat_times_list) < needed:
+            beat_times_list.append(beat_times_list[-1] + cur_spb)
+        bar_start_seconds = [beat_times_list[b * measure_beats] for b in range(n_bars + 1)]
 
     return {
         "bpm": float(bpm),

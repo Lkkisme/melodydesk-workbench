@@ -27,12 +27,12 @@ from subpkgs.stem_mir import (
 MANIFEST_PATH = Path(r"E:\MelodyDesk\work\repertoire_audio\repertoire_manifest.json")
 
 SONG_CONFIGS = {
-    "scarborough_fair": {"tonic": "G", "minor": True, "meter": "3/4", "bpm_range": (66.0, 108.0)},
-    "greensleeves": {"tonic": "F", "minor": True, "meter": "3/4", "bpm_range": (72.0, 112.0)},
-    "romance_amor": {"tonic": "A", "minor": False, "meter": "4/4", "bpm_range": (70.0, 104.0)},
-    "canon_in_d": {"tonic": "A", "minor": False, "meter": "4/4", "bpm_range": (74.0, 108.0)},
-    "mandarin_pop": {"tonic": "D", "minor": False, "meter": "4/4", "bpm_range": (66.0, 96.0)},
-    "real_vocal": {"tonic": "G", "minor": False, "meter": "4/4", "bpm_range": (88.0, 128.0)},
+    "scarborough_fair": {"tonic": "G", "minor": True, "meter": "3/4", "bpm_range": (60.0, 140.0)},
+    "greensleeves": {"tonic": "F", "minor": True, "meter": "3/4", "bpm_range": (68.0, 120.0)},
+    "romance_amor": {"tonic": "A", "minor": False, "meter": "4/4", "bpm_range": (68.0, 110.0)},
+    "canon_in_d": {"tonic": "A", "minor": False, "meter": "4/4", "bpm_range": (70.0, 120.0)},
+    "mandarin_pop": {"tonic": "D", "minor": False, "meter": "4/4", "bpm_range": (60.0, 136.0)},
+    "real_vocal": {"tonic": "G", "minor": False, "meter": "4/4", "bpm_range": (72.0, 118.0)},
 }
 
 
@@ -42,6 +42,7 @@ def main() -> None:
         t0 = time.time()
         entry = manifest[key]
         vocals_wav = Path(entry["vocals_wav"])
+        source_wav = Path(entry["source"]) if entry.get("source") and Path(entry["source"]).is_file() else vocals_wav
         info = sf.info(str(vocals_wav))
         clip_duration = round(float(info.duration), 3)
         raw_lyrics = entry["raw_lyrics"]
@@ -57,13 +58,24 @@ def main() -> None:
             set(vocal_onsets) | {float(w["end"]) for w in word_ts if "end" in w and float(w["end"]) >= 0.0}
         )
 
-        # 2. Vocal Beat & Downbeat Tracking with Bar-Boundary Phase Re-Locking
-        beat_info = track_beats_and_downbeats(
+        # Extract acoustic vocal note onsets first so 1-bar pre-vocal origin never misses soft choir openings
+        pre_tx = transcribe_vocal_notes(
             vocals_wav,
+            bpm=100.0,
+            beat_origin=0.0,
+            word_boundaries_sec=word_boundaries or None,
+            prefer_cuda=True,
+        )
+        note_onsets = sorted({float(n.raw_start) for n in pre_tx["notes"] if n.raw_duration >= 0.18 and n.raw_start >= 0.5})
+        combined_onsets = sorted(set(vocal_onsets) | set(note_onsets))
+
+        # 2. Dual-Mode Neural Downbeat Bar-Grid Locking + 1-Bar Pre-Vocal Pickup Origin
+        beat_info = track_beats_and_downbeats(
+            source_wav,
             prefer_cuda=True,
             bpm_range=cfg["bpm_range"],
             meter_hint=cfg["meter"],
-            vocal_onsets_sec=vocal_onsets or None,
+            vocal_onsets_sec=combined_onsets or None,
         )
         bpm = round(float(beat_info["bpm"]), 2)
         beat_origin = round(float(beat_info["beat_origin"]), 4)
@@ -129,6 +141,7 @@ def main() -> None:
         entry.pop("backing_wav", None)
         entry.update(
             tonic=cfg["tonic"],
+            preset="original",
             meter=meter,
             bpm=bpm,
             beat_origin=beat_origin,

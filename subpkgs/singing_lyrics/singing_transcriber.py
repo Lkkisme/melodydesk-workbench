@@ -136,32 +136,50 @@ def regulate_singing_notes_for_score(
         else:
             merged.append(n)
 
+    scooped: list = []
+    i = 0
+    while i < len(merged):
+        if (i + 1 < len(merged)
+                and merged[i].raw_duration < 0.21
+                and (merged[i + 1].raw_start - (merged[i].raw_start + merged[i].raw_duration)) < 0.07
+                and merged[i + 1].raw_duration >= merged[i].raw_duration * 1.35
+                and 1 <= abs(merged[i + 1].pitch - merged[i].pitch) <= 3):
+            old_end = merged[i + 1].raw_start + merged[i + 1].raw_duration
+            merged[i + 1].raw_start = merged[i].raw_start
+            merged[i + 1].raw_duration = old_end - merged[i + 1].raw_start
+            scooped.append(merged[i + 1])
+            i += 2
+        else:
+            scooped.append(merged[i])
+            i += 1
+    merged = scooped
+
     if word_boundaries_sec:
         from music import Note
         wbs = sorted(set(float(w) for w in word_boundaries_sec if math.isfinite(w) and w >= beat_origin))
         if wbs:
             split_merged: list = []
             for n in merged:
-                if n.raw_duration < 0.34:
+                if n.raw_duration < 0.46:
                     split_merged.append(n)
                     continue
                 n_start = n.raw_start
                 n_end = n.raw_start + n.raw_duration
-                interior = [wb for wb in wbs if n_start + 0.14 <= wb <= n_end - 0.14]
+                interior = [wb for wb in wbs if n_start + 0.20 <= wb <= n_end - 0.20]
                 cuts = [n_start] + interior[:4] + [n_end]
                 valid_cuts = [cuts[0]]
                 for c in cuts[1:]:
-                    if c - valid_cuts[-1] >= 0.14:
+                    if c - valid_cuts[-1] >= 0.20:
                         valid_cuts.append(c)
                     else:
                         valid_cuts[-1] = c
-                if len(valid_cuts) < 2 or valid_cuts[-1] - valid_cuts[0] < 0.14:
+                if len(valid_cuts) < 2 or valid_cuts[-1] - valid_cuts[0] < 0.20:
                     split_merged.append(n)
                     continue
                 for j in range(len(valid_cuts) - 1):
                     seg_start = valid_cuts[j]
                     seg_dur = valid_cuts[j + 1] - seg_start
-                    if seg_dur >= 0.14:
+                    if seg_dur >= 0.20:
                         split_merged.append(Note(n.pitch, n.start, n.duration, seg_start, seg_dur, n.confidence, n.edited))
                 if not any(sn for sn in split_merged[-len(valid_cuts)+1:]):
                     split_merged.append(n)
@@ -221,8 +239,44 @@ def regulate_singing_notes_for_score(
             continue
         result.append(n)
 
+    MAJOR_SCALE = {0, 2, 4, 5, 7, 9, 11}
+    if len(result) >= 8:
+        dur_by_pc = [0.0] * 12
+        for n in result:
+            dur_by_pc[n.pitch % 12] += n.duration
+        total_dur = sum(dur_by_pc)
+        if total_dur > 0:
+            best_k, best_cov = 0, 0.0
+            for k in range(12):
+                cov = sum(dur_by_pc[(k + d) % 12] for d in MAJOR_SCALE) / total_dur
+                if cov > best_cov:
+                    best_k, best_cov = k, cov
+            if best_cov >= 0.78:
+                scale_pcs = frozenset((best_k + d) % 12 for d in MAJOR_SCALE)
+                for i, n in enumerate(result):
+                    if n.duration > 0.8 or n.pitch % 12 in scale_pcs:
+                        continue
+                    snapped = False
+                    for adj in (result[i - 1] if i > 0 else None, result[i + 1] if i + 1 < len(result) else None):
+                        if adj is not None and abs(adj.pitch - n.pitch) == 1 and adj.pitch % 12 in scale_pcs:
+                            n.pitch = adj.pitch
+                            snapped = True
+                            break
+                    if not snapped:
+                        up_ok = (n.pitch + 1) % 12 in scale_pcs
+                        dn_ok = (n.pitch - 1) % 12 in scale_pcs
+                        if up_ok and dn_ok:
+                            n.pitch += 1 if dur_by_pc[(n.pitch + 1) % 12] >= dur_by_pc[(n.pitch - 1) % 12] else -1
+                        elif up_ok:
+                            n.pitch += 1
+                        elif dn_ok:
+                            n.pitch -= 1
+
     if clip_duration > beat_origin:
-        max_beats = max(grid, (clip_duration - beat_origin) / spb)
+        if use_piecewise:
+            max_beats = max(grid, float(seconds_to_beats_piecewise(clip_duration, beat_times, bpm, beat_origin)))
+        else:
+            max_beats = max(grid, (clip_duration - beat_origin) / spb)
         result = [n for n in result if n.start < max_beats - grid]
 
     cleaned_result: list = []

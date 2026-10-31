@@ -98,8 +98,15 @@ def synthesize_melody_conditioned_harmony(
     else:
         computed_bar_starts = [beat_origin + b * bar_seconds for b in range(n_bars + 1)]
 
-    # --- 100% Pure Vocal-Melody Emission Scoring ---
-    emission_scores = []
+    # --- Phrase-Boundary & Tonic/Cadence Anchoring ---
+    tonic_root = (R + 9) % 12 if minor else R
+    tonic_qual = "m" if minor else ""
+    dom_root = (tonic_root + 7) % 12
+
+    # Pre-compute per-bar vocal presence and weighted chroma for two-pass scoring
+    bar_vocal_w = []
+    bar_has_vocal = []
+    first_vocal_bar = -1
     for b in range(n_bars):
         bs_beat = b * measure_beats
         be_beat = (b + 1) * measure_beats
@@ -109,10 +116,23 @@ def synthesize_melody_conditioned_harmony(
             if overlap <= 0:
                 continue
             on_strong = abs(n.start - bs_beat) < 0.13 or abs(n.start - (bs_beat + measure_beats / 2)) < 0.13
-            weight = overlap * (1.35 if on_strong else 1.0)
+            dur_factor = 0.35 if n.duration <= 0.3 else (1.25 if n.duration >= 0.75 else 1.0)
+            weight = overlap * (1.35 if on_strong else 1.0) * dur_factor
             vocal_w[n.pitch % 12] += weight
-
         has_vocal = float(np.sum(vocal_w)) > 0
+        bar_vocal_w.append(vocal_w)
+        bar_has_vocal.append(has_vocal)
+        if has_vocal and first_vocal_bar < 0:
+            first_vocal_bar = b
+
+    # --- 100% Pure Vocal-Melody Emission Scoring ---
+    emission_scores = []
+    for b in range(n_bars):
+        vocal_w = bar_vocal_w[b]
+        has_vocal = bar_has_vocal[b]
+        rel_b = (b - first_vocal_bar) if (first_vocal_bar >= 0 and b >= first_vocal_bar) else b
+
+        is_cadence_bar = (rel_b % 4 == 3) or (has_vocal and b + 1 < n_bars and not bar_has_vocal[b + 1])
 
         bar_scores = {}
         for ci in range(len(candidates)):
@@ -137,16 +157,36 @@ def synthesize_melody_conditioned_harmony(
                 vocal_score = s / float(np.sum(vocal_w))
                 combined = 0.92 * vocal_score + bias
             else:
-                t_root = (R + 9) % 12 if minor else R
+                t_root = tonic_root
                 turnaround_roots = (
                     (t_root, (t_root + 10) % 12, (t_root + 3) % 12, (t_root + 7) % 12)
                     if minor
                     else (t_root, (t_root + 7) % 12, (t_root + 9) % 12, (t_root + 5) % 12)
                 )
-                turnaround_prior = 0.14 if root == turnaround_roots[b % 4] else 0.0
+                turnaround_prior = 0.14 if root == turnaround_roots[rel_b % 4] else 0.0
                 tonic_prior = 0.22 if (b == 0 and root == t_root) else (0.05 if root == t_root else 0.0)
-                cadence_prior = 0.08 if (b == n_bars - 1 or b % 4 == 0) and root == t_root else 0.0
+                cadence_prior = 0.08 if (b == n_bars - 1 or rel_b % 4 == 0) and root == t_root else 0.0
                 combined = tonic_prior + cadence_prior + turnaround_prior + bias
+
+            is_tonic_chord = (root == tonic_root and quality == tonic_qual)
+
+            # Tonic anchor: bar 0, first vocal bar, last bar
+            if is_tonic_chord and (b == 0 or b == first_vocal_bar):
+                tonic_triad = set(candidate_tones[ci])
+                vocal_on_triad = sum(vocal_w[pc] for pc in range(12) if pc in tonic_triad)
+                avoid_clash = not any(vocal_w[pc] > 0 for pc in avoid_pcs)
+                triad_frac = vocal_on_triad / float(np.sum(vocal_w)) if has_vocal and float(np.sum(vocal_w)) > 0 else 1.0
+                if not has_vocal or (avoid_clash and triad_frac >= 0.35):
+                    combined += 0.28
+            if is_tonic_chord and b == n_bars - 1:
+                combined += 0.22
+
+            # Phrase-cadence bonus
+            if is_cadence_bar:
+                if root == dom_root and quality != "m":
+                    combined += 0.16
+                if is_tonic_chord and b == n_bars - 1:
+                    combined += 0.06
 
             # In minor keys, Major V (harmonic minor dominant) requires the raised leading tone (#7) in the vocal melody.
             if minor and root == (R_min + 7) % 12 and not is_minor_q:
@@ -161,10 +201,8 @@ def synthesize_melody_conditioned_harmony(
         emission_scores.append(bar_scores)
 
     # --- Functional Viterbi Transitions ---
-    tonic_root = (R + 9) % 12 if minor else R
     tonic_name = _chord_name(tonic_root, minor)
-    dominant_root = (tonic_root + 7) % 12
-    dom_name = _chord_name(dominant_root, False)
+    dom_name = _chord_name(dom_root, False)
     vi_root = (R + 9) % 12 if not minor else -1
     vi_name = _chord_name(vi_root, True) if not minor else ""
     v_of_vi_name = _chord_name((R + 4) % 12, False) if not minor else ""
@@ -207,7 +245,8 @@ def synthesize_melody_conditioned_harmony(
                         if len(path) >= 2 and path[-2] == name:
                             transition -= 0.14
 
-                    if (b % 4 == 0 or b == n_bars - 1) and name == tonic_name:
+                    rel_b_v = (b - first_vocal_bar) if (first_vocal_bar >= 0 and b >= first_vocal_bar) else b
+                    if (rel_b_v % 4 == 0 or b == n_bars - 1) and name == tonic_name:
                         transition += 0.12
                 total = cost + fit + transition
                 if best is None or total > best[0]:
