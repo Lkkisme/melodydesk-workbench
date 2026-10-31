@@ -210,8 +210,25 @@ def track_beats_and_downbeats(
         if len(db) >= 2:
             median_bar = float(np.median(np.diff(db)))
 
-        # Fast Cut-Time / Half-Bar Consolidation for 4/4
-        if measure_beats == 4 and median_bar < 1.65:
+        # Bayesian Metrical-Level / Tactus MAP Disambiguation
+        scores_by_m: dict[int, float] = {}
+        for m in (1, 2):
+            bar_m = m * median_bar
+            bpm_m = 60.0 * measure_beats / max(1e-6, bar_m)
+            spb_m = 60.0 / max(1e-6, bpm_m)
+            if m == 2 and (bpm_m < max(58.0, lo_bpm * 0.95) or len(db) < 6):
+                continue
+            log_p_tactus = -0.5 * ((math.log2(max(1e-3, bpm_m) / 76.0) / 0.38) ** 2)
+            log_p_syl = 0.0
+            if len(syl_arr) >= 4:
+                syl_iois = np.diff(syl_arr)
+                syl_iois = syl_iois[(syl_iois >= 0.16) & (syl_iois <= 2.4)]
+                if len(syl_iois) >= 2:
+                    med_ioi = float(np.median(syl_iois))
+                    target_sec = 0.68 * spb_m
+                    log_p_syl = -0.45 * ((math.log2(max(1e-3, med_ioi) / max(1e-3, target_sec))) ** 2)
+            scores_by_m[m] = log_p_tactus + log_p_syl
+        if 2 in scores_by_m and scores_by_m[2] > scores_by_m.get(1, -np.inf):
             best_parity, best_parity_score = 0, np.inf
             for par in (0, 1):
                 db_cand = db[par::2]
@@ -229,6 +246,7 @@ def track_beats_and_downbeats(
                     score = -float(np.sum(db_accent))
                 if score < best_parity_score:
                     best_parity, best_parity_score = par, score
+            beat_arr = np.unique(np.sort(np.concatenate([beat_arr, db[1 - best_parity::2]])))
             db = db[best_parity::2]
             if len(db) >= 2:
                 median_bar = float(np.median(np.diff(db)))
@@ -242,6 +260,8 @@ def track_beats_and_downbeats(
     if use_neural_grid:
         while float(db[0]) - median_bar >= 0.0:
             db = np.insert(db, 0, float(db[0]) - median_bar)
+        while float(db[-1]) < duration:
+            db = np.append(db, float(db[-1]) + median_bar)
         if len(syl_arr) >= 1:
             first_vocal = float(syl_arr[0])
             if first_vocal > float(db[0]) + 1.2 * median_bar:
@@ -253,7 +273,10 @@ def track_beats_and_downbeats(
                         break
                 start_bar_idx = max(0, vocal_bar_idx - 1)
                 db = db[start_bar_idx:]
+        while len(db) < 3 or float(db[-1]) < duration:
+            db = np.append(db, float(db[-1]) + median_bar)
         beat_origin = round(float(db[0]), 6)
+        db[0] = beat_origin
         if len(db) >= 2:
             median_bar = float(np.median(np.diff(db)))
     elif len(syl_arr) >= 1:

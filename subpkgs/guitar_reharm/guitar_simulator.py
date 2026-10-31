@@ -102,16 +102,16 @@ def _select_vel_layer(velocity: float, technique: str) -> tuple[int, float]:
         return 1, 0.85
     if technique == "CM":
         return (3 if velocity >= 82 else 2), 1.08
-    if velocity <= 54:
+    if velocity <= 68:
         layer = 1
-        span_pos = (velocity - 1.0) / 53.0
-    elif velocity <= 86:
+        span_pos = (velocity - 1.0) / 67.0
+    elif velocity <= 94:
         layer = 2
-        span_pos = (velocity - 55.0) / 31.0
+        span_pos = (velocity - 69.0) / 25.0
     else:
         layer = 3
-        span_pos = (velocity - 87.0) / 40.0
-    db_offset = -1.8 + 3.6 * np.clip(span_pos, 0.0, 1.0)
+        span_pos = (velocity - 95.0) / 32.0
+    db_offset = -2.2 + 3.4 * np.clip(span_pos, 0.0, 1.0)
     return layer, float(10.0 ** (db_offset / 20.0))
 
 
@@ -165,7 +165,7 @@ def _get_blended_studio_base(pitch: int, string: int, layer: int, sr: int, is_pm
             f_seg = fss_wave[: min(len(fss_wave), max_len)].astype(np.float64)
             f_seg = _pitch_shift_resample(f_seg, fss_shift)
             n_blend = min(len(seg), len(f_seg))
-            seg[:n_blend] = 0.82 * seg[:n_blend] + 0.18 * (f_seg[:n_blend] * 0.48)
+            seg[:n_blend] = 0.90 * seg[:n_blend] + 0.10 * (f_seg[:n_blend] * 0.42)
     elif fss_wave is not None:
         seg = fss_wave[: min(len(fss_wave), max_len)].astype(np.float64)
         seg = _pitch_shift_resample(seg, fss_shift) * 0.55
@@ -177,7 +177,10 @@ def _get_blended_studio_base(pitch: int, string: int, layer: int, sr: int, is_pm
         seg *= np.exp(-t * 9.5)
         seg = sosfilt(butter(2, 1150, fs=sr, output="sos"), seg)
     else:
-        seg *= np.exp(-t * 0.18)
+        decay_rate = 0.24 if string >= 4 else (0.52 if layer == 1 else 0.42)
+        seg *= np.exp(-t * decay_rate)
+        if layer == 1 and string <= 3:
+            seg = sosfilt(butter(1, min(0.45 * sr, 5800.0), fs=sr, output='sos'), seg)
     seg.flags.writeable = False
     with _CACHE_LOCK:
         _BLENDED_NOTE_CACHE[key] = seg
@@ -366,7 +369,7 @@ def _schedule(events, bpm, sr, measure_beats=4.0):
             unique_strings = sorted(set(played))
             if len(unique_strings) >= 2:
                 is_downstroke = abs((event["start"] * 2.0) % 2.0) < 1e-6
-                step_sec = 0.012 if len(unique_strings) >= 3 else 0.005
+                step_sec = 0.011 if len(unique_strings) >= 3 else 0.002
                 rake = ((max(unique_strings) - event["string"]) if is_downstroke else (event["string"] - min(unique_strings))) * step_sec
         onset = round((event["start"] * spb + rake) * sr)
         if tech not in {"X", "CM", "H", "P", "PB"}:
@@ -389,7 +392,8 @@ def _schedule(events, bpm, sr, measure_beats=4.0):
             next_bound = next((b for b in sorted_boundaries if b > event["start"] + 0.05), event["start"] + natural_ring_beats)
             chord_span_beats = (next_bound - event["start"]) + (0.045 / spb)
             remaining_song_beats = max(event["duration"], max_event_end_beat - event["start"] + 1.0)
-            ring_beats = min(max(event["duration"], chord_span_beats), natural_ring_beats, remaining_song_beats)
+            string_ring_cap = natural_ring_beats if event['string'] >= 4 else min(natural_ring_beats, max(1.5, 1.45 / spb))
+            ring_beats = min(max(event["duration"], chord_span_beats), string_ring_cap, remaining_song_beats)
         duration = max(1, round(ring_beats * spb * sr))
         scheduled.append(dict(event=event, onset=onset, duration=duration, index=index))
 

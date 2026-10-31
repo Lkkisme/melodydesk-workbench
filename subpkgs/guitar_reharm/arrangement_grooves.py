@@ -16,6 +16,81 @@ from .chord_voicing import (STANDARD_TUNING, _integer, _make_voicing, generate_v
 from .reharmonizer import _measure_beats, _overlapping_notes, roman_numeral
 
 
+def _decode_viterbi_texture_states(bars, project, measure):
+    """Module A: AccoMontage-style global Viterbi phrase-texture graph optimisation."""
+    n_bars = len(bars)
+    if n_bars == 0:
+        return []
+
+    all_pitches = [n.pitch for n in project.notes]
+    min_song_pitch = min(all_pitches) if all_pitches else 60
+    max_song_pitch = max(all_pitches) if all_pitches else 72
+    pitch_range = max(1.0, float(max_song_pitch - min_song_pitch))
+
+    energies = []
+    for idx in range(n_bars):
+        bar_start = idx * measure
+        bar_end = (idx + 1) * measure
+        ov_notes = _overlapping_notes(project.notes, bar_start, bar_end)
+        onset_notes = [n for n in ov_notes if bar_start - 1e-6 <= n.start < bar_end]
+
+        density_norm = min(1.0, len(onset_notes) / max(1.0, measure))
+        if ov_notes:
+            mean_p = sum(n.pitch for n in ov_notes) / len(ov_notes)
+            pitch_norm = max(0.0, min(1.0, (mean_p - min_song_pitch) / pitch_range))
+        else:
+            pitch_norm = 0.35
+        raw_dyn = float(bars[idx].get('dynamic_scale', 0.85))
+        dyn_norm = max(0.0, min(1.0, (raw_dyn - 0.55) / 0.60))
+
+        e_b = 0.40 * density_norm + 0.35 * pitch_norm + 0.25 * dyn_norm
+        if not ov_notes:
+            e_b *= 0.45
+        if (idx + 1) % 4 == 0:
+            e_b *= 0.72
+        energies.append(e_b)
+
+    centers = (0.18, 0.42, 0.66, 0.88)
+    n_states = 4
+    trans_base = {0: 0.0, 1: 0.35, 2: 1.20, 3: 2.50}
+
+    INF = float('inf')
+    dp = [[INF] * n_states for _ in range(n_bars)]
+    back = [[0] * n_states for _ in range(n_bars)]
+
+    for s in range(n_states):
+        dp[0][s] = ((energies[0] - centers[s]) / 0.22) ** 2
+
+    for b in range(1, n_bars):
+        emit = [((energies[b] - centers[s]) / 0.22) ** 2 for s in range(n_states)]
+        is_phrase_boundary = (b % 4 == 0)
+        is_cadence = ((b + 1) % 4 == 0)
+        for s in range(n_states):
+            best_cost = INF
+            best_prev = 0
+            for ps in range(n_states):
+                jump = abs(s - ps)
+                tc = trans_base[jump]
+                if is_phrase_boundary:
+                    tc *= 0.5
+                if is_cadence and s <= ps:
+                    tc -= 0.35
+                cost = dp[b - 1][ps] + tc + emit[s]
+                if cost < best_cost:
+                    best_cost = cost
+                    best_prev = ps
+            dp[b][s] = best_cost
+            back[b][s] = best_prev
+
+    last_state = min(range(n_states), key=lambda s: dp[n_bars - 1][s])
+    bar_states = [0] * n_bars
+    bar_states[n_bars - 1] = last_state
+    for b in range(n_bars - 2, -1, -1):
+        bar_states[b] = back[b + 1][bar_states[b + 1]]
+
+    return bar_states
+
+
 def arrange_advanced(
     project,
     chords: list[str] | None = None,
@@ -54,7 +129,6 @@ def arrange_advanced(
             raise ValueError(f'{name} must match bar count')
     bars, layers, flat = [], [], []
     for index, chord in enumerate(chords):
-        # Validate all custom input independently of segment precedence and rests.
         custom = None
         if custom_voicings is not None and custom_voicings[index] is not None:
             custom = _make_voicing(chord,custom_voicings[index],capo,chord)
@@ -98,6 +172,9 @@ def arrange_advanced(
             dyn = max(0.55, min(1.15, float(bar_dynamics[bar['bar']])))
             bar['dynamic_scale'] = round(dyn, 3)
 
+    # --- Module A: Decode global Viterbi texture states ---
+    bar_states = _decode_viterbi_texture_states(bars, project, measure)
+
     _GENTLE_STYLES = {'民谣扫弦', '流行扫弦', '拍弦律动', '扫弦伴奏', '指弹律动'}
 
     events = {}
@@ -131,11 +208,26 @@ def arrange_advanced(
         if replace or key not in events:
             events[key] = event
 
+    def clear_beat(bar_idx, beat_pos):
+        """Remove plain arpeggio events at a specific beat to make room for ornaments."""
+        bar_start = bar_idx * measure + beat_pos
+        to_remove = []
+        for key, ev in events.items():
+            if abs(key[0] - bar_start) < 1e-9 and ev['technique'] == '':
+                to_remove.append(key)
+        for key in to_remove:
+            del events[key]
+
     tonic_pc = _note_pc(project.tonic)
     pentatonic = {(tonic_pc+x)%12 for x in (0,2,4,7,9)}
     diatonic = {(tonic_pc+x)%12 for x in (0,2,4,5,7,9,11)}
     _FINGERPICK_STYLES = {'分解和弦', '抒情琶音', '指弹律动'}
     _PHRASE_VEL_CURVE = [0.97, 1.00, 1.04, 0.98]
+
+    spb = 60.0 / project.bpm
+    half_beat_sec = 0.5 * spb
+    fast_tempo = half_beat_sec < 0.285
+    step_dur = 1.0 if fast_tempo else 0.5
 
     vocal_counts = {}
     for bar in bars:
@@ -143,6 +235,9 @@ def arrange_advanced(
         bar_start = idx * measure
         bar_end = (idx + 1) * measure
         vocal_counts[idx] = len(_overlapping_notes(project.notes, bar_start, bar_end))
+
+    prev_treble_pitch = None
+    prev_treble_string = None
 
     for bar in bars:
         index = bar['bar']
@@ -153,15 +248,64 @@ def arrange_advanced(
         cm = intro_mode == 'chord_melody' and silent
         bar_dyn = bar.get('dynamic_scale')
         use_gentle = bar_dyn is not None and bar_dyn < 0.68 and style in _GENTLE_STYLES
-        effective_style_idx = 0 if use_gentle else ADVANCED_STYLES.index(style)
+        state = 0 if use_gentle else (bar_states[index] if index < len(bar_states) else 1)
         phrase_vel_scale = _PHRASE_VEL_CURVE[bar_index % 4]
         dyn_scale = bar.get('dynamic_scale')
         is_cadence_bar = (bar_index + 1) % 4 == 0
         is_fingerpick = style in _FINGERPICK_STYLES
         is_4_4 = abs(measure - 4.0) < 1e-9
+        is_3_4 = abs(measure - 3.0) < 1e-9
         segments = bar['split_segments']
+        segment_beats = {s['beat'] for s in segments}
         grid = sorted(set([i*0.5 for i in range(math.ceil(measure*2)) if i*0.5 < measure]
                           +[s['beat'] for s in segments]))
+
+        # --- Module A cont.: compute active_slots per texture state ---
+        is_fingerpick_or_neosoul = style in _FINGERPICK_STYLES or style == 'Neo-Soul 律动'
+        if style == '扫弦伴奏':
+            if fast_tempo or state <= 1:
+                active_slots = {0, 2, 4, 6}
+            else:
+                active_slots = {0, 2, 4, 5, 6}
+        elif is_fingerpick_or_neosoul and not cm:
+            if fast_tempo:
+                if state == 0:
+                    active_slots = {0, 4}
+                elif state == 1:
+                    active_slots = {0, 2, 4, 6}
+                elif state == 2:
+                    if is_3_4:
+                        active_slots = {0, 2, 4}
+                    else:
+                        active_slots = {0, 2, 4, 6}
+                else:
+                    if is_3_4:
+                        active_slots = {0, 2, 4, 5}
+                    else:
+                        active_slots = {0, 2, 3, 4, 6}
+            else:
+                if state == 0:
+                    if is_3_4:
+                        active_slots = {0, 2}
+                    else:
+                        active_slots = {0, 2, 4}
+                elif state == 1:
+                    if is_3_4:
+                        active_slots = {0, 2, 4}
+                    else:
+                        active_slots = {0, 2, 3, 4, 6}
+                elif state == 2:
+                    if is_3_4:
+                        active_slots = {0, 1, 2, 4}
+                    else:
+                        active_slots = {0, 2, 3, 4, 6, 7}
+                else:
+                    active_slots = {0, 1, 2, 3, 4, 5, 6, 7}
+        else:
+            active_slots = set(range(8))
+
+        ov_notes = _overlapping_notes(project.notes, index * measure, (index + 1) * measure) if not silent else []
+
         for beat in grid:
             segment = active(bar,beat)
             if segment is None:
@@ -170,11 +314,17 @@ def arrange_advanced(
             bass = bass_of(segment)
             treble = sorted((x for x in played if x[0] <= 3),key=lambda x:x[2])
             mid_treble = sorted((x for x in played if x[0] <= 4),key=lambda x:x[2]) or treble
-            low = treble[0:1]
-            middle = treble[min(1,len(treble)-1):min(1,len(treble)-1)+1] if treble else []
-            high = treble[-1:]
             bass_list = [bass] if bass is not None else []
             slot = int(round(beat*2))%8
+            is_segment_boundary = any(abs(beat - sb) < 1e-9 for sb in segment_beats)
+            is_pm_beat = palm_mute and any(abs(beat - b) < 1e-9 for b in (0.0, measure / 2))
+
+            slot_in_active = slot in active_slots or is_segment_boundary
+            if is_pm_beat and not slot_in_active:
+                slot_in_active = True
+            if not slot_in_active:
+                continue
+
             use_alt_bass = False
             alt_bass_item = None
             if (is_fingerpick and is_4_4 and len(segments) == 1
@@ -186,32 +336,84 @@ def arrange_advanced(
                         alt_bass_item = candidate
                         use_alt_bass = True
                         break
-            patterns = (
-                [bass_list,low,middle,low,high,low,middle,low],
-                [played,[],mid_treble,treble,bass_list,treble,mid_treble,treble],
-                [bass_list+high,low,middle,low,bass_list+middle,high,low,middle],
-                [bass_list+treble,[],mid_treble,high,bass_list,treble,[],treble],
-                [bass_list,low,middle,high,middle,low,middle,low],
-            )
+
             slot_vels = (90, 45, 68, 44, 84, 46, 72, 44)
-            selection = list(patterns[effective_style_idx][slot])
-            if use_alt_bass and alt_bass_item is not None:
-                if bass in selection:
-                    selection = [alt_bass_item if (x == bass) else x for x in selection]
-                elif is_cadence_bar and selection:
-                    selection = [alt_bass_item]
-            is_strum = len(selection) >= 3
-            if any(abs(beat-s['beat']) < 1e-9 for s in segments) and bass is not None and bass not in selection:
-                if not use_alt_bass:
+
+            if style == '扫弦伴奏':
+                selection = list(played) if slot in {0, 4} else list(mid_treble) if slot in {2, 6} else list(treble)
+                if use_alt_bass and alt_bass_item is not None and bass in selection:
+                    selection = [alt_bass_item if x == bass else x for x in selection]
+                is_strum = len(selection) >= 3
+                if is_segment_boundary and bass is not None and bass not in selection and not use_alt_bass:
                     selection.append(bass)
-            for item in selection:
-                if cm and item[0] <= 3:
-                    continue
-                is_bass = bass is not None and (item == bass or (use_alt_bass and item == alt_bass_item))
-                technique = 'PM' if palm_mute and is_bass and any(abs(beat-b) < 1e-9 for b in (0,measure/2)) else ''
-                velocity = (92 if slot == 0 else slot_vels[slot]) if is_strum else (92 if (is_bass and slot == 0) else 86 if is_bass else slot_vels[slot])
-                velocity = max(1, min(127, round(velocity * phrase_vel_scale)))
-                insert(bar,beat,0.5,item,velocity,technique)
+                for item in selection:
+                    if cm and item[0] <= 3:
+                        continue
+                    is_bass_note = bass is not None and (item == bass or (use_alt_bass and item == alt_bass_item))
+                    technique = 'PM' if palm_mute and is_bass_note and any(abs(beat-b) < 1e-9 for b in (0, measure/2)) else ''
+                    velocity = (92 if slot == 0 else slot_vels[slot]) if is_strum else (92 if (is_bass_note and slot == 0) else 86 if is_bass_note else slot_vels[slot])
+                    velocity = max(1, min(127, round(velocity * phrase_vel_scale)))
+                    insert(bar, beat, step_dur, item, velocity, technique)
+
+            elif is_fingerpick_or_neosoul:
+                is_bass_slot = (slot == 0) or (slot == 4 and style in {'指弹律动', 'Neo-Soul 律动'} and (is_segment_boundary or state >= 1))
+
+                if is_bass_slot:
+                    bass_item = alt_bass_item if (use_alt_bass and alt_bass_item is not None) else bass
+                    if bass_item is not None:
+                        technique = 'PM' if palm_mute and any(abs(beat-b) < 1e-9 for b in (0, measure/2)) else ''
+                        velocity = max(1, min(127, round(92 * phrase_vel_scale)))
+                        insert(bar, beat, step_dur, bass_item, velocity, technique)
+
+                    if slot == 0 and style in {'指弹律动', 'Neo-Soul 律动'} and state >= 2 and mid_treble:
+                        best_pinch = _wdag_select(mid_treble, ov_notes, index, measure, beat,
+                                                  prev_treble_pitch, prev_treble_string)
+                        if best_pinch is not None:
+                            vel_pinch = max(1, min(127, round(slot_vels[slot] * phrase_vel_scale)))
+                            insert(bar, beat, step_dur, best_pinch, vel_pinch)
+                            prev_treble_pitch = best_pinch[2]
+                            prev_treble_string = best_pinch[0]
+                else:
+                    if cm:
+                        continue
+
+                    if style == 'Neo-Soul 律动' and slot in {2, 6} and len(mid_treble) >= 2:
+                        best1 = _wdag_select(mid_treble, ov_notes, index, measure, beat,
+                                             prev_treble_pitch, prev_treble_string)
+                        if best1 is not None:
+                            vel1 = max(1, min(127, round(slot_vels[slot] * phrase_vel_scale)))
+                            insert(bar, beat, step_dur, best1, vel1)
+                            adjacent = [c for c in mid_treble if c[0] != best1[0] and abs(c[0] - best1[0]) == 1]
+                            if adjacent:
+                                dyad_note = min(adjacent, key=lambda c: abs(c[2] - best1[2]))
+                                insert(bar, beat, step_dur, dyad_note, max(1, min(127, round(vel1 * 0.85))))
+                            prev_treble_pitch = best1[2]
+                            prev_treble_string = best1[0]
+                    elif mid_treble:
+                        best_treble = _wdag_select(mid_treble, ov_notes, index, measure, beat,
+                                                   prev_treble_pitch, prev_treble_string)
+                        if best_treble is not None:
+                            vel_t = max(1, min(127, round(slot_vels[slot] * phrase_vel_scale)))
+                            insert(bar, beat, step_dur, best_treble, vel_t)
+                            prev_treble_pitch = best_treble[2]
+                            prev_treble_string = best_treble[0]
+
+            else:
+                selection = list(played)
+                if use_alt_bass and alt_bass_item is not None and bass in selection:
+                    selection = [alt_bass_item if x == bass else x for x in selection]
+                is_strum = len(selection) >= 3
+                if is_segment_boundary and bass is not None and bass not in selection and not use_alt_bass:
+                    selection.append(bass)
+                for item in selection:
+                    if cm and item[0] <= 3:
+                        continue
+                    is_bass_note = bass is not None and (item == bass or (use_alt_bass and item == alt_bass_item))
+                    technique = 'PM' if palm_mute and is_bass_note and any(abs(beat-b) < 1e-9 for b in (0, measure/2)) else ''
+                    velocity = (92 if slot == 0 else slot_vels[slot]) if is_strum else (92 if (is_bass_note and slot == 0) else 86 if is_bass_note else slot_vels[slot])
+                    velocity = max(1, min(127, round(velocity * phrase_vel_scale)))
+                    insert(bar, beat, step_dur, item, velocity, technique)
+
         if cm:
             explicit = instrumental_melody is not None and index in instrumental_melody
             lead = list(instrumental_melody[index]) if explicit else []
@@ -242,9 +444,12 @@ def arrange_advanced(
                     raise ValueError(f'Unplayable treble melody pitch {pitch}')
                 item = min(choices,key=lambda x:(abs(x[1]-segment['base_fret']),x[1],x[0]))
                 insert(bar,beat,duration,item,88,'CM',True)
+
+        # --- Zero-collision ornament insertion ---
         tail = measure-0.5
         segment = active(bar,tail) if tail >= 0 else None
         ornament_candidates = []
+        tail_done = False
         if embellish_hp and segment is not None:
             parsed = parse_extended_chord(segment['chord'])
             tones = set(parsed['pcs']) | {parsed['bass_pc']} if parsed else set()
@@ -261,8 +466,10 @@ def arrange_advanced(
                 _, string, fret, pitch, old = min(ornament_candidates)
                 existing = events.get((index*measure+tail,string))
                 if existing is None or existing['technique'] not in {'CM','H','P','PB'}:
-                    insert(bar,tail,0.5,(string,fret,pitch),78,'H' if fret > old else 'P',True)
-        if passing_bass and segment is not None and index+1 < len(bars):
+                    clear_beat(index, tail)
+                    insert(bar,tail,step_dur,(string,fret,pitch),78,'H' if fret > old else 'P',True)
+                    tail_done = True
+        if not tail_done and passing_bass and segment is not None and index+1 < len(bars):
             next_segment = active(bars[index+1],0)
             target = bass_of(next_segment) if next_segment is not None else None
             current = bass_of(segment)
@@ -277,7 +484,8 @@ def arrange_advanced(
                             candidates.append((abs(pitch-current[2]),0,fret,string,pitch))
             if candidates:
                 _, _, fret, string, pitch = min(candidates)
-                insert(bar,tail,0.5,(string,fret,pitch),88,'PB')
+                clear_beat(index, tail)
+                insert(bar,tail,step_dur,(string,fret,pitch),88,'PB')
         vnc = vocal_counts.get(index, 0)
         if vnc <= 1 and (passing_bass or embellish_hp) and segment is not None:
             fill_beat = measure - 1.0
@@ -303,6 +511,7 @@ def arrange_advanced(
                             _, fs2, ff2, pp2, old2 = best
                             key_check = (index * measure + fill_beat, fs2)
                             if key_check not in events or events[key_check].get('technique') not in {'CM', 'H', 'P', 'PB'}:
+                                clear_beat(index, fill_beat)
                                 insert(bar, fill_beat, 1.0, (fs2, ff2, pp2), 78, 'H' if ff2 > old2 else 'P', True)
                                 fill_done = True
                                 break
@@ -322,7 +531,8 @@ def arrange_advanced(
                                     cands_fill.append((abs(pp - current_fill[2]), 0, ff, fs, pp))
                     if cands_fill:
                         _, _, ff3, fs3, pp3 = min(cands_fill)
-                        insert(bar, fill_beat, 0.5, (fs3, ff3, pp3), 84, 'PB')
+                        clear_beat(index, fill_beat)
+                        insert(bar, fill_beat, step_dur, (fs3, ff3, pp3), 84, 'PB')
 
         if slap_x and bar['split_segments']:
             for beat in (1.0,3.0):
@@ -357,3 +567,38 @@ def arrange_advanced(
                 beat_origin=project.beat_origin,style=style,capo=capo,bar_count=count,measure_beats=measure,
                 chords=[b['chord'] for b in bars],bars=bars,
                 events=sorted(ordered+slaps,key=lambda e:(e['start'],e['string'],e['technique'])))
+
+
+def _wdag_select(mid_treble, ov_notes, bar_idx, measure, beat,
+                 prev_treble_pitch, prev_treble_string):
+    """Module B: WDAG voice-leading + vocal register avoidance + call-and-response selection."""
+    if not mid_treble:
+        return None
+    abs_time = bar_idx * measure + beat
+    vocal_onset_here = any(abs(n.start - abs_time) < 0.45 for n in ov_notes)
+    v_pitch = None
+    for n in ov_notes:
+        if n.start <= abs_time < n.start + n.duration or abs(n.start - abs_time) < 0.45:
+            v_pitch = n.pitch
+            break
+    vocal_gap_here = (v_pitch is None) or (not vocal_onset_here and beat >= measure * 0.5)
+
+    best_cand = None
+    best_cost = float('inf')
+    for cand in mid_treble:
+        s_num, fret, pitch = cand
+        c_vl = abs(pitch - prev_treble_pitch) * 0.45 if prev_treble_pitch is not None else 0.0
+        c_repeat = 4.5 if (prev_treble_string is not None and s_num == prev_treble_string) else 0.0
+        if vocal_onset_here and v_pitch is not None:
+            c_mask = 5.0 * max(0.0, (pitch - (v_pitch - 5)) / 3.0)
+        else:
+            c_mask = 0.0
+        if vocal_gap_here:
+            c_resp = -3.5 * (4 - s_num)
+        else:
+            c_resp = 1.2 * (4 - s_num)
+        cost = c_vl + c_repeat + c_mask + c_resp
+        if cost < best_cost:
+            best_cost = cost
+            best_cand = cand
+    return best_cand
