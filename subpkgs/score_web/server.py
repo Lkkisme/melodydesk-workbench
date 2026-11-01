@@ -42,11 +42,12 @@ except ModuleNotFoundError as exc:
     reharmonize_progression = arrange_advanced = synthesize_realistic_guitar = suggest_bar_substitutions = None
     REHARMONIZE_PRESETS, ADVANCED_STYLES = {}, ()
 try:
-    from subpkgs.singing_lyrics import align_lyrics_to_notes
+    from subpkgs.singing_lyrics import align_lyrics_to_notes, estimate_key_albrecht_shanahan
 except ModuleNotFoundError as exc:
-    if exc.name != 'subpkgs.singing_lyrics':
+    if exc.name not in {'subpkgs.singing_lyrics', 'subpkgs.singing_lyrics.singing_transcriber'}:
         raise
     align_lyrics_to_notes = None
+    estimate_key_albrecht_shanahan = None
 
 
 def _implemented(function):
@@ -55,7 +56,7 @@ def _implemented(function):
 
 def _refresh_backends():
     global reharmonize_progression, arrange_advanced, roman_numeral, check_melody_clash, generate_voicings, suggest_bar_substitutions
-    global REHARMONIZE_PRESETS, ADVANCED_STYLES, synthesize_realistic_guitar, align_lyrics_to_notes
+    global REHARMONIZE_PRESETS, ADVANCED_STYLES, synthesize_realistic_guitar, align_lyrics_to_notes, estimate_key_albrecht_shanahan
     global NATIVE, PRESETS, STYLES
     try:
         import importlib
@@ -75,6 +76,7 @@ def _refresh_backends():
         import importlib
         sl = importlib.import_module('subpkgs.singing_lyrics')
         align_lyrics_to_notes = getattr(sl, 'align_lyrics_to_notes', None)
+        estimate_key_albrecht_shanahan = getattr(sl, 'estimate_key_albrecht_shanahan', None)
     except Exception:
         pass
     NATIVE = _implemented(reharmonize_progression) and _implemented(arrange_advanced) and bool(REHARMONIZE_PRESETS)
@@ -948,21 +950,14 @@ def create_app() -> FastAPI:
                     except Exception:
                         notes = raw_notes
 
-                # Step 5 — Joint Major/Minor Key Detection (tonic, is_minor)
-                major_scale = {0, 2, 4, 5, 7, 9, 11}
-                minor_scale = {0, 2, 3, 5, 7, 8, 10, 11}
-                final_pc = notes[-1].pitch % 12 if notes else None
+                # Step 5 — Albrecht-Shanahan (2013) Empirical Key Estimation
                 tonic_pc, is_minor = 0, False
-                if notes:
-                    best_score = -1.0
-                    for k in range(12):
-                        for scale_set, minor_flag in ((major_scale, False), (minor_scale, True)):
-                            score = sum(n.duration for n in notes if (n.pitch - k) % 12 in scale_set)
-                            if final_pc is not None and final_pc == k:
-                                score += 0.8
-                            if score > best_score:
-                                best_score = score
-                                tonic_pc, is_minor = k, minor_flag
+                if notes and estimate_key_albrecht_shanahan is not None:
+                    key_info = estimate_key_albrecht_shanahan(notes)
+                    tonic_pc = key_info['tonic_pc']
+                    is_minor = key_info['is_minor']
+                elif notes:
+                    tonic_pc = int(notes[-1].pitch) % 12
                 rel_major_pc = (tonic_pc + 3) % 12 if is_minor else tonic_pc
                 rel_tonic = NAMES[rel_major_pc]
                 project = Project(
@@ -977,7 +972,7 @@ def create_app() -> FastAPI:
                     guitar.chord_name(rel_major_pc + 9, True),
                     guitar.chord_name(rel_major_pc + 5, False),
                 ]
-                vocal_chords = guitar.suggest(project, rel_major_pc, minor=is_minor) if notes else turnaround
+                vocal_chords = guitar.suggest(project, tonic_pc, minor=is_minor) if notes else turnaround
                 base_chords = [
                     (turnaround[i % 4] if (not ch or ch == 'N.C.') else ch)
                     for i, ch in enumerate(vocal_chords)

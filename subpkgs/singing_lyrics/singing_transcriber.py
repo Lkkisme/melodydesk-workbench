@@ -13,6 +13,66 @@ import pitch_notes
 import singing_model
 
 
+AS_MAJOR = (0.238, 0.006, 0.111, 0.006, 0.137, 0.094, 0.016, 0.214, 0.009, 0.080, 0.008, 0.081)
+AS_MINOR = (0.220, 0.006, 0.104, 0.123, 0.019, 0.103, 0.012, 0.214, 0.062, 0.022, 0.061, 0.052)
+
+
+def estimate_key_albrecht_shanahan(notes: list) -> dict:
+    if not notes:
+        return {'tonic_pc': 0, 'is_minor': False, 'rel_major_pc': 0,
+                'confidence': 0.0, 'profile': list(AS_MAJOR)}
+
+    chroma = [0.0] * 12
+    n_notes = len(notes)
+    for idx, n in enumerate(notes):
+        conf = max(0.35, float(getattr(n, 'confidence', 1.0)))
+        dur = float(getattr(n, 'duration', 1.0))
+        w = dur * conf
+        beat_pos = float(getattr(n, 'start', 0.0)) % 4.0
+        if beat_pos < 0.1:
+            w *= 1.3
+        elif beat_pos % 2.0 < 0.1:
+            w *= 1.15
+        elif beat_pos % 1.0 < 0.1:
+            w *= 1.05
+        chroma[int(n.pitch) % 12] += w
+
+    last_pc = int(notes[-1].pitch) % 12
+    first_pc = int(notes[0].pitch) % 12
+
+    best_k, best_minor, best_corr = 0, False, -2.0
+    best_profile = list(AS_MAJOR)
+    for k in range(12):
+        for is_minor, profile in ((False, AS_MAJOR), (True, AS_MINOR)):
+            rotated = [chroma[(k + d) % 12] for d in range(12)]
+            mean_r = sum(rotated) / 12.0
+            mean_p = sum(profile) / 12.0
+            cov, var_r, var_p = 0.0, 0.0, 0.0
+            for i in range(12):
+                dr = rotated[i] - mean_r
+                dp = profile[i] - mean_p
+                cov += dr * dp
+                var_r += dr * dr
+                var_p += dp * dp
+            denom = math.sqrt(var_r * var_p) if var_r > 0 and var_p > 0 else 1e-12
+            corr = cov / denom
+
+            if last_pc == k:
+                corr += 0.12
+            if first_pc == k:
+                corr += 0.06
+
+            if corr > best_corr:
+                best_corr = corr
+                best_k = k
+                best_minor = is_minor
+                best_profile = list(profile)
+
+    rel_major_pc = (best_k + 3) % 12 if best_minor else best_k
+    return {'tonic_pc': best_k, 'is_minor': best_minor, 'rel_major_pc': rel_major_pc,
+            'confidence': best_corr, 'profile': best_profile}
+
+
 def transcribe_vocal_notes(
     vocal_path: str | Path,
     bpm: float = 120.0,
@@ -123,35 +183,69 @@ def regulate_singing_notes_for_score(
     if not filtered:
         return []
 
+    def _has_wb_between(a, b, wbs_list):
+        a_end = a.raw_start + a.raw_duration
+        for wb in wbs_list:
+            if a_end - 0.03 < wb < b.raw_start + 0.03:
+                return True
+        return False
+
+    wb_set = sorted(set(float(w) for w in (word_boundaries_sec or []) if math.isfinite(w))) if word_boundaries_sec else []
+
     merged: list = []
     for n in filtered:
-        if (merged
-                and (n.raw_start - (merged[-1].raw_start + merged[-1].raw_duration)) < 0.05
-                and abs(n.pitch - merged[-1].pitch) <= 1
-                and merged[-1].raw_duration < 0.16):
-            prev_dur = merged[-1].raw_duration
-            merged[-1].raw_duration = (n.raw_start + n.raw_duration) - merged[-1].raw_start
-            if n.raw_duration > prev_dur:
-                merged[-1].pitch = n.pitch
-        else:
-            merged.append(n)
+        if merged:
+            prev = merged[-1]
+            gap_t = n.raw_start - (prev.raw_start + prev.raw_duration)
+            dp = abs(n.pitch - prev.pitch)
+            prev_conf = max(0.35, float(getattr(prev, 'confidence', 1.0)))
+            cur_conf = max(0.35, float(getattr(n, 'confidence', 1.0)))
+            dur_ratio = min(prev.raw_duration, n.raw_duration) / max(prev.raw_duration, n.raw_duration, 1e-6)
+            has_wb = _has_wb_between(prev, n, wb_set)
+
+            log_odds = -2.0 * max(0.0, gap_t) / 0.05 - 1.5 * dp + 1.2 * dur_ratio + 0.8 * (prev_conf + cur_conf) - 1.5
+            if has_wb:
+                log_odds -= 3.0
+
+            if not has_wb and dp <= 1 and log_odds > 0.0 and prev.raw_duration < 0.16:
+                prev_dur = prev.raw_duration
+                prev.raw_duration = (n.raw_start + n.raw_duration) - prev.raw_start
+                if n.raw_duration > prev_dur:
+                    prev.pitch = n.pitch
+                continue
+        merged.append(n)
 
     scooped: list = []
     i = 0
     while i < len(merged):
-        if (i + 1 < len(merged)
-                and merged[i].raw_duration < 0.21
-                and (merged[i + 1].raw_start - (merged[i].raw_start + merged[i].raw_duration)) < 0.07
-                and merged[i + 1].raw_duration >= merged[i].raw_duration * 1.35
-                and 1 <= abs(merged[i + 1].pitch - merged[i].pitch) <= 3):
-            old_end = merged[i + 1].raw_start + merged[i + 1].raw_duration
-            merged[i + 1].raw_start = merged[i].raw_start
-            merged[i + 1].raw_duration = old_end - merged[i + 1].raw_start
-            scooped.append(merged[i + 1])
-            i += 2
-        else:
-            scooped.append(merged[i])
-            i += 1
+        if i + 1 < len(merged):
+            prev = merged[i]
+            cur = merged[i + 1]
+            gap_t = cur.raw_start - (prev.raw_start + prev.raw_duration)
+            dp = abs(cur.pitch - prev.pitch)
+            prev_conf = max(0.35, float(getattr(prev, 'confidence', 1.0)))
+            cur_conf = max(0.35, float(getattr(cur, 'confidence', 1.0)))
+            has_wb = _has_wb_between(prev, cur, wb_set)
+
+            scoop_log_odds = (-2.0 * max(0.0, gap_t) / 0.07
+                              + 1.5 * (cur.raw_duration / max(prev.raw_duration, 1e-6) - 1.0)
+                              + 0.8 * (cur_conf - prev_conf)
+                              - 0.5 * max(0, dp - 1))
+            if has_wb:
+                scoop_log_odds -= 3.0
+
+            if (not has_wb and 1 <= dp <= 3
+                    and prev.raw_duration < 0.21 and gap_t < 0.07
+                    and cur.raw_duration >= prev.raw_duration * 1.35
+                    and scoop_log_odds > 0.0):
+                old_end = cur.raw_start + cur.raw_duration
+                cur.raw_start = prev.raw_start
+                cur.raw_duration = old_end - cur.raw_start
+                scooped.append(cur)
+                i += 2
+                continue
+        scooped.append(merged[i])
+        i += 1
     merged = scooped
 
     if word_boundaries_sec:
@@ -176,12 +270,14 @@ def regulate_singing_notes_for_score(
                 if len(valid_cuts) < 2 or valid_cuts[-1] - valid_cuts[0] < 0.20:
                     split_merged.append(n)
                     continue
+                appended = False
                 for j in range(len(valid_cuts) - 1):
                     seg_start = valid_cuts[j]
                     seg_dur = valid_cuts[j + 1] - seg_start
                     if seg_dur >= 0.20:
                         split_merged.append(Note(n.pitch, n.start, n.duration, seg_start, seg_dur, n.confidence, n.edited))
-                if not any(sn for sn in split_merged[-len(valid_cuts)+1:]):
+                        appended = True
+                if not appended:
                     split_merged.append(n)
             merged = split_merged
 
@@ -239,38 +335,37 @@ def regulate_singing_notes_for_score(
             continue
         result.append(n)
 
-    MAJOR_SCALE = {0, 2, 4, 5, 7, 9, 11}
     if len(result) >= 8:
-        dur_by_pc = [0.0] * 12
-        for n in result:
-            dur_by_pc[n.pitch % 12] += n.duration
-        total_dur = sum(dur_by_pc)
-        if total_dur > 0:
-            best_k, best_cov = 0, 0.0
-            for k in range(12):
-                cov = sum(dur_by_pc[(k + d) % 12] for d in MAJOR_SCALE) / total_dur
-                if cov > best_cov:
-                    best_k, best_cov = k, cov
-            if best_cov >= 0.78:
-                scale_pcs = frozenset((best_k + d) % 12 for d in MAJOR_SCALE)
-                for i, n in enumerate(result):
-                    if n.duration > 0.8 or n.pitch % 12 in scale_pcs:
-                        continue
-                    snapped = False
-                    for adj in (result[i - 1] if i > 0 else None, result[i + 1] if i + 1 < len(result) else None):
-                        if adj is not None and abs(adj.pitch - n.pitch) == 1 and adj.pitch % 12 in scale_pcs:
-                            n.pitch = adj.pitch
-                            snapped = True
-                            break
-                    if not snapped:
-                        up_ok = (n.pitch + 1) % 12 in scale_pcs
-                        dn_ok = (n.pitch - 1) % 12 in scale_pcs
-                        if up_ok and dn_ok:
-                            n.pitch += 1 if dur_by_pc[(n.pitch + 1) % 12] >= dur_by_pc[(n.pitch - 1) % 12] else -1
-                        elif up_ok:
-                            n.pitch += 1
-                        elif dn_ok:
-                            n.pitch -= 1
+        key_info = estimate_key_albrecht_shanahan(result)
+        if key_info['confidence'] >= 0.45:
+            profile = key_info['profile']
+            tonic_k = key_info['tonic_pc']
+            for i, n in enumerate(result):
+                if getattr(n, 'edited', False):
+                    continue
+                conf_i = max(0.35, float(getattr(n, 'confidence', 1.0)))
+                if n.duration > 0.8 or conf_i > 0.85:
+                    continue
+                p0 = int(n.pitch)
+                pc0 = p0 % 12
+                rel0 = (pc0 - tonic_k) % 12
+                if profile[rel0] > 0.05:
+                    continue
+                prev_p = int(result[i - 1].pitch) if i > 0 else p0
+                next_p = int(result[i + 1].pitch) if i + 1 < len(result) else p0
+                best_p, best_score = p0, -math.inf
+                lam = max(0.3, min(1.5, 1.0 - 0.8 * conf_i + 0.5 * (1.0 - n.duration)))
+                for candidate_p in (p0 - 1, p0, p0 + 1):
+                    cp_rel = (candidate_p % 12 - tonic_k) % 12
+                    log_prior = math.log(max(1e-6, profile[cp_rel]))
+                    obs_score = -abs(candidate_p - p0) * (0.5 + 0.5 * conf_i)
+                    vl = -0.1 * (abs(candidate_p - prev_p) + abs(candidate_p - next_p))
+                    score = obs_score + lam * log_prior + vl
+                    if score > best_score:
+                        best_score = score
+                        best_p = candidate_p
+                if best_p != p0:
+                    n.pitch = best_p
 
     if clip_duration > beat_origin:
         if use_piecewise:

@@ -543,12 +543,26 @@ def _align_anchored_tokens(tokens, notes, intervals, anchors, baseline):
         lyrics[onset], owners[onset] = tokens[i]["text"], i
         stop = onsets[i + 1] if i + 1 < m else n
         anchor = anchors[i]
+        next_anchor_start = math.inf
+        if i + 1 < m and anchors[i + 1] is not None:
+            next_anchor_start = anchors[i + 1]["start"]
         for j in range(onset + 1, stop):
             start, end = intervals[j]
+            duration = max(1e-6, end - start)
+            gap = start - intervals[j - 1][1]
             if anchor is not None:
                 overlap = max(0.0, min(end, anchor["end"]) - max(start, anchor["start"]))
-                if (start > intervals[j - 1][1] or overlap <= 0.0
-                        or overlap < 0.25 * (end - start)):
+                ov_ratio = overlap / duration
+                tail_ext = max(0.0, start - anchor["end"])
+                tail_score = math.exp(-tail_ext / max(0.12, 0.45 * duration))
+                pitch_step = abs(int(notes[j].pitch) - int(notes[j - 1].pitch))
+                is_legato = gap <= 0.06
+                before_next = end <= next_anchor_start + 0.02
+                if gap > 0.06:
+                    break
+                if not (is_legato and before_next
+                        and (ov_ratio >= 0.18
+                             or (start >= anchor["start"] and tail_score >= 0.55 and pitch_step <= 4))):
                     break
             lyrics[j], owners[j] = "-", i
     return lyrics, owners

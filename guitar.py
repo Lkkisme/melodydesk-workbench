@@ -10,6 +10,26 @@ import wave
 from music import NAMES, vlq
 
 TUNING=(40,45,50,55,59,64)  # low E -> high e
+
+ALBRECHT_MAJOR=(0.238,0.006,0.111,0.006,0.137,0.094,0.016,0.214,0.009,0.080,0.008,0.081)
+ALBRECHT_MINOR=(0.220,0.006,0.104,0.123,0.019,0.103,0.012,0.214,0.062,0.022,0.061,0.052)
+
+_GUITAR_MAJ_TRANS=(
+    (-0.03, 0.06, 0.03, 0.10, 0.10, 0.08),
+    ( 0.03,-0.04, 0.02, 0.04, 0.12, 0.03),
+    ( 0.02, 0.05,-0.04, 0.08, 0.03, 0.10),
+    ( 0.10, 0.05, 0.02,-0.03, 0.10, 0.04),
+    ( 0.14, 0.02, 0.02, 0.04,-0.04, 0.10),
+    ( 0.03, 0.08, 0.04, 0.10, 0.06,-0.04),
+)
+_GUITAR_MIN_TRANS=(
+    (-0.03, 0.06, 0.10, 0.04, 0.04, 0.10),
+    ( 0.05,-0.04, 0.06, 0.03, 0.05, 0.06),
+    ( 0.06, 0.05,-0.03, 0.08, 0.05, 0.06),
+    ( 0.08, 0.05, 0.05,-0.04, 0.06, 0.05),
+    ( 0.05, 0.06, 0.06, 0.05,-0.03, 0.08),
+    ( 0.10, 0.06, 0.05, 0.03, 0.05,-0.03),
+)
 OPEN={'C':[-1,3,2,0,1,0],'D':[-1,-1,0,2,3,2],'E':[0,2,2,1,0,0],
       'F':[1,3,3,2,1,1],'G':[3,2,0,0,0,3],'A':[-1,0,2,2,2,0],
       'Am':[-1,0,2,2,1,0],'Dm':[-1,-1,0,2,3,1],'Em':[0,2,2,0,0,0]}
@@ -61,7 +81,6 @@ def voicing(name,capo=0):
 
 
 def key_candidates(project):
-    # Deliberately simple melody-only prior, not a calibrated key detector.
     weights=[0.0]*12
     for n in project.notes:
         weights[n.pitch%12]+=n.duration
@@ -69,13 +88,32 @@ def key_candidates(project):
     options=[]
     for root in range(12):
         for minor in (False,True):
-            scale={0,2,3,5,7,8,10} if minor else {0,2,4,5,7,9,11}
-            inside=sum(w for pc,w in enumerate(weights) if (pc-root)%12 in scale)/total
-            tonic=weights[root]/total
+            profile=ALBRECHT_MINOR if minor else ALBRECHT_MAJOR
+            corr=sum(weights[pc]*profile[(pc-root)%12] for pc in range(12))/total
+            triad={root,(root+(3 if minor else 4))%12,(root+7)%12}
+            triad_w=sum(weights[pc] for pc in triad)/total
             fifth=weights[(root+7)%12]/total
             final=.04 if project.notes and project.notes[-1].pitch%12==root else 0
-            options.append((inside+.12*tonic+.04*fifth+final,root,minor))
+            options.append((corr+.12*triad_w+.04*fifth+final,root,minor))
     return sorted(options,reverse=True)
+
+
+def _gttm_salience(rel_onset,overlap,measure):
+    sigma=0.14
+    grid=[(0.0,1.45),(measure*0.5,1.22)]
+    for q in range(int(measure)):
+        grid.append((float(q),1.05))
+    for q in range(int(measure*2)):
+        grid.append((q*0.5,0.85))
+    best=0.85
+    for pos,w in grid:
+        d=abs(rel_onset-pos)
+        if d>measure/2:d=measure-d
+        g=math.exp(-0.5*(d/sigma)**2)
+        v=w*g
+        if v>best:best=v
+    dur_f=min(1.45,max(0.35,0.40+0.65*math.log(1+2.2*overlap)))
+    return best*dur_f
 
 
 def suggest(project,root,minor=False):
@@ -88,13 +126,16 @@ def suggest(project,root,minor=False):
         raise ValueError('当前编配最多支持 1000 小节')
     degrees=[(0,True),(3,False),(5,True),(7,False),(8,False),(10,False)] if minor else [(0,False),(2,True),(4,True),(5,False),(7,False),(9,True)]
     names=[chord_name(root+d,m) for d,m in degrees]
+    name_to_deg={n:i for i,n in enumerate(names)}
+    trans_mat=_GUITAR_MIN_TRANS if minor else _GUITAR_MAJ_TRANS
     rows=[]
     for bar in range(count):
         weights=[0.0]*12
         for n in project.notes:
             overlap=max(0,min(n.start+n.duration,(bar+1)*measure)-max(n.start,bar*measure))
-            # Longer notes and notes entering on the bar line carry more weight.
-            weights[n.pitch%12]+=overlap*(1.25 if abs(n.start-bar*measure)<.13 else 1)
+            if overlap<=0:continue
+            rel_onset=(n.start-bar*measure)%measure
+            weights[n.pitch%12]+=_gttm_salience(rel_onset,overlap,measure)
         if not sum(weights):
             rows.append({'N.C.':0});continue
         emission={}
@@ -110,8 +151,12 @@ def suggest(project,root,minor=False):
             for previous,(cost,path) in states.items():
                 transition=0
                 if previous and previous!='N.C.' and name!='N.C.':
-                    distance=(parse_chord(name)[0]-parse_chord(previous)[0])%12
-                    transition=.06 if distance in (5,7) else -.02 if previous==name else -.05
+                    pi=name_to_deg.get(previous,-1)
+                    ci=name_to_deg.get(name,-1)
+                    if pi>=0 and ci>=0:
+                        transition=trans_mat[pi][ci]
+                    else:
+                        transition=-0.05
                 choices.append((cost+fit+transition,path+[name]))
             updated[name]=max(choices,key=lambda x:x[0])
         states=updated

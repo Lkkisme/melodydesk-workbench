@@ -1,4 +1,4 @@
-"""Extended & Slash Chord Parser, CAGED/Open/Shell Voicing Generator, and Parameter-Free Voice Leading DP."""
+"""Extended & Slash Chord Parser, CAGED/Open/Shell Voicing Generator, Biomechanical Ergonomic Energy, and Soprano Voice-Leading Viterbi DP."""
 from __future__ import annotations
 
 import re
@@ -111,6 +111,40 @@ def _internal_mutes(frets):
     return sum(1 for f in frets[lo:hi+1] if f < 0)
 
 
+def _ergonomic_voicing_cost(frets, parsed, capo):
+    sounding = [i for i, f in enumerate(frets) if f >= 0]
+    if not sounding:
+        return 100.0
+    pitches = [STANDARD_TUNING[i] + capo + f for i in sounding for f in [frets[i]]]
+    pcs = {p % 12 for p in pitches}
+    bass_pc = parsed['bass_pc']
+    actual_bass_pc = pitches[0] % 12
+    bass_cost = 0.0 if actual_bass_pc == bass_pc else 3.0
+    req = _required(parsed)
+    completeness_cost = len(req - pcs) * 2.5
+    interior = _internal_mutes(frets)
+    mute_cost = interior * 2.0 if not (interior == 1 and parsed['bass']) else interior * 0.8
+    richness_cost = max(0, 4 - len(sounding)) * 1.5
+    positive = [f for f in frets if f > 0]
+    if positive:
+        min_f, max_f = min(positive), max(positive)
+        span_cost = (max_f - min_f) ** 2 * 0.15
+        centroid = sum(positive) / len(positive)
+        centroid_cost = centroid * 0.18
+        barre_strings = sum(1 for f in frets if f == min_f and f > 0)
+        barre_cost = (barre_strings - 1) * 0.8 if barre_strings > 1 else 0.0
+        stretch_cost = 0.0
+        for i in range(len(frets) - 1):
+            if frets[i] > 0 and frets[i + 1] > 0 and abs(frets[i] - frets[i + 1]) >= 3:
+                stretch_cost += (abs(frets[i] - frets[i + 1]) - 2) * 0.5
+    else:
+        span_cost = centroid_cost = barre_cost = stretch_cost = 0.0
+    fingers_cnt, _ = _fingers(frets)
+    fingers_cost = max(0, fingers_cnt - 3) * 1.5
+    return (bass_cost + completeness_cost + mute_cost + richness_cost
+            + span_cost + centroid_cost + barre_cost + stretch_cost + fingers_cost)
+
+
 @lru_cache(maxsize=512)
 def _search(symbol, capo):
     parsed = parse_extended_chord(symbol)
@@ -157,24 +191,12 @@ def _search(symbol, capo):
                 visit(i+1, frets+[fret], pcs | ({pitch%12} if pitch >= 0 else set()),
                       active+([pitch] if pitch >= 0 else []), pitch if pitch >= 0 else last)
         visit(0, [], set(), [], -1)
+
     def key(item):
-        frets, v = item
-        active_cnt = sum(1 for f in frets if f >= 0)
-        mutes = _internal_mutes(frets)
-        max_f = max(0, *frets)
-        return (
-            0 if frets in canonical else 1,
-            len(set(parsed['pcs'])-{p%12 for p in v['pitches'] if p >= 0}),
-            0 if mutes == 0 else (1 if mutes == 1 and parsed['bass'] else 2 + mutes),
-            0 if active_cnt >= 4 else 1,
-            0 if max_f <= 5 else 1,
-            -min(active_cnt, 5),
-            max_f,
-            v['span'],
-            _fingers(frets)[0],
-            sum(max(f,0) for f in frets),
-            frets,
-        )
+        frets, _ = item
+        canonical_bonus = 0.0 if frets in canonical else 2.0
+        return canonical_bonus + _ergonomic_voicing_cost(list(frets), parsed, capo)
+
     return tuple(frets for frets, _ in sorted(found.items(), key=key))
 
 
@@ -214,9 +236,28 @@ def generate_voicings(symbol: str, capo: int = 0, max_candidates: int = 6) -> li
     return [_make_voicing(symbol,f,capo,symbol) for f in _search(normalized,capo)[:max_candidates]]
 
 
-def _transition_cost(a,b):
-    return sum(abs(x-y) for x,y in zip(a['frets'],b['frets'])) - len(
-        {p for p in a['pitches'] if p >= 0} & {p for p in b['pitches'] if p >= 0})
+def _transition_cost(a, b):
+    frets_a, frets_b = a['frets'], b['frets']
+    positive_a = [f for f in frets_a if f > 0]
+    positive_b = [f for f in frets_b if f > 0]
+    centroid_a = sum(positive_a) / len(positive_a) if positive_a else 0.5
+    centroid_b = sum(positive_b) / len(positive_b) if positive_b else 0.5
+    centroid_cost = abs(centroid_a - centroid_b) * 1.15
+    anchor_bonus = 0.0
+    jump_cost = 0.0
+    for fa, fb in zip(frets_a, frets_b):
+        if fa > 0 and fa == fb:
+            anchor_bonus -= 0.35
+        elif fa >= 0 and fb >= 0:
+            jump_cost += abs(fa - fb) * 0.12
+    pitches_a = [p for p in a['pitches'] if p >= 0]
+    pitches_b = [p for p in b['pitches'] if p >= 0]
+    soprano_cost = 0.0
+    if pitches_a and pitches_b:
+        top_a, top_b = max(pitches_a), max(pitches_b)
+        leap = abs(top_a - top_b)
+        soprano_cost = max(0, leap - 3) * 0.28
+    return centroid_cost + anchor_bonus + jump_cost + soprano_cost
 
 
 def _optimize_candidates(layers):
