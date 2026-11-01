@@ -183,17 +183,21 @@ def _rebuild(candidate):
                 if identity in candidate.custom_segment_voicings:
                     segment.update(frets=list(candidate.custom_segment_voicings[identity]), capo=candidate.capo)
                 reports.append(check_melody_clash(segment['chord'], candidate.project.notes,
-                    index*measure+segment['beat'], index*measure+segment['beat']+segment['duration']))
+                    index*measure+segment['beat'], index*measure+segment['beat']+segment['duration'],
+                    candidate.project.tonic))
             row['chord'] = row['split_segments'][0]['chord']
             row['roman'] = row['split_segments'][0]['roman']
-            status = ('clash' if any(r['clashes'] for r in reports) else
-                      'tension' if any(r['tensions'] for r in reports) else 'safe')
+            status = ('clash' if any(r.get('status') == 'clash' or r['clashes'] for r in reports) else
+                      'tension' if any(r.get('status') == 'tension' or r['tensions'] for r in reports) else 'safe')
+            reasons = [r.get('reason', '') for r in reports if r.get('reason')]
             row['clash'] = dict(status=status,
                 message='⚠️ 小二度避用音冲突' if status == 'clash' else ('✨ 色彩张力音 (9/11/13)' if status == 'tension' else '✅ 与主旋律和谐'),
                 clashes=[c for r in reports for c in r['clashes']],
                 tensions=[t for r in reports for t in r['tensions']],
                 chord_tones=sorted({pc for r in reports for pc in r['chord_tones']}),
-                notes_checked=sum(r['notes_checked'] for r in reports))
+                notes_checked=sum(r['notes_checked'] for r in reports),
+                clashing_pitches=[p for r in reports for p in r.get('clashing_pitches', [])],
+                reason='; '.join(dict.fromkeys(reasons)))
             row['voicings'] = generate_voicings(row['chord'], candidate.capo)
             if _implemented(suggest_bar_substitutions) and row['chord'] != 'N.C.':
                 prev_c = analysis[index-1]['chord'] if index > 0 else None
@@ -908,8 +912,17 @@ def create_app() -> FastAPI:
                     from subpkgs.singing_lyrics import transcribe_word_timestamps
                     aligned = transcribe_word_timestamps(stems['vocals'], prefer_cuda=True, ground_truth_text=lyrics or '')
                     word_ts = aligned.get('word_timestamps') or []
-                    vocal_onsets = sorted({float(w['start']) for w in word_ts if 'start' in w and float(w['start']) >= 0})
-                    word_boundaries = sorted(set(vocal_onsets) | {float(w['end']) for w in word_ts if 'end' in w and float(w['end']) >= 0})
+                    measured_ts = [w for w in word_ts if not w.get('interpolated') and not w.get('subdivided')]
+                    subdiv_ts = [w for w in word_ts if not w.get('interpolated') and w.get('subdivided')]
+                    vocal_onsets = sorted(
+                        {float(w['start']) for w in measured_ts if 'start' in w and float(w['start']) >= 0}
+                        | {float(w['group_start']) for w in subdiv_ts if 'group_start' in w and float(w['group_start']) >= 0}
+                    )
+                    word_boundaries = sorted(
+                        set(vocal_onsets)
+                        | {float(w['end']) for w in measured_ts if 'end' in w and float(w['end']) >= 0}
+                        | {float(w['group_end']) for w in subdiv_ts if 'group_end' in w and float(w['group_end']) >= 0}
+                    )
                 except Exception:
                     pass
 
