@@ -5,21 +5,29 @@ import logging
 import math
 import re
 import sys
+import unicodedata
 from statistics import median
 
 _CJK_PATTERN = (
     r"[㐀-䶿一-鿿豈-﫿"
-    r"\U00020000-\U0002fa1f"
-    r"ぁ-ゖァ-ヺ가-힯]"
+    r"\U00020000-\U0002fa1f\U00030000-\U000323af"
+    r"\u3040-\u30ff\u3005-\u3007\u303b\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]"
 )
-_LATIN_PATTERN = r"[A-Za-z0-9'’]+"
-_SCAN = re.compile(_CJK_PATTERN + "|" + _LATIN_PATTERN + r"|\r\n|[\r\n，,。！？!?;；、]")
+_LATIN_PATTERN = (
+    r"(?:(?!" + _CJK_PATTERN + r")(?:[^\W_]|["
+    + "".join(chr(i) for i in range(0x10000) if unicodedata.category(chr(i)).startswith("M") or i in (0x200C, 0x200D))
+    + r"]))+(?:['’](?:(?!" + _CJK_PATTERN + r")(?:[^\W_]|["
+    + "".join(chr(i) for i in range(0x10000) if unicodedata.category(chr(i)).startswith("M") or i in (0x200C, 0x200D))
+    + r"]))+)*"
+)
+_SCAN = re.compile(_CJK_PATTERN + r"[\u3099\u309a\ufe00-\ufe0f]*|" + _LATIN_PATTERN + r"|\r\n|[\r\n，,.。！？!?;；、:：…]")
 _LOG = logging.getLogger(__name__)
 _MMS_FA_CACHE: dict[str, tuple] = {}
 
 
 def tokenize_lyrics(raw_text: str) -> list[dict]:
     """Tokenize Chinese/English mixed lyrics into singable units (1 Chinese char = 1 syllable, 1 English word = 1 token) preserving line/clause breaks."""
+    raw_text = unicodedata.normalize("NFC", raw_text) if isinstance(raw_text, str) else raw_text
     tokens = []
     line_index = 0
     for match in _SCAN.finditer(raw_text):
@@ -28,7 +36,7 @@ def tokenize_lyrics(raw_text: str) -> list[dict]:
             if tokens:
                 tokens[-1]["is_line_end"] = True
             line_index += 1
-        elif item in "，,。！？!?;；、":
+        elif item in "，,.。！？!?;；、:：…":
             if tokens:
                 tokens[-1]["is_line_end"] = True
         else:
@@ -41,10 +49,10 @@ def tokenize_lyrics(raw_text: str) -> list[dict]:
 def _expand_word_timestamps(records):
     expanded = []
     previous_start = -math.inf
-    for record in records:
+    records_list = list(records)
+    for rec_idx, record in enumerate(records_list):
         word = record["word"]
         start, end = float(record["start"]), float(record["end"])
-        # External anchors and Qwen may have unavailable confidence.
         probability = float(record.get("probability", 0.0))
         if not isinstance(word, str):
             raise ValueError("Timestamp word must be text")
@@ -54,23 +62,42 @@ def _expand_word_timestamps(records):
             raise ValueError("Invalid or unordered word timestamps")
         previous_start = start
         pieces = tokenize_lyrics(word)
+        if not pieces:
+            continue
+        eff_end = end
+        if len(pieces) > 1 and rec_idx + 1 < len(records_list):
+            try:
+                next_s = float(records_list[rec_idx + 1]["start"])
+                if math.isfinite(next_s) and next_s >= start:
+                    eff_end = min(end, next_s)
+            except (KeyError, TypeError, ValueError):
+                pass
+        is_interp = bool(record.get("interpolated", False))
+        is_subdiv = (not is_interp) and (len(pieces) > 1 or bool(record.get("subdivided", False)))
+        g_start = float(record.get("group_start", start)) if record.get("subdivided") else start
+        g_end = float(record.get("group_end", eff_end)) if record.get("subdivided") else eff_end
+        piece_prob = 0.0 if is_interp else probability
         for index, token in enumerate(pieces):
-            expanded.append({"word": token["text"],
-                             "start": start + (end - start) * index / len(pieces),
-                             "end": start + (end - start) * (index + 1) / len(pieces),
-                             "probability": probability})
+            item = {"word": token["text"],
+                    "start": start + (eff_end - start) * index / len(pieces),
+                    "end": start + (eff_end - start) * (index + 1) / len(pieces),
+                    "probability": piece_prob}
+            if is_interp:
+                item["interpolated"] = True
+            elif is_subdiv:
+                item["subdivided"] = True
+                item["group_start"] = g_start
+                item["group_end"] = g_end
+            expanded.append(item)
     return expanded
 
 
 def _is_faster_whisper_real():
-    """Return True if faster_whisper in sys.modules is the real library, not a test mock."""
+    """Return True if faster_whisper is available or not explicitly disabled."""
     fw = sys.modules.get("faster_whisper")
     if fw is None:
         return True
-    wm = getattr(fw, "WhisperModel", None)
-    if wm is None:
-        return True
-    return getattr(wm, "__module__", "").startswith("faster_whisper")
+    return getattr(fw, "WhisperModel", None) is not None
 
 
 def _token_to_mms_chars(token_text: str, dict_chars: set[str]) -> str:
@@ -203,17 +230,21 @@ def _edit_distance(a: str, b: str) -> int:
 
 
 def _nw_score(gt_text: str, asr_text: str) -> float:
-    g = gt_text.casefold()
-    a = asr_text.casefold()
+    g = gt_text.casefold().strip()
+    a = asr_text.casefold().strip()
+    if not g or not a:
+        return -2.0
     if g == a:
         return 3.0
+    dist = _edit_distance(g, a)
+    sim = max(0.0, 1.0 - dist / max(len(g), len(a)))
     if re.search(_CJK_PATTERN, g) and re.search(_CJK_PATTERN, a) and g[0] == a[0]:
-        return 1.2
-    if len(g) > 1 and len(a) > 1 and (g[:2] == a[:2] or g[-2:] == a[-2:]):
-        return 1.2
-    if _edit_distance(g, a) <= 1:
-        return 1.2
-    return -0.5
+        sim = max(sim, 0.6)
+    elif len(g) > 1 and len(a) > 1 and (g[:2] == a[:2] or g[-2:] == a[-2:]):
+        sim = max(sim, 0.55)
+    if sim >= 0.5:
+        return 1.2 * sim
+    return -2.0
 
 
 def _project_records_to_ground_truth(records: list[dict], ground_truth_text: str) -> list[dict]:
@@ -223,7 +254,7 @@ def _project_records_to_ground_truth(records: list[dict], ground_truth_text: str
         return records
     records = _expand_word_timestamps(records)
     if not records:
-        return [{"word": t["text"], "start": 0.0, "end": 0.15, "probability": 0.0} for t in gt_tokens]
+        return []
 
     m, n = len(gt_tokens), len(records)
     GAP = -0.8
@@ -262,13 +293,31 @@ def _project_records_to_ground_truth(records: list[dict], ground_truth_text: str
             j -= 1
 
     result = []
+    has_positive_match = False
     for i, tok in enumerate(gt_tokens):
         if i in matched:
             r = records[matched[i]]
-            result.append({"word": tok["text"], "start": float(r["start"]),
-                           "end": float(r["end"]), "probability": float(r.get("probability", 0.0))})
+            sc = _nw_score(tok["text"], r["word"])
+            if sc > 0.0:
+                has_positive_match = True
+                sim = 1.0 if sc >= 2.99 else round(sc / 1.2, 4)
+                is_interp = bool(r.get("interpolated", False))
+                rec = {"word": tok["text"], "start": float(r["start"]),
+                       "end": float(r["end"]),
+                       "probability": 0.0 if is_interp else round(float(r.get("probability", 0.0)) * sim, 4)}
+                if is_interp:
+                    rec["interpolated"] = True
+                elif r.get("subdivided"):
+                    rec["subdivided"] = True
+                    rec["group_start"] = float(r.get("group_start", r["start"]))
+                    rec["group_end"] = float(r.get("group_end", r["end"]))
+                result.append(rec)
+            else:
+                result.append({"word": tok["text"], "start": -1.0, "end": -1.0, "probability": 0.0, "interpolated": True})
         else:
-            result.append({"word": tok["text"], "start": -1.0, "end": -1.0, "probability": 0.0})
+            result.append({"word": tok["text"], "start": -1.0, "end": -1.0, "probability": 0.0, "interpolated": True})
+    if not has_positive_match:
+        return []
 
     i = 0
     prev_matched_idx = -1
@@ -285,18 +334,47 @@ def _project_records_to_ground_truth(records: list[dict], ground_truth_text: str
         gap_start = prev_matched_idx + 1
         gap_end = next_matched_idx if next_matched_idx >= 0 else len(result)
         gap_count = gap_end - gap_start
-        left_time = result[prev_matched_idx]["end"] if prev_matched_idx >= 0 else (records[0]["start"] if records else 0.0)
-        right_time = result[next_matched_idx]["start"] if next_matched_idx >= 0 else (left_time + 0.16 * gap_count)
-        if right_time - left_time < 0.03 * gap_count and prev_matched_idx >= 0 and next_matched_idx >= 0:
-            # Redistribute across [prev_matched_idx .. next_matched_idx] so adjacent words share positive duration
-            span_start = result[prev_matched_idx]["start"]
-            span_end = max(span_start + 0.03 * (gap_count + 2), result[next_matched_idx]["end"])
-            total_slots = gap_count + 2
-            for offset, idx in enumerate(range(prev_matched_idx, next_matched_idx + 1)):
-                s = span_start + (span_end - span_start) * offset / total_slots
-                e = span_start + (span_end - span_start) * (offset + 1) / total_slots
+        if prev_matched_idx >= 0:
+            left_time = result[prev_matched_idx]["end"]
+            right_time = result[next_matched_idx]["start"] if next_matched_idx >= 0 else (left_time + 0.16 * gap_count)
+        elif next_matched_idx >= 0:
+            right_time = result[next_matched_idx]["start"]
+            left_time = max(0.0, right_time - 0.16 * gap_count)
+        else:
+            left_time = records[0]["start"] if records else 0.0
+            right_time = left_time + 0.16 * gap_count
+        if right_time > left_time:
+            span = right_time - left_time
+            for offset, idx in enumerate(range(gap_start, gap_end)):
+                s = left_time + span * offset / gap_count
+                e = left_time + span * (offset + 1) / gap_count
                 result[idx]["start"] = max(0.0, float(s))
-                result[idx]["end"] = max(result[idx]["start"] + 0.015, float(e))
+                result[idx]["end"] = max(result[idx]["start"] + 1e-4, float(e))
+                result[idx]["probability"] = 0.0
+                result[idx]["interpolated"] = True
+        elif prev_matched_idx >= 0 and next_matched_idx >= 0:
+            s_lo = float(result[prev_matched_idx]["start"])
+            s_hi = float(result[next_matched_idx]["start"])
+            if s_hi > s_lo:
+                for offset, idx in enumerate(range(gap_start, gap_end)):
+                    s = s_lo + (s_hi - s_lo) * (offset + 1) / (gap_count + 1)
+                    e = s_lo + (s_hi - s_lo) * (offset + 2) / (gap_count + 1)
+                    result[idx]["start"] = max(0.0, float(s))
+                    result[idx]["end"] = max(result[idx]["start"], float(e))
+                    result[idx]["probability"] = 0.0
+                    result[idx]["interpolated"] = True
+            else:
+                for idx in range(gap_start, gap_end):
+                    result[idx]["start"] = max(0.0, s_lo)
+                    result[idx]["end"] = max(0.0, s_lo)
+                    result[idx]["probability"] = 0.0
+                    result[idx]["interpolated"] = True
+        elif prev_matched_idx < 0 and next_matched_idx >= 0:
+            for idx in range(gap_start, gap_end):
+                result[idx]["start"] = 0.0
+                result[idx]["end"] = 0.0
+                result[idx]["probability"] = 0.0
+                result[idx]["interpolated"] = True
         else:
             span = max(0.04 * gap_count, right_time - left_time)
             for offset, idx in enumerate(range(gap_start, gap_end)):
@@ -304,6 +382,8 @@ def _project_records_to_ground_truth(records: list[dict], ground_truth_text: str
                 e = left_time + span * (offset + 1) / gap_count
                 result[idx]["start"] = max(0.0, float(s))
                 result[idx]["end"] = max(result[idx]["start"] + 0.015, float(e))
+                result[idx]["probability"] = 0.0
+                result[idx]["interpolated"] = True
         prev_matched_idx = next_matched_idx
         i = gap_end + 1 if next_matched_idx >= 0 else len(result)
 
@@ -311,8 +391,12 @@ def _project_records_to_ground_truth(records: list[dict], ground_truth_text: str
     for r in result:
         if r["start"] < prev_start:
             r["start"] = prev_start
-        if r["end"] <= r["start"]:
-            r["end"] = r["start"] + 0.02
+            r["probability"] = 0.0
+            r["interpolated"] = True
+        if r["end"] < r["start"]:
+            r["end"] = r["start"]
+            r["probability"] = 0.0
+            r["interpolated"] = True
         prev_start = r["start"]
 
     return result
@@ -337,16 +421,19 @@ def transcribe_word_timestamps(
         device = "cuda" if prefer_cuda and torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if device == "cuda" else torch.float32
         if ground_truth_text:
-            language = "English"
+            language = None
             if re.search(r"[ぁ-ゖァ-ヺ]", ground_truth_text):
                 language = "Japanese"
-            elif re.search(r"[가-힯]", ground_truth_text):
+            elif re.search(r"[가-힯\u1100-\u11ff\u3130-\u318f]", ground_truth_text):
                 language = "Korean"
             elif re.search(r"[㐀-䶿一-鿿豈-﫿\U00020000-\U0002fa1f]", ground_truth_text):
                 language = "Chinese"
             model = Qwen3ForcedAligner.from_pretrained(
                 "Qwen/Qwen3-ForcedAligner-0.6B", dtype=dtype, device_map=device)
-            result = model.align(audio=str(audio_path), text=ground_truth_text, language=language)
+            align_kwargs = {"audio": str(audio_path), "text": ground_truth_text}
+            if language is not None:
+                align_kwargs["language"] = language
+            result = model.align(**align_kwargs)
             text = ground_truth_text
             first_res = result[0] if result else []
             items = getattr(first_res, "items", first_res)
@@ -364,16 +451,17 @@ def transcribe_word_timestamps(
                     "end": item.end_time, "probability": 0.0} for item in (items or [])]
         if text.strip() and not records:
             raise RuntimeError("Qwen returned nonempty text without timestamps")
-    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        expanded_qwen = _expand_word_timestamps(records)
+    except (ImportError, OSError, RuntimeError, ValueError, TypeError, AttributeError) as exc:
         last_failure = exc
         failures.append(f"qwen3: {exc}")
         _LOG.warning("Qwen timestamp backend failed: %s", exc)
     else:
-        return {"raw_lyrics": text, "word_timestamps": _expand_word_timestamps(records),
+        return {"raw_lyrics": text, "word_timestamps": expanded_qwen,
                 "backend": backend}
 
-    # Tier 2: MMS-FA CTC for Latin/English ground truth (skip when faster_whisper is mocked)
-    if _is_faster_whisper_real() and ground_truth_text.strip():
+    # Tier 2: MMS-FA CTC for Latin ground truth (skip when text is CJK/Kana/Hangul)
+    if ground_truth_text.strip() and not re.search(_CJK_PATTERN, ground_truth_text):
         mms_result = _try_mms_fa(audio_path, ground_truth_text, prefer_cuda)
         if mms_result is not None:
             return mms_result
@@ -392,60 +480,65 @@ def transcribe_word_timestamps(
                 compute_type="float16" if device == "cuda" else "int8",
                 download_root=str(Path(__file__).resolve().parents[2].parents[1]
                                   / "work" / "model-cache" / "whisper"))
-            is_real_fw = getattr(WhisperModel, "__module__", "").startswith("faster_whisper")
-            if is_real_fw:
-                lang_hint = "zh" if re.search(_CJK_PATTERN, ground_truth_text) else ("en" if ground_truth_text else None)
-                prompt_hint = ground_truth_text[:48] if ground_truth_text else None
+            if not ground_truth_text:
+                lang_hint = None
+            elif re.search(r"[ぁ-ゖァ-ヺ]", ground_truth_text):
+                lang_hint = "ja"
+            elif re.search(r"[가-힯\u1100-\u11ff\u3130-\u318f]", ground_truth_text):
+                lang_hint = "ko"
+            elif re.search(r"[㐀-䶿一-鿿豈-﫿\U00020000-\U0002fa1f]", ground_truth_text):
+                lang_hint = "zh"
+            else:
+                lang_hint = None
+            prompt_hint = ground_truth_text[:48] if ground_truth_text else None
+            try:
                 segments, info = model.transcribe(
                     audio_16k.astype(np.float32), language=lang_hint, word_timestamps=True,
                     condition_on_previous_text=False, vad_filter=True,
                     temperature=0.0, initial_prompt=prompt_hint)
-                segments = list(segments)
-                records = [{"word": word.word, "start": word.start, "end": word.end,
-                            "probability": word.probability}
-                           for segment in segments for word in (segment.words or [])]
-                min_expected = max(5, len(tokenize_lyrics(ground_truth_text)) // 4) if ground_truth_text else 5
-                if len(records) < min_expected:
+            except TypeError:
+                segments, info = model.transcribe(
+                    audio_16k.astype(np.float32), word_timestamps=True, condition_on_previous_text=False,
+                    temperature=0.0, initial_prompt=ground_truth_text or None)
+            segments = list(segments)
+            records = [{"word": word.word, "start": word.start, "end": word.end,
+                        "probability": getattr(word, "probability", 0.0)}
+                       for segment in segments for word in (segment.words or [])]
+            min_expected = max(5, len(tokenize_lyrics(ground_truth_text)) // 4) if ground_truth_text else 5
+            if len(records) < min_expected:
+                try:
                     segments_no_vad, info = model.transcribe(
                         audio_16k.astype(np.float32), language=lang_hint, word_timestamps=True,
                         condition_on_previous_text=False, vad_filter=False,
                         temperature=0.0, initial_prompt=None)
                     segments_no_vad = list(segments_no_vad)
                     records_no_vad = [{"word": word.word, "start": word.start, "end": word.end,
-                                       "probability": word.probability}
+                                       "probability": getattr(word, "probability", 0.0)}
                                       for segment in segments_no_vad for word in (segment.words or [])]
                     if len(records_no_vad) > len(records):
                         segments = segments_no_vad
                         records = records_no_vad
-                text = "".join(segment.text for segment in segments).strip()
-            else:
-                segments, info = model.transcribe(
-                    audio_16k.astype(np.float32), word_timestamps=True, condition_on_previous_text=False,
-                    temperature=0.0, initial_prompt=ground_truth_text or None)
-                segments = list(segments)
-                text = "".join(segment.text for segment in segments).strip()
-                records = [{"word": word.word, "start": word.start, "end": word.end,
-                            "probability": word.probability}
-                           for segment in segments for word in (segment.words or [])]
+                except TypeError:
+                    pass
+            text = "".join(segment.text for segment in segments).strip()
             if text and not records:
                 raise RuntimeError("Whisper returned nonempty text without timestamps")
+            if ground_truth_text.strip() and records:
+                projected = _project_records_to_ground_truth(records, ground_truth_text)
+                if projected:
+                    return {
+                        "raw_lyrics": ground_truth_text,
+                        "word_timestamps": _expand_word_timestamps(projected),
+                        "backend": f"faster-whisper-{device}+gt-projection",
+                    }
+            expanded_whisper = _expand_word_timestamps(records)
         except (ImportError, OSError, RuntimeError, ValueError) as exc:
             last_failure = exc
             failures.append(f"faster-whisper-{device}: {exc}")
             _LOG.warning("Whisper %s timestamp backend failed: %s", device, exc)
             continue
 
-        # Tier 3: project Whisper records onto ground truth via Needleman-Wunsch
-        if (ground_truth_text.strip() and records
-                and getattr(WhisperModel, "__module__", "").startswith("faster_whisper")):
-            projected = _project_records_to_ground_truth(records, ground_truth_text)
-            return {
-                "raw_lyrics": ground_truth_text,
-                "word_timestamps": _expand_word_timestamps(projected),
-                "backend": f"faster-whisper-{device}+gt-projection",
-            }
-
-        return {"raw_lyrics": text, "word_timestamps": _expand_word_timestamps(records),
+        return {"raw_lyrics": text, "word_timestamps": expanded_whisper,
                 "backend": f"faster-whisper-{device}"}
     raise RuntimeError("All timestamp backends failed: " + "; ".join(failures)) from last_failure
 
@@ -479,8 +572,8 @@ def _align_text_tokens(tokens, notes):
             costs[i][j] = min(new, extend)
             transitions[i][j] = "new" if new <= extend else "extend"
     i, j = m, n
-    while j:
-        transition = transitions[i][j]
+    while j and i > 0:
+        transition = transitions[i][j] or "new"
         owners[j - 1] = i - 1
         lyrics[j - 1] = tokens[i - 1]["text"] if transition == "new" else "-"
         if transition == "new":
@@ -489,22 +582,43 @@ def _align_text_tokens(tokens, notes):
     return lyrics, owners
 
 
-def _match_anchors(tokens, records):
-    m, k = len(tokens), len(records)
-    lengths = [[0] * (k + 1) for _ in range(m + 1)]
+def _match_anchors(tokens, records, intervals=None, max_allow_gap=1.5):
+    valid_records = [r for r in records if not r.get("interpolated", False)]
+    m, k = len(tokens), len(valid_records)
+    rec_bonus = [0.0] * k
+    if intervals:
+        denom = float(max(1, m))
+        n_iv = len(intervals)
+        for j, r in enumerate(valid_records):
+            rs, re_t = float(r["start"]), float(r["end"])
+            ov = max((max(0.0, min(ne, re_t) - max(ns, rs)) for ns, ne in intervals), default=0.0)
+            min_gap = min((max(0.0, ns - re_t, rs - ne) for ns, ne in intervals), default=math.inf)
+            is_elig = (ov > 1e-6) or (m <= n_iv and min_gap <= max_allow_gap)
+            rec_bonus[j] = (float(m) if is_elig else 0.0) + ((0.4 if ov > 1e-6 else 0.0) + 0.1 / (1.0 + min_gap)) / denom
+    lengths = [[0.0] * (k + 1) for _ in range(m + 1)]
+    choices = [[0] * (k + 1) for _ in range(m + 1)]
     anchors = [None] * m
     for i in range(m - 1, -1, -1):
         for j in range(k - 1, -1, -1):
-            if tokens[i]["text"].casefold() == records[j]["word"].casefold():
-                lengths[i][j] = 1 + lengths[i + 1][j + 1]
-            else:
-                lengths[i][j] = max(lengths[i + 1][j], lengths[i][j + 1])
+            best = lengths[i][j + 1]
+            choice = 2
+            if lengths[i + 1][j] > best:
+                best = lengths[i + 1][j]
+                choice = 1
+            if tokens[i]["text"].casefold() == valid_records[j]["word"].casefold():
+                cand = 1.0 + rec_bonus[j] + lengths[i + 1][j + 1]
+                if cand >= best - 1e-12:
+                    best = cand
+                    choice = 0
+            lengths[i][j] = best
+            choices[i][j] = choice
     i, j = 0, 0
     while i < m and j < k:
-        if tokens[i]["text"].casefold() == records[j]["word"].casefold():
-            anchors[i] = records[j]
+        c = choices[i][j]
+        if c == 0:
+            anchors[i] = valid_records[j]
             i, j = i + 1, j + 1
-        elif lengths[i + 1][j] > lengths[i][j + 1]:
+        elif c == 1:
             i += 1
         else:
             j += 1
@@ -514,6 +628,34 @@ def _match_anchors(tokens, records):
 def _align_anchored_tokens(tokens, notes, intervals, anchors, baseline):
     n, m = len(notes), len(tokens)
     baseline_onsets = [baseline.index(i) for i in range(m)]
+    subdiv_targets = {}
+    subdiv_melismas = {}
+    idx_tok = 0
+    while idx_tok < m:
+        anc = anchors[idx_tok]
+        if anc is not None and anc.get("subdivided"):
+            gs = float(anc.get("group_start", anc["start"]))
+            ge = float(anc.get("group_end", anc["end"]))
+            end_tok = idx_tok + 1
+            while end_tok < m and anchors[end_tok] is not None and anchors[end_tok].get("subdivided"):
+                if (abs(float(anchors[end_tok].get("group_start", -1.0)) - gs) < 1e-6
+                        and abs(float(anchors[end_tok].get("group_end", -1.0)) - ge) < 1e-6):
+                    end_tok += 1
+                else:
+                    break
+            g_notes = [j_n for j_n, (ns, ne) in enumerate(intervals) if min(ne, ge) - max(ns, gs) > 1e-6]
+            g_count = end_tok - idx_tok
+            if len(g_notes) >= g_count:
+                g_lyr, g_own = _align_text_tokens(tokens[idx_tok:end_tok], [notes[j_n] for j_n in g_notes])
+                for offset_t in range(g_count):
+                    if offset_t in g_own:
+                        subdiv_targets[idx_tok + offset_t] = g_notes[g_own.index(offset_t)]
+                        subdiv_melismas[idx_tok + offset_t] = {
+                            g_notes[k_n] for k_n, ow in enumerate(g_own) if ow == offset_t and g_lyr[k_n] == "-"
+                        }
+            idx_tok = end_tok
+        else:
+            idx_tok += 1
     costs = [[math.inf] * (n + 1) for _ in range(m + 1)]
     placed = [[False] * (n + 1) for _ in range(m + 1)]
     costs[0] = [0.0] * (n + 1)
@@ -521,11 +663,20 @@ def _align_anchored_tokens(tokens, notes, intervals, anchors, baseline):
         anchor = anchors[i - 1]
         for j in range(1, n + 1):
             start, end = intervals[j - 1]
-            duration = end - start
+            duration = max(1e-6, end - start)
             onset_cost = abs(j - 1 - baseline_onsets[i - 1]) / max(1, n)
             if anchor is not None:
-                overlap = max(0.0, min(end, anchor["end"]) - max(start, anchor["start"]))
-                onset_cost = abs(start - anchor["start"]) / duration + 1 - overlap / duration
+                if (i - 1) in subdiv_targets:
+                    gs = float(anchor.get("group_start", anchor["start"]))
+                    ge = float(anchor.get("group_end", anchor["end"]))
+                    g_ov = max(0.0, min(end, ge) - max(start, gs))
+                    if g_ov > 1e-6:
+                        onset_cost = abs((j - 1) - subdiv_targets[i - 1]) / max(1, n)
+                    else:
+                        onset_cost = abs(start - gs) / duration + 1.0
+                else:
+                    overlap = max(0.0, min(end, anchor["end"]) - max(start, anchor["start"]))
+                    onset_cost = abs(start - anchor["start"]) / duration + 1 - overlap / duration
             candidate = costs[i - 1][j - 1] + onset_cost
             costs[i][j] = costs[i][j - 1]
             if candidate < costs[i][j]:
@@ -551,6 +702,11 @@ def _align_anchored_tokens(tokens, notes, intervals, anchors, baseline):
             duration = max(1e-6, end - start)
             gap = start - intervals[j - 1][1]
             if anchor is not None:
+                if i in subdiv_melismas:
+                    if j not in subdiv_melismas[i]:
+                        break
+                    lyrics[j], owners[j] = "-", i
+                    continue
                 overlap = max(0.0, min(end, anchor["end"]) - max(start, anchor["start"]))
                 ov_ratio = overlap / duration
                 tail_ext = max(0.0, start - anchor["end"])
@@ -580,15 +736,13 @@ def _join_tokens(texts):
 
 
 def _use_raw_intervals(notes, origin):
-    """Check if all notes have valid acoustic timestamps for interval computation."""
-    prev_raw_end = -1e-6
+    """Check if all notes have ordered positive raw_start/raw_duration intervals aligned with origin."""
+    prev_raw_end = max(-1e-6, float(origin) - 0.5)
     has_any = False
     for note in notes:
         rs = float(getattr(note, "raw_start", 0.0))
         rd = float(getattr(note, "raw_duration", 0.0))
-        if rd <= 0:
-            return False
-        if rs < prev_raw_end - 1e-6:
+        if not (math.isfinite(rs) and math.isfinite(rd)) or rd <= 0 or rs < prev_raw_end - 1e-6:
             return False
         prev_raw_end = rs + rd
         has_any = True
@@ -610,11 +764,27 @@ def align_lyrics_to_notes(
     previous_end = -math.inf
     intervals = []
     spb = 60.0 / bpm
-    use_raw = _use_raw_intervals(notes, origin) and (getattr(project, "bar_start_seconds", None) is not None or bool(getattr(project, "source", "")))
+    raw_bar_starts = getattr(project, "bar_start_seconds", None)
+    valid_bar_starts = None
+    measure_beats = 4.0
+    try:
+        m_num, m_den = map(int, str(getattr(project, "meter", "4/4") or "4/4").split("/"))
+        if m_num > 0 and m_den > 0:
+            measure_beats = m_num * 4.0 / m_den
+    except (ValueError, TypeError):
+        pass
+    if raw_bar_starts is not None and len(raw_bar_starts) >= 1:
+        try:
+            bs_list = [float(x) for x in raw_bar_starts]
+            if all(math.isfinite(x) for x in bs_list) and all(bs_list[k] > bs_list[k - 1] for k in range(1, len(bs_list))):
+                valid_bar_starts = bs_list
+        except (ValueError, TypeError):
+            pass
+    use_raw = _use_raw_intervals(notes, origin) and (valid_bar_starts is not None or bool(getattr(project, "source", "")))
     for note in notes:
         start, duration = float(note.start), float(note.duration)
         if (not math.isfinite(start) or not math.isfinite(duration) or duration <= 0
-                or start < previous_end or not math.isfinite(float(note.pitch))
+                or start < previous_end - 1e-6 or not math.isfinite(float(note.pitch))
                 or int(note.pitch) != note.pitch):
             raise ValueError("Notes must have finite pitches and ordered nonoverlapping positive durations")
         previous_end = start + duration
@@ -622,6 +792,20 @@ def align_lyrics_to_notes(
             rs = float(note.raw_start)
             rd = float(note.raw_duration)
             intervals.append((rs, rs + rd))
+        elif valid_bar_starts is not None:
+            pts = []
+            for b_val in (start, float(note.start + note.duration)):
+                if b_val < 0.0:
+                    pts.append(valid_bar_starts[0] + b_val * spb)
+                else:
+                    k_idx = int(b_val // measure_beats)
+                    if k_idx < len(valid_bar_starts) - 1:
+                        frac = (b_val - k_idx * measure_beats) / measure_beats
+                        pts.append(valid_bar_starts[k_idx] + frac * (valid_bar_starts[k_idx + 1] - valid_bar_starts[k_idx]))
+                    else:
+                        rem_beats = b_val - (len(valid_bar_starts) - 1) * measure_beats
+                        pts.append(valid_bar_starts[-1] + rem_beats * spb)
+            intervals.append((pts[0], pts[1]))
         else:
             intervals.append((origin + start * spb, origin + float(note.start + note.duration) * spb))
     resolved_raw_lyrics = raw_lyrics
@@ -635,26 +819,99 @@ def align_lyrics_to_notes(
         records = _expand_word_timestamps(word_timestamps)
     if not resolved_raw_lyrics and records:
         resolved_raw_lyrics = _join_tokens([record["word"] for record in records])
-    tokens = tokenize_lyrics(resolved_raw_lyrics)[:len(notes)]
-    note_lyrics, owners = _align_text_tokens(tokens, notes)
-    anchors = _match_anchors(tokens, records)
-    if any(anchor is not None for anchor in anchors):
-        note_lyrics, owners = _align_anchored_tokens(tokens, notes, intervals, anchors, owners)
-    pairs, blocks = [], []
-    for i, token in enumerate(tokens):
+    all_tokens = tokenize_lyrics(resolved_raw_lyrics)
+    max_allow_gap = max(1.5, 2.0 * spb)
+    all_anchors = _match_anchors(all_tokens, records, intervals, max_allow_gap)
+    n_notes = len(notes)
+    if n_notes == 0:
+        selected_idx = []
+    elif any(a is not None for a in all_anchors):
+        anchored_scored = []
+        for idx_t, anc in enumerate(all_anchors):
+            if anc is not None:
+                ov = max((max(0.0, min(ne, anc["end"]) - max(ns, anc["start"])) for ns, ne in intervals), default=0.0)
+                min_gap = min((max(0.0, ns - anc["end"], anc["start"] - ne) for ns, ne in intervals), default=math.inf)
+                if ov > 1e-6 or (len(all_tokens) <= n_notes and min_gap <= max_allow_gap):
+                    anchored_scored.append((1 if ov > 1e-6 else 0, ov, -min_gap, -idx_t, idx_t))
+        if len(anchored_scored) > n_notes:
+            anchored_scored = sorted(anchored_scored, reverse=True)[:n_notes]
+        kept_anchored = sorted(item[4] for item in anchored_scored)
+        k_anc = len(kept_anchored)
+        if k_anc > 0:
+            anc_tokens = [all_tokens[idx_t] for idx_t in kept_anchored]
+            anc_records = [all_anchors[idx_t] for idx_t in kept_anchored]
+            _, anc_base = _align_text_tokens(anc_tokens, notes)
+            _, anc_owners = _align_anchored_tokens(anc_tokens, notes, intervals, anc_records, anc_base)
+            anc_note_idx = [next((j_n for j_n, ow in enumerate(anc_owners) if ow == r_i), r_i) for r_i in range(k_anc)]
+        else:
+            anc_note_idx = []
+        selected_set = set(kept_anchored)
+        for r_i in range(k_anc + 1):
+            t_lo = 0 if r_i == 0 else kept_anchored[r_i - 1] + 1
+            t_hi = len(all_tokens) if r_i == k_anc else kept_anchored[r_i]
+            n_lo = 0 if r_i == 0 else anc_note_idx[r_i - 1] + 1
+            n_hi = n_notes if r_i == k_anc else anc_note_idx[r_i]
+            cap = max(0, n_hi - n_lo)
+            if cap > 0:
+                span_start_sec = float(intervals[n_lo][0])
+                span_end_sec = float(intervals[n_hi - 1][1])
+                eff_lo, eff_hi = t_lo, t_hi
+                for t_idx in range(t_lo, t_hi):
+                    anc_t = all_anchors[t_idx]
+                    if anc_t is not None:
+                        if float(anc_t["end"]) <= span_start_sec + 1e-6:
+                            eff_lo = max(eff_lo, t_idx + 1)
+                        if float(anc_t["start"]) >= span_end_sec - 1e-6:
+                            eff_hi = min(eff_hi, t_idx)
+                unanc_in_span = [t_idx for t_idx in range(eff_lo, max(eff_lo, eff_hi)) if all_anchors[t_idx] is None]
+                for t_idx in unanc_in_span[:cap]:
+                    selected_set.add(t_idx)
+        selected_idx = sorted(selected_set)[:n_notes]
+    else:
+        selected_idx = list(range(min(len(all_tokens), n_notes)))
+
+    sub_tokens = [all_tokens[k] for k in selected_idx]
+    sub_anchors = [all_anchors[k] for k in selected_idx]
+    note_lyrics, sub_owners = _align_text_tokens(sub_tokens, notes)
+    if any(anchor is not None for anchor in sub_anchors) and len(sub_tokens) <= n_notes:
+        note_lyrics, sub_owners = _align_anchored_tokens(sub_tokens, notes, intervals, sub_anchors, sub_owners)
+    owners = [selected_idx[o] if o is not None and o < len(selected_idx) else None for o in sub_owners]
+
+    pairs, blocks, unaligned_tokens = [], [], []
+    active_tokens = all_tokens
+    for i, token in enumerate(active_tokens):
         indices = [j for j, owner in enumerate(owners) if owner == i]
-        pairs.append({"token_index": i, "text": token["text"],
-                      "line_index": token["line_index"], "note_indices": indices,
-                      "start": float(intervals[indices[0]][0]),
-                      "end": float(intervals[indices[-1]][1])})
+        if indices:
+            p_start = max(0.0, float(intervals[indices[0]][0]))
+            p_end = max(p_start, float(intervals[indices[-1]][1]))
+            pairs.append({"token_index": i, "text": token["text"],
+                          "line_index": token["line_index"], "note_indices": indices,
+                          "start": p_start, "end": p_end})
+        else:
+            anc = all_anchors[i]
+            if anc is not None:
+                p_start, p_end = float(anc["start"]), float(anc["end"])
+            else:
+                prev_end = pairs[-1]["end"] if pairs else (float(intervals[0][0]) if intervals else max(0.0, float(origin)))
+                p_start, p_end = max(0.0, prev_end), max(0.0, prev_end)
+            unaligned_entry = {"token_index": i, "text": token["text"],
+                               "line_index": token["line_index"], "note_indices": [],
+                               "start": p_start, "end": p_end, "unaligned": True}
+            pairs.append(unaligned_entry)
+            unaligned_tokens.append(unaligned_entry)
     group = []
     for pair in pairs:
         group.append(pair)
-        if tokens[pair["token_index"]]["is_line_end"] or pair is pairs[-1]:
+        if active_tokens[pair["token_index"]]["is_line_end"] or pair is pairs[-1]:
+            timed_in_group = [item for item in group if item["note_indices"] or all_anchors[item["token_index"]] is not None]
+            span_items = timed_in_group if timed_in_group else group
+            blk_start = min(item["start"] for item in span_items)
+            blk_end = max(item["end"] for item in span_items)
             blocks.append({"text": _join_tokens([item["text"] for item in group]),
                            "line_index": group[0]["line_index"],
-                           "start": group[0]["start"], "end": group[-1]["end"],
-                           "note_indices": [j for item in group for j in item["note_indices"]]})
+                           "start": blk_start, "end": blk_end,
+                           "note_indices": list(dict.fromkeys(j for item in group for j in item["note_indices"]))})
             group = []
     return {"note_lyrics": note_lyrics, "lyrics_blocks": blocks,
-            "aligned_pairs": pairs, "raw_lyrics": resolved_raw_lyrics}
+            "aligned_pairs": pairs, "unaligned_tokens": unaligned_tokens,
+            "raw_lyrics": resolved_raw_lyrics}

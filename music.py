@@ -56,11 +56,20 @@ class Project:
     schema_version: int = 1
     reference_notes: list = field(default_factory=list)
     lyrics: list = field(default_factory=list)
+    bar_start_seconds: list = field(default_factory=list)
 
     def validate(self):
         self.bpm = finite(self.bpm, '速度')
         self.clip_start = finite(self.clip_start, '片段开始')
         self.clip_duration = finite(self.clip_duration, '片段长度')
+        if self.bar_start_seconds is None:
+            self.bar_start_seconds = []
+        elif not isinstance(self.bar_start_seconds, (list, tuple)):
+            raise ValueError('小节起点列表无效')
+        else:
+            self.bar_start_seconds = [finite(x, '小节起点') for x in self.bar_start_seconds]
+            if any(b <= a for a, b in zip(self.bar_start_seconds, self.bar_start_seconds[1:])):
+                raise ValueError('小节起点必须严格递增')
         if len(self.lyrics)>20000:
             raise ValueError('歌词过长')
         for line in self.lyrics:
@@ -72,8 +81,17 @@ class Project:
         self.beat_origin = finite(self.beat_origin, '拍点偏移')
         if not 30 <= self.bpm <= 300:
             raise ValueError('速度应在 30–300 BPM 之间')
-        if self.meter not in ('2/4', '3/4', '4/4', '6/8') or self.tonic not in NAMES:
+        m_parts = str(self.meter).split('/') if isinstance(self.meter, str) else []
+        try:
+            m_num, m_den = (int(m_parts[0]), int(m_parts[1])) if len(m_parts) == 2 else (0, 0)
+        except ValueError:
+            m_num, m_den = 0, 0
+        if m_num < 1 or m_num > 64 or m_den < 1 or m_den > 64 or (m_den & (m_den - 1)) != 0 or self.tonic not in NAMES:
             raise ValueError('调号或拍号无效')
+        measure_q = m_num * 4.0 / m_den
+        for a_bs, b_bs in zip(self.bar_start_seconds, self.bar_start_seconds[1:]):
+            if round((b_bs - a_bs) * 1_000_000 / measure_q) > 16_777_215:
+                raise ValueError('小节速度超出有效范围')
         if self.clip_start < 0 or not 0 < self.clip_duration <= 3600:
             raise ValueError('片段时间无效')
         if len(self.notes) > 20000:

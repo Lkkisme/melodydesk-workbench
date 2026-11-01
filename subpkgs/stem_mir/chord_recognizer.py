@@ -1,6 +1,6 @@
 """Pure Vocal-Melody-Conditioned Functional Harmony & Vocal Dynamics Generator.
 
-100% driven by the singer's vocal melody notes, phrase cadences, and vocal register/density dynamics.
+Driven by the singer's vocal melody notes, phrase cadences, and vocal register/density dynamics (returning N.C. and 0.0 dynamics when notes is empty).
 Zero accompaniment audio or background CQT is ever read or used.
 """
 from __future__ import annotations
@@ -31,22 +31,50 @@ MINOR_TRANS_MATRIX = np.array([
 def _timing(bpm: float, beat_origin: float, meter: str) -> tuple[float, float, float]:
     if not np.isfinite(bpm) or bpm <= 0:
         raise ValueError("BPM must be finite and positive")
-    if not np.isfinite(beat_origin) or beat_origin < 0:
-        raise ValueError("Beat origin must be finite and nonnegative")
-    if meter not in ("4/4", "3/4"):
+    if not np.isfinite(beat_origin):
+        raise ValueError("Beat origin must be finite")
+    if not isinstance(meter, str) or "/" not in meter:
         raise ValueError("Unsupported meter")
-    measure_beats = 4.0 if meter == "4/4" else 3.0
+    try:
+        num_s, den_s = meter.strip().split("/", 1)
+        num, den = int(num_s), int(den_s)
+    except ValueError as exc:
+        raise ValueError("Unsupported meter") from exc
+    if num <= 0 or den <= 0 or (den & (den - 1)) != 0:
+        raise ValueError("Unsupported meter")
+    measure_beats = float(num) * (4.0 / float(den))
     seconds_per_beat = 60.0 / bpm
     return measure_beats, seconds_per_beat, measure_beats * seconds_per_beat
 
 
-def _gttm_note_salience(rel_onset_beats: float, overlap_beats: float, measure_beats: float) -> float:
+def _gttm_note_salience(rel_onset_beats: float, overlap_beats: float, measure_beats: float, meter: str = "4/4") -> float:
     sigma = 0.14
-    grid = [(0.0, 1.45), (measure_beats * 0.5, 1.22)]
-    for q in range(int(measure_beats)):
-        grid.append((float(q), 1.05))
-    for q in range(int(measure_beats * 2)):
-        grid.append((q * 0.5, 0.85))
+    num_m, den_m = 4, 4
+    if isinstance(meter, str) and "/" in meter:
+        try:
+            num_m, den_m = map(int, meter.strip().split("/", 1))
+        except ValueError:
+            num_m, den_m = 4, 4
+    sub_unit = 4.0 / den_m if den_m > 0 else 1.0
+    is_compound = (den_m >= 8 and num_m % 3 == 0 and num_m >= 6)
+    if is_compound:
+        grid = [(0.0, 1.45)]
+        n_comp_beats = num_m // 3
+        comp_step = 3.0 * sub_unit
+        for cb in range(1, n_comp_beats):
+            w_cb = 1.30 if (n_comp_beats % 2 == 0 and cb == n_comp_beats // 2) else 1.25
+            grid.append((cb * comp_step, w_cb))
+        for s_idx in range(num_m):
+            if s_idx % 3 != 0:
+                grid.append((s_idx * sub_unit, 0.88))
+    else:
+        grid = [(0.0, 1.45)]
+        if num_m % 2 == 0 and num_m >= 2:
+            grid.append((measure_beats * 0.5, 1.22))
+        for q in range(1, num_m):
+            grid.append((q * sub_unit, 1.05))
+        for q in range(num_m * 2):
+            grid.append((q * sub_unit * 0.5, 0.85))
     best = 0.85
     for pos, weight in grid:
         dist = abs(rel_onset_beats - pos)
@@ -81,11 +109,16 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
 
 def _degree_index(root: int, quality: str, tonic_root: int, is_minor_key: bool) -> int:
     offset = (root - tonic_root) % 12
+    is_min_like = quality.startswith(("m", "dim")) and not quality.startswith("maj")
     if is_minor_key:
-        if offset == 7 and quality != "m":
+        if offset == 7 and not is_min_like:
             return 6
-        return {0: 0, 3: 1, 5: 2, 7: 3, 8: 4, 10: 5}.get(offset, -1)
-    return {0: 0, 2: 1, 4: 2, 5: 3, 7: 4, 9: 5, 10: 6}.get(offset, -1)
+        return {0: 0, 2: 2, 3: 1, 5: 2, 7: 3, 8: 4, 10: 5}.get(offset, -1)
+    if offset == 4 and not is_min_like:
+        return 4
+    if offset == 2 and not is_min_like:
+        return 4
+    return {0: 0, 2: 1, 4: 2, 5: 3, 7: 4, 9: 5, 10: 6, 11: 4}.get(offset, -1)
 
 
 def synthesize_melody_conditioned_harmony(
@@ -100,30 +133,34 @@ def synthesize_melody_conditioned_harmony(
 ) -> dict:
     """Pure Vocal-Melody-Conditioned Functional Harmony & Dynamics Engine.
 
-    Scores diatonic, modal, and secondary-dominant guitar chords per bar 100% from the
+    Scores diatonic, modal, and secondary-dominant guitar chords per bar from the
     singer's vocal melody notes (`notes`), resolves harmonic progressions via functional
     Hooktheory-grounded Viterbi decoding with GTTM metrical salience and TIV emission,
     and derives per-bar guitar dynamics (`bar_dynamics`) from the singer's vocal note
     density and pitch register.
     """
     NAMES = "C C# D D# E F F# G G# A A# B".split()
-    if tonic not in NAMES:
+    if not isinstance(tonic, str):
         raise ValueError("Malformed tonic")
+    t_clean = tonic.strip().replace("♯", "#").replace("♭", "b")
+    if not t_clean or t_clean[0].upper() not in "CDEFGAB" or len(t_clean) > 2 or (len(t_clean) == 2 and t_clean[1] not in ("#", "b")):
+        raise ValueError("Malformed tonic")
+    base_pc = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}[t_clean[0].upper()]
+    R = (base_pc + (1 if len(t_clean) == 2 and t_clean[1] == "#" else (-1 if len(t_clean) == 2 and t_clean[1] == "b" else 0))) % 12
     measure_beats, seconds_per_beat, bar_seconds = _timing(bpm, beat_origin, meter)
-    R = NAMES.index(tonic)
     tonic_root = (R + 9) % 12 if minor else R
     trans_matrix = MINOR_TRANS_MATRIX if minor else MAJOR_TRANS_MATRIX
 
-    def _chord_name(root: int, is_minor: bool) -> str:
-        return NAMES[root % 12] + ("m" if is_minor else "")
+    def _chord_name(root: int, quality) -> str:
+        suf = quality if isinstance(quality, str) else ("m" if quality else "")
+        return NAMES[root % 12] + suf
 
     candidates = []
     seen_names = set()
 
     def _add(root: int, quality: str, tones: tuple[int, ...], prior_bias: float) -> None:
         r = root % 12
-        is_minor = quality == "m"
-        name = _chord_name(r, is_minor)
+        name = _chord_name(r, quality)
         key = (name, tones)
         if key not in seen_names:
             seen_names.add(key)
@@ -133,6 +170,7 @@ def synthesize_melody_conditioned_harmony(
     if minor:
         R_min = (R + 9) % 12
         _add(R_min, "m", (0, 3, 7), 0.08)
+        _add((R_min + 2) % 12, "dim", (0, 3, 6), 0.01)
         _add((R_min + 3) % 12, "", (0, 4, 7), 0.06)
         _add((R_min + 5) % 12, "m", (0, 3, 7), 0.06)
         _add((R_min + 5) % 12, "", (0, 4, 7), 0.05)
@@ -147,9 +185,83 @@ def synthesize_melody_conditioned_harmony(
         _add((R + 5) % 12, "", (0, 4, 7), 0.06)
         _add((R + 7) % 12, "", (0, 4, 7), 0.06)
         _add((R + 9) % 12, "m", (0, 3, 7), 0.06)
+        _add((R + 11) % 12, "dim", (0, 3, 6), 0.01)
         _add((R + 4) % 12, "", (0, 4, 7), -0.02)
         _add((R + 2) % 12, "", (0, 4, 7), -0.03)
         _add((R + 10) % 12, "", (0, 4, 7), -0.03)
+
+    if notes:
+        from subpkgs.guitar_reharm.chord_voicing import EXTENDED_INTERVALS, parse_extended_chord
+        observed_pcs = {int(round(float(getattr(n, "pitch", 60)))) % 12 for n in notes}
+        seen_ext_pcs = {(0, 4, 7), (0, 3, 7)}
+        ext_q_list = []
+        for q_str, ivs in EXTENDED_INTERVALS.items():
+            norm_pcs = tuple(sorted({iv % 12 for iv in ivs}))
+            if len(norm_pcs) < 3 or norm_pcs in seen_ext_pcs:
+                continue
+            seen_ext_pcs.add(norm_pcs)
+            ext_q_list.append((q_str, norm_pcs))
+        n_b_est = max(1, math.ceil(max((float(n.start) + float(n.duration) for n in notes), default=0.0) / measure_beats))
+        for b_i in range(n_b_est):
+            b_pcs = {int(round(float(n.pitch))) % 12 for n in notes if min(float(n.start) + float(n.duration), (b_i + 1) * measure_beats) - max(float(n.start), b_i * measure_beats) > 0}
+            if len(b_pcs) < 3:
+                continue
+            for r_c in range(12):
+                if r_c not in b_pcs:
+                    continue
+                rel = tuple(sorted((p - r_c) % 12 for p in b_pcs))
+                if rel in seen_ext_pcs:
+                    continue
+                rel_s = set(rel)
+                if 4 in rel_s:
+                    base_q = "7" if 10 in rel_s else ("maj7" if 11 in rel_s else "")
+                elif 3 in rel_s:
+                    base_q = "m7b5" if (10 in rel_s and 6 in rel_s and 7 not in rel_s) else ("m7" if 10 in rel_s else ("mmaj7" if 11 in rel_s else ("dim7" if (6 in rel_s and 7 not in rel_s and 9 in rel_s) else ("dim" if (6 in rel_s and 7 not in rel_s) else "m"))))
+                elif 5 in rel_s:
+                    base_q = "7sus4" if 10 in rel_s else "sus4"
+                elif 2 in rel_s:
+                    base_q = "7sus2" if 10 in rel_s else "sus2"
+                else:
+                    continue
+                bpcs = {x % 12 for x in EXTENDED_INTERVALS[base_q]}
+                mods = []
+                if 7 in bpcs and 7 not in rel_s:
+                    if 6 in rel_s and 6 not in bpcs:
+                        mods.append("b5"); bpcs.discard(7); bpcs.add(6)
+                    elif 8 in rel_s and 8 not in bpcs:
+                        mods.append("#5"); bpcs.discard(7); bpcs.add(8)
+                    else:
+                        mods.append("no5"); bpcs.discard(7)
+                has_7 = (10 in rel_s or 11 in rel_s)
+                for p_rel in sorted(rel_s - bpcs):
+                    if p_rel == 1:
+                        mods.append("b9" if has_7 else "addb9")
+                    elif p_rel == 2:
+                        mods.append("add9")
+                    elif p_rel == 3 and 4 in rel_s:
+                        mods.append("#9" if has_7 else "add#9")
+                    elif p_rel == 5:
+                        mods.append("add11")
+                    elif p_rel == 6:
+                        mods.append("#11" if has_7 else "add#11")
+                    elif p_rel == 8:
+                        mods.append("b13" if has_7 else "addb13")
+                    elif p_rel == 9:
+                        mods.append("add13" if has_7 else "6")
+                    elif p_rel == 11:
+                        mods.append("add#7")
+                p_res = parse_extended_chord("C" + base_q + "".join(mods))
+                if p_res is not None and tuple(sorted({x % 12 for x in p_res["intervals"]})) == rel:
+                    seen_ext_pcs.add(rel)
+                    ext_q_list.append((p_res["quality"], rel))
+        for off in range(12):
+            r_pc = (tonic_root + off) % 12
+            for q_str, ivs in (("", (0, 4, 7)), ("m", (0, 3, 7))):
+                if sum(1 for iv in ivs if (r_pc + iv) % 12 in observed_pcs) >= 2:
+                    _add(r_pc, q_str, ivs, -0.04)
+            for q_str, ivs in ext_q_list:
+                if all((r_pc + iv) % 12 in observed_pcs for iv in ivs):
+                    _add(r_pc, q_str, ivs, -0.02 - 0.03 * max(0, len(ivs) - 3))
 
     chord_names = [c[4] for c in candidates]
     candidate_roots = [c[0] for c in candidates]
@@ -160,12 +272,23 @@ def synthesize_melody_conditioned_harmony(
 
     max_note_end = max((n.start * seconds_per_beat + beat_origin + n.duration * seconds_per_beat
                         for n in notes), default=0.0) if notes else 0.0
+    note_bars = math.ceil(max((float(n.start) + float(n.duration) for n in notes), default=0.0) / measure_beats) if notes else 0
     total_duration = max(clip_duration, max_note_end, beat_origin + bar_seconds)
-    n_bars = max(1, int(math.ceil((total_duration - beat_origin) / bar_seconds)))
+    n_bars = max(1, note_bars, int(math.ceil((total_duration - beat_origin) / bar_seconds)))
 
-    if bar_start_seconds is not None and len(bar_start_seconds) >= 2:
-        n_bars = len(bar_start_seconds) - 1
+    if bar_start_seconds is not None:
+        if len(bar_start_seconds) < 2:
+            raise ValueError("bar_start_seconds must contain at least 2 boundary timestamps")
         computed_bar_starts = [float(t) for t in bar_start_seconds]
+        if any(not math.isfinite(t) for t in computed_bar_starts):
+            raise ValueError("bar_start_seconds must be finite")
+        if any(computed_bar_starts[i + 1] <= computed_bar_starts[i] for i in range(len(computed_bar_starts) - 1)):
+            raise ValueError("bar_start_seconds must be strictly increasing")
+        max_raw_end = max((float(n.raw_start) + float(n.raw_duration) for n in notes if getattr(n, "raw_duration", 0.0) > 0), default=0.0) if notes else 0.0
+        target_end_sec = max(float(clip_duration), max_raw_end)
+        while (len(computed_bar_starts) - 1 < max(1, note_bars)) or (target_end_sec > computed_bar_starts[-1] + 1e-6):
+            computed_bar_starts.append(computed_bar_starts[-1] + bar_seconds)
+        n_bars = len(computed_bar_starts) - 1
     else:
         computed_bar_starts = [beat_origin + b * bar_seconds for b in range(n_bars + 1)]
 
@@ -183,21 +306,46 @@ def synthesize_melody_conditioned_harmony(
 
     bar_vocal_w = []
     bar_has_vocal = []
+    bar_cov_ratios = []
+    bar_mean_pitches = []
     first_vocal_bar = -1
+    custom_bounds = bar_start_seconds is not None and len(bar_start_seconds) >= 2
     for b in range(n_bars):
-        bs_beat = b * measure_beats
-        be_beat = (b + 1) * measure_beats
+        bs_sec = computed_bar_starts[b]
+        be_sec = computed_bar_starts[b + 1]
+        bar_dur_sec = max(1e-6, be_sec - bs_sec)
+        bs_beat_musical = b * measure_beats
+        be_beat_musical = (b + 1) * measure_beats
         vocal_w = np.zeros(12)
+        cov_beats = 0.0
+        pitches_in_bar = []
         for n in notes:
-            overlap = max(0.0, min(n.start + n.duration, be_beat) - max(n.start, bs_beat))
-            if overlap <= 0:
-                continue
-            rel_onset = (n.start - bs_beat) % measure_beats
-            salience = _gttm_note_salience(rel_onset, overlap, measure_beats)
-            vocal_w[n.pitch % 12] += salience
+            has_raw = getattr(n, "raw_duration", 0.0) > 0
+            if custom_bounds and has_raw:
+                ns_sec = float(n.raw_start)
+                ne_sec = ns_sec + float(n.raw_duration)
+                ov_sec = max(0.0, min(ne_sec, be_sec) - max(ns_sec, bs_sec))
+                if ov_sec <= 0:
+                    continue
+                overlap = (ov_sec / bar_dur_sec) * measure_beats
+                rel_onset = ((max(ns_sec, bs_sec) - bs_sec) / bar_dur_sec) * measure_beats
+            else:
+                ns_b = float(n.start)
+                ne_b = ns_b + float(n.duration)
+                overlap = max(0.0, min(ne_b, be_beat_musical) - max(ns_b, bs_beat_musical))
+                if overlap <= 0:
+                    continue
+                rel_onset = (max(ns_b, bs_beat_musical) - bs_beat_musical) % measure_beats
+            cov_beats += overlap
+            pitches_in_bar.append(float(n.pitch))
+            salience = _gttm_note_salience(rel_onset, overlap, measure_beats, meter)
+            vocal_w[int(round(float(n.pitch))) % 12] += salience
+        bar_len_beats = measure_beats
         has_vocal = float(np.sum(vocal_w)) > 0
         bar_vocal_w.append(vocal_w)
         bar_has_vocal.append(has_vocal)
+        bar_cov_ratios.append(cov_beats / bar_len_beats)
+        bar_mean_pitches.append(float(np.mean(pitches_in_bar)) if pitches_in_bar else 0.0)
         if has_vocal and first_vocal_bar < 0:
             first_vocal_bar = b
 
@@ -218,9 +366,11 @@ def synthesize_melody_conditioned_harmony(
             quality = candidate_qualities[ci]
             name = chord_names[ci]
             bias = candidate_biases[ci]
-            is_minor_q = quality == "m"
+            is_minor_q = quality.startswith(("m", "dim")) and not quality.startswith("maj")
             third = (root + 3) % 12 if is_minor_q else (root + 4) % 12
-            avoid_pcs = {(third + 1) % 12, (third - 1) % 12} if not is_minor_q else set()
+            avoid_pcs = set() if quality.startswith("sus") else ({(third + 1) % 12, (third - 1) % 12} if not is_minor_q else set())
+            missing_tones = 0
+            cov_ratio = 0.0
 
             if has_vocal:
                 s = 0.0
@@ -233,21 +383,28 @@ def synthesize_melody_conditioned_harmony(
                         s += vocal_w[pc] * -0.25
                 total_w = float(np.sum(vocal_w))
                 vocal_score = s / total_w if total_w > 0 else 0.0
+                cov_ratio = sum(vocal_w[pc] for pc in tones) / total_w if total_w > 0 else 0.0
+                missing_tones = sum(1 for pc in tones if vocal_w[pc] <= 0.02 * total_w)
+                is_dia_triad = (quality in ("", "m") or (quality == "dim" and candidate_degrees[ci] >= 0))
+                if not is_dia_triad and (missing_tones > 0 or cov_ratio < (0.92 if len(tones) >= 4 else 0.85)):
+                    continue
                 tiv_sim = _cosine_sim(bar_tiv, chord_tivs[name])
-                combined = 0.75 * vocal_score + 0.17 * tiv_sim + bias
+                combined = 0.75 * vocal_score + 0.17 * tiv_sim + bias - 0.04 * missing_tones
             else:
+                is_dia_triad = (quality in ("", "m") or (quality == "dim" and candidate_degrees[ci] >= 0))
+                if not is_dia_triad and candidate_degrees[ci] < 0:
+                    continue
                 t_root = tonic_root
-                turnaround_roots = (
-                    (t_root, (t_root + 10) % 12, (t_root + 3) % 12, (t_root + 7) % 12)
-                    if minor
-                    else (t_root, (t_root + 7) % 12, (t_root + 9) % 12, (t_root + 5) % 12)
-                )
-                turnaround_prior = 0.14 if root == turnaround_roots[rel_b % 4] else 0.0
+                ctx_w = np.zeros(12)
+                for ob in range(n_bars):
+                    if bar_has_vocal[ob]:
+                        ctx_w += bar_vocal_w[ob] / max(1.0, float(abs(ob - b)))
+                ctx_tiv_sim = _cosine_sim(_tiv(ctx_w), chord_tivs[name]) if float(np.sum(ctx_w)) > 0 else 0.0
                 tonic_prior = 0.22 if (b == 0 and root == t_root) else (0.05 if root == t_root else 0.0)
                 cadence_prior = 0.08 if (b == n_bars - 1 or rel_b % 4 == 0) and root == t_root else 0.0
-                combined = tonic_prior + cadence_prior + turnaround_prior + bias
+                combined = 0.25 * ctx_tiv_sim + tonic_prior + cadence_prior + bias
 
-            is_tonic_chord = (root == tonic_root and quality == tonic_qual)
+            is_tonic_chord = (root == tonic_root and (quality == tonic_qual or (has_vocal and missing_tones == 0 and cov_ratio >= 0.95)))
 
             if is_tonic_chord and (b == 0 or b == first_vocal_bar):
                 tonic_triad = set(candidate_tones[ci])
@@ -260,7 +417,7 @@ def synthesize_melody_conditioned_harmony(
                 combined += 0.22
 
             if is_cadence_bar:
-                if root == dom_root and quality != "m":
+                if root == dom_root and not is_minor_q:
                     combined += 0.16
                 if is_tonic_chord and b == n_bars - 1:
                     combined += 0.06
@@ -289,7 +446,7 @@ def synthesize_melody_conditioned_harmony(
 
     unique_names = list(dict.fromkeys(chord_names))
 
-    states = {None: (0.0, [])}
+    states = {(None, False): (0.0, [])}
     for b in range(n_bars):
         updated = {}
         rel_b_v = (b - first_vocal_bar) if (first_vocal_bar >= 0 and b >= first_vocal_bar) else b
@@ -297,10 +454,10 @@ def synthesize_melody_conditioned_harmony(
             if name not in emission_scores[b]:
                 continue
             fit = emission_scores[b][name]
-            best = None
             curr_deg = name_to_degree.get(name, -1)
-            for prev, (cost, path) in states.items():
+            for (prev, prev_rep), (cost, path) in states.items():
                 transition = 0.0
+                is_rep = (prev == name)
                 if prev is not None and prev != "N.C." and name != "N.C.":
                     prev_deg = name_to_degree.get(prev, -1)
                     if prev_deg >= 0 and curr_deg >= 0:
@@ -314,39 +471,40 @@ def synthesize_melody_conditioned_harmony(
                         elif dist in (2, 10):
                             transition = 0.06
 
-                    if prev == name:
+                    if is_rep:
                         transition -= 0.03
-                        if len(path) >= 2 and path[-2] == name:
+                        if prev_rep:
                             transition -= 0.14
 
                     if (rel_b_v % 4 == 0 or b == n_bars - 1) and name == tonic_name:
                         transition += 0.12
 
                 total = cost + fit + transition
-                if best is None or total > best[0]:
-                    best = (total, path + [name])
-            if best is not None:
-                if name not in updated or best[0] > updated[name][0]:
-                    updated[name] = best
+                state_key = (name, is_rep)
+                if state_key not in updated or total > updated[state_key][0]:
+                    updated[state_key] = (total, path + [name])
         states = updated
 
     chords = max(states.values(), key=lambda x: x[0])[1] if states else ["N.C."] * n_bars
 
-    if notes:
+    if notes and any(bar_has_vocal):
         vocal_energy = np.zeros(n_bars, dtype=np.float64)
         for b in range(n_bars):
-            bs_beat, be_beat = b * measure_beats, (b + 1) * measure_beats
-            bar_ns = [n for n in notes if min(n.start + n.duration, be_beat) > max(n.start, bs_beat)]
-            if bar_ns:
-                cov = sum(min(n.start + n.duration, be_beat) - max(n.start, bs_beat) for n in bar_ns) / measure_beats
-                reg = np.clip((np.mean([n.pitch for n in bar_ns]) - 54.0) / 22.0, 0.0, 1.0)
+            if bar_has_vocal[b]:
+                cov = bar_cov_ratios[b]
+                reg = np.clip((bar_mean_pitches[b] - 54.0) / 22.0, 0.0, 1.0)
                 vocal_energy[b] = float(np.clip(0.55 * min(1.0, cov) + 0.45 * reg, 0.15, 1.0))
             else:
                 vocal_energy[b] = 0.25
-        smoothed = np.convolve(vocal_energy, np.ones(3) / 3, mode="same")
-        bar_dynamics = [round(float(np.clip(0.66 + 0.44 * v, 0.66, 1.10)), 4) for v in smoothed]
+        if n_bars == 1:
+            smoothed = vocal_energy.copy()
+        else:
+            padded = np.pad(vocal_energy, (1, 1), mode="edge")
+            smoothed = np.convolve(padded, np.ones(3) / 3, mode="valid")
+        bar_dynamics = [round(float(np.clip(0.66 + 0.44 * v, 0.66, 1.10)), 4) for v in smoothed[:n_bars]]
     else:
-        bar_dynamics = [0.85] * n_bars
+        chords = ["N.C."] * n_bars
+        bar_dynamics = [0.0] * n_bars
 
     return {
         "chords": chords,

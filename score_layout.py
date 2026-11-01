@@ -29,11 +29,27 @@ def diagram(frets,x=42,y=42):
 
 def lyric_bars(arrangement):
     measure=arrangement['measure'];notes=arrangement.get('melody',[])
+    bs=arrangement.get('bar_start_seconds')
     result={}
     for line in arrangement.get('lyrics',[]):
         start=line['start']
         nearest=min(notes,key=lambda n:abs(n['raw_start']-start),default=None)
-        beat=(nearest['start'] if nearest and abs(nearest['raw_start']-start)<1.5 else (start-arrangement.get('beat_origin',0))*arrangement['bpm']/60)
+        if nearest and nearest.get('raw_duration',0)>0 and abs(nearest['raw_start']-start)<1.5:
+            beat=nearest['start']
+        elif bs and len(bs)>=2:
+            spb=60/arrangement['bpm']
+            if start<=bs[0]:
+                beat=(start-bs[0])/spb
+            elif start>=bs[-1]:
+                beat=(len(bs)-1)*measure+(start-bs[-1])/spb
+            else:
+                beat=0.0
+                for k in range(len(bs)-1):
+                    if start<=bs[k+1]:
+                        beat=(k+(start-bs[k])/max(1e-6,bs[k+1]-bs[k]))*measure
+                        break
+        else:
+            beat=(nearest['start'] if nearest and abs(nearest['raw_start']-start)<1.5 else (start-arrangement.get('beat_origin',0))*arrangement['bpm']/60)
         bar=max(0,min(len(arrangement['bars'])-1,int(beat//measure)))
         result.setdefault(bar,[]).append(line)
     return result
