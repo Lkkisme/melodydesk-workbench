@@ -1,6 +1,10 @@
-﻿__pycache__/
+__pycache__/
 *.pyc
 *.pyo
 static/vendor/alphatab/soundfont/*.sf2
 static/vendor/alphatab/font/*
 subpkgs/*/verification/
+.claudecloud_state.json
+.lkktest_runs/
+.sotareview_runs/
+scratch_vm/
