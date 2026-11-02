@@ -14,22 +14,77 @@ TUNING=(40,45,50,55,59,64)  # low E -> high e
 ALBRECHT_MAJOR=(0.238,0.006,0.111,0.006,0.137,0.094,0.016,0.214,0.009,0.080,0.008,0.081)
 ALBRECHT_MINOR=(0.220,0.006,0.104,0.123,0.019,0.103,0.012,0.214,0.062,0.022,0.061,0.052)
 
-_GUITAR_MAJ_TRANS=(
-    (-0.03, 0.06, 0.03, 0.10, 0.10, 0.08),
-    ( 0.03,-0.04, 0.02, 0.04, 0.12, 0.03),
-    ( 0.02, 0.05,-0.04, 0.08, 0.03, 0.10),
-    ( 0.10, 0.05, 0.02,-0.03, 0.10, 0.04),
-    ( 0.14, 0.02, 0.02, 0.04,-0.04, 0.10),
-    ( 0.03, 0.08, 0.04, 0.10, 0.06,-0.04),
+# Functional-degree transition model. The pseudo-counts are hand-specified
+# priors (not corpus-fitted); rows are Dirichlet-smoothed (alpha) and
+# row-normalized into stochastic matrices (sum_j P_ij = 1, P_ij > 0). The
+# additive Viterbi weight is the scaled log-likelihood ratio c*log(P_ij/(1/K)).
+# Major degree order: I ii iii IV V vi.  Minor: i III iv v VI VII.
+_TRANS_ALPHA=1.0
+_TRANS_LOG_SCALE=0.06
+_GUITAR_MAJ_COUNTS=(
+    ( 2,12, 7,25,25,18),
+    ( 9, 2, 7,10,42, 9),
+    ( 7,12, 2,21, 9,30),
+    (25,10, 6, 2,25, 9),
+    (59, 7, 7,10, 2,30),
+    ( 9,21,10,30,15, 2),
 )
-_GUITAR_MIN_TRANS=(
-    (-0.03, 0.06, 0.10, 0.04, 0.04, 0.10),
-    ( 0.05,-0.04, 0.06, 0.03, 0.05, 0.06),
-    ( 0.06, 0.05,-0.03, 0.08, 0.05, 0.06),
-    ( 0.08, 0.05, 0.05,-0.04, 0.06, 0.05),
-    ( 0.05, 0.06, 0.06, 0.05,-0.03, 0.08),
-    ( 0.10, 0.06, 0.05, 0.03, 0.05,-0.03),
+_GUITAR_MIN_COUNTS=(
+    ( 2,12,25, 9, 9,25),
+    (12, 2,15, 9,12,15),
+    (12,10, 2,18,10,12),
+    (21,12,12, 2,15,12),
+    (10,12,12,10, 2,18),
+    (25,12,10, 7,10, 2),
 )
+
+
+def _row_stochastic(counts,alpha=_TRANS_ALPHA):
+    """Dirichlet posterior-mean rows: P_ij=(n_ij+alpha)/sum_k(n_ik+alpha)."""
+    return tuple(tuple((c+alpha)/sum(x+alpha for x in row) for c in row) for row in counts)
+
+
+def _log_ratio_matrix(probs,scale=_TRANS_LOG_SCALE):
+    return tuple(tuple(scale*math.log(p*len(row)) for p in row) for row in probs)
+
+
+_GUITAR_MAJ_PROBS=_row_stochastic(_GUITAR_MAJ_COUNTS)
+_GUITAR_MIN_PROBS=_row_stochastic(_GUITAR_MIN_COUNTS)
+_GUITAR_MAJ_TRANS=_log_ratio_matrix(_GUITAR_MAJ_PROBS)
+_GUITAR_MIN_TRANS=_log_ratio_matrix(_GUITAR_MIN_PROBS)
+
+# Tonal Interval Space DFT-coefficient weights (Bernardes et al. 2016).
+_TIS_WEIGHTS=(2.0,11.0,17.0,16.0,19.0,7.0)
+
+
+def _tiv_vec(chroma):
+    """6-harmonic Tonal Interval Vector (real/imag parts) of a 12-bin chroma."""
+    total=sum(chroma)
+    if total<=1e-12:
+        return [0.0]*12
+    re_part=[];im_part=[]
+    for k,w in enumerate(_TIS_WEIGHTS,start=1):
+        re_k=sum(c*math.cos(2*math.pi*k*pc/12) for pc,c in enumerate(chroma))/total
+        im_k=-sum(c*math.sin(2*math.pi*k*pc/12) for pc,c in enumerate(chroma))/total
+        re_part.append(w*re_k);im_part.append(w*im_k)
+    return re_part+im_part
+
+
+def _cosine(a,b):
+    na=math.sqrt(sum(x*x for x in a));nb=math.sqrt(sum(x*x for x in b))
+    if na<1e-12 or nb<1e-12:
+        return 0.0
+    return sum(x*y for x,y in zip(a,b))/(na*nb)
+
+
+def _pearson(x,y):
+    """Mean-centered, variance-normalized Pearson correlation; 0 for flat inputs."""
+    mx=sum(x)/len(x);my=sum(y)/len(y)
+    dx=[v-mx for v in x];dy=[v-my for v in y]
+    den=math.sqrt(sum(v*v for v in dx)*sum(v*v for v in dy))
+    if den<1e-12:
+        return 0.0
+    return sum(a*b for a,b in zip(dx,dy))/den
 OPEN={'C':[-1,3,2,0,1,0],'D':[-1,-1,0,2,3,2],'E':[0,2,2,1,0,0],
       'F':[1,3,3,2,1,1],'G':[3,2,0,0,0,3],'A':[-1,0,2,2,2,0],
       'Am':[-1,0,2,2,1,0],'Dm':[-1,-1,0,2,3,1],'Em':[0,2,2,0,0,0]}
@@ -105,12 +160,13 @@ def key_candidates(project):
     for root in range(12):
         for minor in (False,True):
             profile=ALBRECHT_MINOR if minor else ALBRECHT_MAJOR
-            corr=sum(weights[pc]*profile[(pc-root)%12] for pc in range(12))/total
+            rotated=[profile[(pc-root)%12] for pc in range(12)]
+            corr=_pearson(weights,rotated)
             triad={root,(root+(3 if minor else 4))%12,(root+7)%12}
             triad_w=sum(weights[pc] for pc in triad)/total
             fifth=weights[(root+7)%12]/total
-            final=.04 if project.notes and project.notes[-1].pitch%12==root else 0
-            options.append((corr+.12*triad_w+.04*fifth+final,root,minor))
+            final=.06 if project.notes and project.notes[-1].pitch%12==root else 0
+            options.append((corr+.15*triad_w+.05*fifth+final,root,minor))
     return sorted(options,reverse=True)
 
 
@@ -135,15 +191,15 @@ def _gttm_salience(rel_onset,overlap,measure,meter='4/4'):
             grid.append((measure*0.5,1.22))
         for q in range(1,num_m):grid.append((q*sub_u,1.05))
         for q in range(num_m*2):grid.append((q*sub_u*0.5,0.85))
-    best=0.85
+    max_salience=0.85
     for pos,w in grid:
         d=abs(rel_onset-pos)
         if d>measure/2:d=measure-d
         g=math.exp(-0.5*(d/sigma)**2)
         v=w*g
-        if v>best:best=v
+        if v>max_salience:max_salience=v
     dur_f=min(1.45,max(0.35,0.40+0.65*math.log(1+2.2*overlap)))
-    return best*dur_f
+    return max_salience*dur_f
 
 
 def suggest(project,root=None,minor=False):
@@ -234,6 +290,7 @@ def suggest(project,root=None,minor=False):
         if not tot_w:
             rows.append({'N.C.':0});continue
         emission={}
+        bar_tiv=_tiv_vec(weights)
         for name in all_names:
             r,m=parse_chord(name); ivs=q_ivs[m]; tones={(r+iv)%12 for iv in ivs}
             is_dia=name in name_to_deg
@@ -244,7 +301,9 @@ def suggest(project,root=None,minor=False):
                 continue
             missing=sum(1 for t in tones if weights[t]<=0.05*tot_w)
             prior=(0.0 if is_dia else (-0.04 - 0.02*max(0,len(tones)-3))) - 0.03*missing
-            emission[name]=sum(w*(1 if pc in tones else -.45) for pc,w in enumerate(weights))/tot_w+prior
+            coverage_score=sum(w*(1 if pc in tones else -.45) for pc,w in enumerate(weights))/tot_w
+            chord_tiv=_tiv_vec([1.0 if pc in tones else 0.0 for pc in range(12)])
+            emission[name]=.8*coverage_score+.2*_cosine(bar_tiv,chord_tiv)+prior
         rows.append(emission)
     states={None:(0,[])}
     for row in rows:

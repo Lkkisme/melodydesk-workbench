@@ -1,4 +1,4 @@
-"""Functional Roman Numeral Analysis, 12-D TIS Consonance & Dyadic Roughness Clash Detector, 6 Re-harmonization Presets with Global Viterbi Bass-Line Decoder, and Split-Bar Cadential / Secondary-Dominant Solver."""
+"""Functional Roman Numeral Analysis, 12-D TIS Consonance & Plomp-Levelt / Sethares Roughness + Avoid-Note Clash Detector, 6 Re-harmonization Presets with Global Viterbi Bass-Line Decoder, and Split-Bar Cadential / Secondary-Dominant Solver."""
 from __future__ import annotations
 
 import cmath
@@ -44,19 +44,97 @@ def _tis_similarity(vec_a: list[complex], vec_b: list[complex]) -> float:
     return max(-1.0, min(1.0, dot / (mag_a * mag_b)))
 
 
-def _dyadic_roughness(chord_tones: set[int], parsed: dict | None, melody_pc: int) -> float:
+def _midi_hz(pitch: float) -> float:
+    return 440.0 * 2.0 ** ((pitch - 69.0) / 12.0)
+
+
+def _plomp_levelt_pair(p1: float, p2: float, a1: float = 1.0, a2: float = 1.0) -> float:
+    """Sethares (1993) parameterisation of the Plomp-Levelt (1965) sensory dissonance curve for two partials:
+    d = min(a1, a2) * (exp(-3.5 s |p2-p1|) - exp(-5.75 s |p2-p1|)), s = 0.24 / (0.0207 min(p1, p2) + 18.96)."""
+    s = 0.24 / (0.0207 * min(p1, p2) + 18.96)
+    df = abs(p2 - p1)
+    return min(a1, a2) * (math.exp(-3.5 * s * df) - math.exp(-5.75 * s * df))
+
+
+
+
+
+
+@lru_cache(maxsize=8192)
+def _plomp_levelt_roughness(f1: float, f2: float, n_partials: int = 5) -> float:
+    """Multi-partial Plomp-Levelt / Sethares sensory dissonance between two harmonic complex tones.
+
+    Each tone has partials h*f (h = 1..n_partials) with amplitudes a_h = 0.88^(h-1).  The dissonance is the
+    sum over all cross-tone partial pairs of the Sethares pair curve (intra-tone partial pairs are identical
+    for every interval, so they are omitted).
+    """
+    if f1 <= 0 or f2 <= 0 or n_partials <= 0:
+        return 0.0
+    total = 0.0
+    for h1 in range(1, n_partials + 1):
+        a1 = 0.88 ** (h1 - 1)
+        for h2 in range(1, n_partials + 1):
+            total += _plomp_levelt_pair(h1 * f1, h2 * f2, a1, 0.88 ** (h2 - 1))
+    return total
+
+
+@lru_cache(maxsize=1)
+def _pl_reference():
+    """Reference roughness scale: a minor second at C4/C#4 (the canonical rough dyad) maps to ~1.0."""
+    return _plomp_levelt_roughness(_midi_hz(60), _midi_hz(61))
+
+
+def _chord_voice_pitch(pc: int, melody_pitch: int) -> int:
+    """Place chord pitch-class `pc` in the closest octave *below* the melody (typical accompaniment register),
+    but never under the guitar's open low E (MIDI 40)."""
+    below = melody_pitch - ((melody_pitch - pc) % 12)
+    pitch = below if below < melody_pitch else below - 12
+    while pitch < 40:
+        pitch += 12
+    return pitch
+
+
+def _avoid_note_reason(chord_tones: set[int], parsed: dict, melody_pc: int) -> str | None:
+    """Functional avoid-note rules from jazz / pop harmony pedagogy (chord-scale theory)."""
+    interval = (melody_pc - parsed['root']) % 12
+    if (parsed['root'] + 4) % 12 in chord_tones and interval == 5 and (parsed['root'] + 5) % 12 not in chord_tones:
+        return 'fourth_over_major_third'
+    if (parsed['root'] + 5) % 12 in chord_tones and (parsed['root'] + 3) % 12 not in chord_tones \
+            and (parsed['root'] + 4) % 12 not in chord_tones and interval == 4:
+        return 'third_against_sus4'
+    if any((melody_pc - ct) % 12 == 1 for ct in chord_tones):
+        return 'minor_ninth'
+    if any((ct - melody_pc) % 12 == 1 for ct in chord_tones):
+        return 'semitone_below_chord_tone'
+    return None
+
+
+def _dyadic_roughness(chord_tones: set[int], parsed: dict | None, melody_pc: int, melody_pitch: int | None = None) -> float:
+    """Clash score of a melody note against a chord: functional avoid-note rules + acoustic roughness.
+
+    The acoustic term is the multi-partial Plomp-Levelt / Sethares roughness of the melody note against each
+    chord tone voiced in the octave below it, normalised so a C4-C#4 minor second ≈ 1.0.  Exact semitone /
+    major-seventh pitch-class collisions keep a functional weight of 1.0 each (an inverted major seventh is
+    acoustically smooth but still a voice-leading clash), and a perfect fourth over a major third adds 0.8.
+    """
     if parsed is None:
         return 0.0
-    roughness = 0.0
+    mel_pitch = melody_pitch if melody_pitch is not None else 60 + (melody_pc % 12)
+    f_mel = _midi_hz(mel_pitch)
+    ref = _pl_reference() or 1.0
+    acoustic = 0.0
+    functional = 0.0
     for ct in chord_tones:
-        interval = (melody_pc - ct) % 12
-        if interval == 1 or interval == 11:
-            roughness += 1.0
-    if (parsed['root'] + 4) % 12 in chord_tones:
-        interval_from_root = (melody_pc - parsed['root']) % 12
-        if interval_from_root == 5 and (parsed['root'] + 5) % 12 not in chord_tones:
-            roughness += 0.8
-    return roughness
+        if ct == melody_pc % 12:
+            continue
+        acoustic += _plomp_levelt_roughness(f_mel, _midi_hz(_chord_voice_pitch(ct, mel_pitch))) / ref
+        if (melody_pc - ct) % 12 in (1, 11):
+            functional += 1.0
+    reason = _avoid_note_reason(chord_tones, parsed, melody_pc % 12)
+    if reason == 'fourth_over_major_third':
+        functional += 0.8
+    # Acoustic roughness contributes a graded share (a lone major second ≈ 0.3) without overriding the rules.
+    return functional + 0.35 * acoustic
 
 
 def _chord_tiv(parsed: dict | None) -> list[complex]:
@@ -289,7 +367,9 @@ def check_melody_clash(
     bar_end: float,
     tonic: str = 'C',
 ) -> dict:
-    """12-D TIS consonance + dyadic roughness clash detector with duration-weighted melody pitch-class distribution."""
+    """Melody/chord clash detector: functional avoid-note rules + multi-partial Plomp-Levelt / Sethares sensory
+    roughness per non-chord melody note, plus 12-D TIS similarity of the duration-weighted melody pitch-class
+    distribution to the chord."""
     notes = _overlapping_notes(melody_notes, bar_start, bar_end)
     parsed = None if (isinstance(chord_symbol, str) and chord_symbol.strip() == 'N.C.') else _parse(chord_symbol)
     tones = set(parsed['pcs']) | {parsed['bass_pc']} if parsed else set()
@@ -352,30 +432,23 @@ def check_melody_clash(
             report['tensions'].append(dict(pitch=pitch, start=n.start, interval=(pitch - parsed['root']) % 12, reason='passing'))
             continue
 
-        roughness = _dyadic_roughness(tones, parsed, pitch % 12)
+        roughness = _dyadic_roughness(tones, parsed, pitch % 12, pitch)
         interval = (pitch - parsed['root']) % 12
         reason = None
         if roughness >= 0.8:
-            if (parsed['root'] + 4) % 12 in tones and interval == 5:
-                reason = 'fourth_over_major_third'
-            elif (parsed['root'] + 5) % 12 in tones and (parsed['root'] + 3) % 12 not in tones and interval == 4:
-                reason = 'third_against_sus4'
-            elif any((pitch - ct) % 12 == 1 for ct in tones):
-                reason = 'minor_ninth'
-            elif any((ct - pitch % 12) % 12 == 1 for ct in tones):
-                reason = 'semitone_below_chord_tone'
-            else:
-                reason = 'dyadic_roughness'
+            reason = _avoid_note_reason(tones, parsed, pitch % 12) or 'sensory_roughness'
         if reason:
             clashing_pitches.append(pitch)
             reasons.append(reason)
-            report['clashes'].append(dict(pitch=pitch, start=n.start, interval=interval, reason=reason))
+            report['clashes'].append(dict(pitch=pitch, start=n.start, interval=interval, reason=reason,
+                                          roughness=round(roughness, 3)))
         else:
             labels = {1: 'b9', 2: '9', 3: '#9', 4: '3', 5: '11', 6: '#11', 7: '5', 8: 'b13', 9: '13', 10: 'b7', 11: 'maj7'}
             t_label = labels.get(interval, 'color')
             if (pitch % 12) not in diatonic_pcs:
                 t_label = f'chromatic_{t_label}'
-            report['tensions'].append(dict(pitch=pitch, start=n.start, interval=interval, reason=t_label))
+            report['tensions'].append(dict(pitch=pitch, start=n.start, interval=interval, reason=t_label,
+                                           roughness=round(roughness, 3)))
 
     if clashing_pitches:
         report['status'] = 'clash'
@@ -528,8 +601,8 @@ def _solve_split_bar_chord(chosen_sym, base_sym, next_base_sym, notes, bar_idx, 
     if not candidates:
         return None
 
-    best_sym = None
-    best_score = -1e9
+    chosen_cand_sym = None
+    max_cand_score = -1e9
     for sym in dict.fromkeys(candidates):
         report = check_melody_clash(sym, notes, mid, bar_end, tonic)
         if report['status'] == 'clash':
@@ -542,11 +615,11 @@ def _solve_split_bar_chord(chosen_sym, base_sym, next_base_sym, notes, bar_idx, 
         tis_score = _tis_similarity(chord_tiv, mel_tiv) if has_mel else 0.5
         bass_score = _bass_transition_score(p['bass_pc'], next_bass, 'walking_bass')
         score = tis_score * 2.0 + bass_score
-        if score > best_score:
-            best_score = score
-            best_sym = sym
+        if score > max_cand_score:
+            max_cand_score = score
+            chosen_cand_sym = sym
 
-    return best_sym
+    return chosen_cand_sym
 
 
 def reharmonize_progression(
@@ -592,7 +665,9 @@ def reharmonize_progression(
         for sym, _ in cands:
             if (idx, sym) not in clash_cache:
                 clash_cache[(idx, sym)] = check_melody_clash(sym, project.notes, bar_start, bar_end, tonic)
-        if preset != 'original' and all(clash_cache[(idx, s)].get('status') == 'clash' for s, _ in cands if s != 'N.C.'):
+        # Only rescue bars whose real chord candidates all clash; an all-N.C. bar (all([]) == True) is left alone.
+        non_nc_syms = [s for s, _ in cands if s != 'N.C.']
+        if preset != 'original' and non_nc_syms and all(clash_cache[(idx, s)].get('status') == 'clash' for s in non_nc_syms):
             base_sym = base_chords[idx]
             prev_c = base_chords[idx - 1] if idx > 0 else None
             next_c = base_chords[idx + 1] if idx + 1 < n_bars else None
@@ -627,8 +702,8 @@ def reharmonize_progression(
             emission_j = prior_j + tis_score_j * 1.5 + (-100.0 if is_clash_j else 0.0)
 
             bass_j = _bass_pc_of(sym_j)
-            best_cost = INF
-            best_prev = 0
+            min_path_cost = INF
+            prev_cand_idx = 0
             for k, (sym_k, _) in enumerate(candidate_lists[b - 1]):
                 bass_k = _bass_pc_of(sym_k)
                 trans = _bass_transition_score(bass_k, bass_j, preset)
@@ -638,11 +713,11 @@ def reharmonize_progression(
                 if p_k and p_j:
                     tis_trans = _tis_similarity(_chord_tiv(p_k), chord_tiv_j) * 0.3
                 cost = dp[b - 1][k] - (trans + tis_trans) - emission_j
-                if cost < best_cost:
-                    best_cost = cost
-                    best_prev = k
-            dp[b][j] = best_cost
-            back[b][j] = best_prev
+                if cost < min_path_cost:
+                    min_path_cost = cost
+                    prev_cand_idx = k
+            dp[b][j] = min_path_cost
+            back[b][j] = prev_cand_idx
 
     last_idx = min(range(len(candidate_lists[-1])), key=lambda j: dp[-1][j])
     chosen_indices = [0] * n_bars

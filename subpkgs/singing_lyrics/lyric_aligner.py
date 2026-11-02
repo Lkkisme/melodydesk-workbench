@@ -1,4 +1,10 @@
-"""Dual-Mode Lyric Tokenizer, ASR Timestamp Extractor (Qwen3-ASR / ForcedAligner + MMS-FA CTC + faster-whisper CUDA), and Parameter-Free DP Syllable-to-Note Forced Aligner."""
+"""Lyric tokenizer, multi-backend neural forced aligner (Qwen3-ForcedAligner / MMS-FA CTC / faster-whisper),
+and monotone sequence-assignment DP that maps lyric syllables onto transcribed notes.
+
+Word timestamps come from whichever neural backend is available; Needleman-Wunsch projects them onto the
+ground-truth lyric tokens, an LCS-style DP picks monotone anchors, and a monotone assignment DP places each
+syllable onset on a note. Melisma continuation ('-') uses a heuristic log-affinity whose time constants are
+scaled by the song's median note duration; its weights are hand-set, not learned."""
 from __future__ import annotations
 from pathlib import Path
 import logging
@@ -271,11 +277,11 @@ def _project_records_to_ground_truth(records: list[dict], ground_truth_text: str
             diag = dp[i - 1][j - 1] + _nw_score(gt_tokens[i - 1]["text"], records[j - 1]["word"])
             up = dp[i - 1][j] + GAP
             left = dp[i][j - 1] + GAP
-            best = max(diag, up, left)
-            dp[i][j] = best
-            if best == diag:
+            max_cell = max(diag, up, left)
+            dp[i][j] = max_cell
+            if max_cell == diag:
                 bt[i][j] = 0
-            elif best == up:
+            elif max_cell == up:
                 bt[i][j] = 1
             else:
                 bt[i][j] = 2
@@ -421,7 +427,7 @@ def transcribe_word_timestamps(
         device = "cuda" if prefer_cuda and torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if device == "cuda" else torch.float32
         if ground_truth_text:
-            language = None
+            language = "English"
             if re.search(r"[ぁ-ゖァ-ヺ]", ground_truth_text):
                 language = "Japanese"
             elif re.search(r"[가-힯\u1100-\u11ff\u3130-\u318f]", ground_truth_text):
@@ -430,9 +436,7 @@ def transcribe_word_timestamps(
                 language = "Chinese"
             model = Qwen3ForcedAligner.from_pretrained(
                 "Qwen/Qwen3-ForcedAligner-0.6B", dtype=dtype, device_map=device)
-            align_kwargs = {"audio": str(audio_path), "text": ground_truth_text}
-            if language is not None:
-                align_kwargs["language"] = language
+            align_kwargs = {"audio": str(audio_path), "text": ground_truth_text, "language": language}
             result = model.align(**align_kwargs)
             text = ground_truth_text
             first_res = result[0] if result else []
@@ -600,17 +604,17 @@ def _match_anchors(tokens, records, intervals=None, max_allow_gap=1.5):
     anchors = [None] * m
     for i in range(m - 1, -1, -1):
         for j in range(k - 1, -1, -1):
-            best = lengths[i][j + 1]
+            max_cell = lengths[i][j + 1]
             choice = 2
-            if lengths[i + 1][j] > best:
-                best = lengths[i + 1][j]
+            if lengths[i + 1][j] > max_cell:
+                max_cell = lengths[i + 1][j]
                 choice = 1
             if tokens[i]["text"].casefold() == valid_records[j]["word"].casefold():
                 cand = 1.0 + rec_bonus[j] + lengths[i + 1][j + 1]
-                if cand >= best - 1e-12:
-                    best = cand
+                if cand >= max_cell - 1e-12:
+                    max_cell = cand
                     choice = 0
-            lengths[i][j] = best
+            lengths[i][j] = max_cell
             choices[i][j] = choice
     i, j = 0, 0
     while i < m and j < k:
@@ -623,6 +627,31 @@ def _match_anchors(tokens, records, intervals=None, max_allow_gap=1.5):
         else:
             j += 1
     return anchors
+
+
+MELISMA_DUR_BAND = (0.15, 0.60)
+MELISMA_LEGATO_GAP = 0.06
+MELISMA_TAIL_TAU_FLOOR = 0.12
+MELISMA_NEXT_ANCHOR_TOL = 0.02
+MELISMA_OV_REF = 0.18
+MELISMA_TAIL_REF = 0.55
+MELISMA_STEP_FREE = 4
+
+
+def _melisma_log_affinity(ov_ratio, tail_decay, pitch_step, lead, tempo_scale=1.0):
+    """Continuous log-affinity (>= 0 continues the melisma) for extending a syllable onto the next note.
+
+    Two evidence channels combined as a log-domain OR (max):
+      overlap:  log(ov_ratio / OV_REF)                      -- note still sits inside the word's ASR span
+      tail:     log(tail_decay / TAIL_REF)                  -- exponential decay past the word end
+                - max(0, pitch_step - STEP_FREE)            -- semitone-step continuity
+                - lead / (0.01 * tempo_scale)               -- note starting before the word is not a tail
+    """
+    e_ov = math.log(max(ov_ratio, 1e-9) / MELISMA_OV_REF)
+    e_tail = (math.log(max(tail_decay, 1e-12) / MELISMA_TAIL_REF)
+              - max(0, pitch_step - MELISMA_STEP_FREE)
+              - lead / (0.01 * tempo_scale))
+    return max(e_ov, e_tail)
 
 
 def _align_anchored_tokens(tokens, notes, intervals, anchors, baseline):
@@ -689,6 +718,18 @@ def _align_anchored_tokens(tokens, notes, intervals, anchors, baseline):
             onsets[i - 1] = j - 1
             i -= 1
         j -= 1
+    # Tempo-adaptive melisma scales: the empirical median note duration rescales the
+    # legato gap and tail-decay floor; inside the reference band the scale is exactly 1.
+    note_durs = [max(0.0, float(ne) - float(ns)) for ns, ne in intervals]
+    med_note_dur = median(note_durs) if note_durs else MELISMA_DUR_BAND[0]
+    if med_note_dur < MELISMA_DUR_BAND[0]:
+        tempo_scale = max(0.6, med_note_dur / MELISMA_DUR_BAND[0])
+    elif med_note_dur > MELISMA_DUR_BAND[1]:
+        tempo_scale = min(1.5, med_note_dur / MELISMA_DUR_BAND[1])
+    else:
+        tempo_scale = 1.0
+    legato_gap = MELISMA_LEGATO_GAP * tempo_scale
+    tail_tau_floor = MELISMA_TAIL_TAU_FLOOR * tempo_scale
     lyrics, owners = [""] * n, [None] * n
     for i, onset in enumerate(onsets):
         lyrics[onset], owners[onset] = tokens[i]["text"], i
@@ -707,18 +748,17 @@ def _align_anchored_tokens(tokens, notes, intervals, anchors, baseline):
                         break
                     lyrics[j], owners[j] = "-", i
                     continue
+                if gap > legato_gap:
+                    break
+                if end > next_anchor_start + MELISMA_NEXT_ANCHOR_TOL:
+                    break
                 overlap = max(0.0, min(end, anchor["end"]) - max(start, anchor["start"]))
                 ov_ratio = overlap / duration
                 tail_ext = max(0.0, start - anchor["end"])
-                tail_score = math.exp(-tail_ext / max(0.12, 0.45 * duration))
+                tail_decay = math.exp(-tail_ext / max(tail_tau_floor, 0.45 * duration))
                 pitch_step = abs(int(notes[j].pitch) - int(notes[j - 1].pitch))
-                is_legato = gap <= 0.06
-                before_next = end <= next_anchor_start + 0.02
-                if gap > 0.06:
-                    break
-                if not (is_legato and before_next
-                        and (ov_ratio >= 0.18
-                             or (start >= anchor["start"] and tail_score >= 0.55 and pitch_step <= 4))):
+                lead = max(0.0, float(anchor["start"]) - start)
+                if _melisma_log_affinity(ov_ratio, tail_decay, pitch_step, lead, tempo_scale) < 0.0:
                     break
             lyrics[j], owners[j] = "-", i
     return lyrics, owners
@@ -766,20 +806,23 @@ def align_lyrics_to_notes(
     spb = 60.0 / bpm
     raw_bar_starts = getattr(project, "bar_start_seconds", None)
     valid_bar_starts = None
-    measure_beats = 4.0
+    raw_meter = getattr(project, "meter", None)
+    meter_str = "4/4" if raw_meter is None or str(raw_meter).strip() == "" else str(raw_meter).strip()
     try:
-        m_num, m_den = map(int, str(getattr(project, "meter", "4/4") or "4/4").split("/"))
-        if m_num > 0 and m_den > 0:
-            measure_beats = m_num * 4.0 / m_den
-    except (ValueError, TypeError):
-        pass
+        m_num, m_den = map(int, meter_str.split("/"))
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid meter: {raw_meter!r}") from exc
+    if m_num <= 0 or m_den not in (1, 2, 4, 8, 16):
+        raise ValueError(f"Invalid meter: {raw_meter!r}")
+    measure_beats = m_num * 4.0 / m_den
     if raw_bar_starts is not None and len(raw_bar_starts) >= 1:
         try:
             bs_list = [float(x) for x in raw_bar_starts]
-            if all(math.isfinite(x) for x in bs_list) and all(bs_list[k] > bs_list[k - 1] for k in range(1, len(bs_list))):
-                valid_bar_starts = bs_list
-        except (ValueError, TypeError):
-            pass
+        except (ValueError, TypeError) as exc:
+            raise ValueError("bar_start_seconds must contain finite numbers") from exc
+        if not all(math.isfinite(x) for x in bs_list) or not all(bs_list[k] > bs_list[k - 1] for k in range(1, len(bs_list))):
+            raise ValueError("bar_start_seconds must be strictly increasing finite timestamps")
+        valid_bar_starts = bs_list
     use_raw = _use_raw_intervals(notes, origin) and (valid_bar_starts is not None or bool(getattr(project, "source", "")))
     for note in notes:
         start, duration = float(note.start), float(note.duration)

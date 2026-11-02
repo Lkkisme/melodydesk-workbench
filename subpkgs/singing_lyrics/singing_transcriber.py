@@ -33,8 +33,8 @@ def estimate_key_albrecht_shanahan(notes: list) -> dict:
     last_pc = int(notes[-1].pitch) % 12
     first_pc = int(notes[0].pitch) % 12
 
-    best_k, best_minor, best_corr = 0, False, -2.0
-    best_profile = list(AS_MAJOR)
+    top_k, top_minor, max_corr = 0, False, -2.0
+    top_profile = list(AS_MAJOR)
     for k in range(12):
         for is_minor, profile in ((False, AS_MAJOR), (True, AS_MINOR)):
             rotated = [chroma[(k + d) % 12] for d in range(12)]
@@ -55,15 +55,15 @@ def estimate_key_albrecht_shanahan(notes: list) -> dict:
             if first_pc == k:
                 corr += 0.06
 
-            if corr > best_corr:
-                best_corr = corr
-                best_k = k
-                best_minor = is_minor
-                best_profile = list(profile)
+            if corr > max_corr:
+                max_corr = corr
+                top_k = k
+                top_minor = is_minor
+                top_profile = list(profile)
 
-    rel_major_pc = (best_k + 3) % 12 if best_minor else best_k
-    return {'tonic_pc': best_k, 'is_minor': best_minor, 'rel_major_pc': rel_major_pc,
-            'confidence': best_corr, 'profile': best_profile}
+    rel_major_pc = (top_k + 3) % 12 if top_minor else top_k
+    return {'tonic_pc': top_k, 'is_minor': top_minor, 'rel_major_pc': rel_major_pc,
+            'confidence': max_corr, 'profile': top_profile}
 
 
 def transcribe_vocal_notes(
@@ -172,6 +172,81 @@ def transcribe_vocal_notes(
             "backend": backend_used, "device": device_used}
 
 
+VITERBI_TRANSITION_WEIGHT = 0.1
+VITERBI_PHRASE_GAP_SEC = 0.45
+
+
+def _pitch_candidates(n, profile: list, tonic_k: int) -> list[int]:
+    """Candidate pitch states for one note; the observed pitch is always first (tie preference)."""
+    p0 = int(n.pitch)
+    conf_i = max(0.35, float(getattr(n, 'confidence', 1.0)))
+    rel0 = (p0 % 12 - tonic_k) % 12
+    if (getattr(n, 'edited', False) or float(n.duration) > 0.8 or conf_i > 0.85
+            or profile[rel0] > 0.05):
+        return [p0]
+    return [p0] + [p for p in (p0 - 1, p0 + 1) if 21 <= p <= 108]
+
+
+def _pitch_node_potential(n, p: int, profile: list, tonic_k: int) -> float:
+    """Log-potential of state p: observation fidelity + key-profile prior weighted by lambda_i."""
+    p0 = int(n.pitch)
+    conf_i = max(0.35, float(getattr(n, 'confidence', 1.0)))
+    lam = max(0.3, min(1.5, 1.0 - 0.8 * conf_i + 0.5 * (1.0 - float(n.duration))))
+    obs = -abs(p - p0) * (0.5 + 0.5 * conf_i)
+    log_prior = math.log(max(1e-6, profile[(p - tonic_k) % 12]))
+    return obs + lam * log_prior
+
+
+def _viterbi_decode_phrase(phrase: list, profile: list, tonic_k: int) -> list[int]:
+    """First-order HMM Viterbi over one phrase: dp[i][s] / back[i][s] with -w*|p_i - p_{i-1}| transitions."""
+    states = [_pitch_candidates(n, profile, tonic_k) for n in phrase]
+    if all(len(s) == 1 for s in states):
+        return [s[0] for s in states]
+    dp = [[_pitch_node_potential(phrase[0], p, profile, tonic_k) for p in states[0]]]
+    back = [[-1] * len(states[0])]
+    for i in range(1, len(phrase)):
+        row, ptr = [], []
+        for p in states[i]:
+            node = _pitch_node_potential(phrase[i], p, profile, tonic_k)
+            arg_s, max_path_score = 0, -math.inf
+            for s_prev, q in enumerate(states[i - 1]):
+                path_score = dp[i - 1][s_prev] - VITERBI_TRANSITION_WEIGHT * abs(p - q)
+                if path_score > max_path_score:
+                    max_path_score, arg_s = path_score, s_prev
+            row.append(max_path_score + node)
+            ptr.append(arg_s)
+        dp.append(row)
+        back.append(ptr)
+    last = dp[-1]
+    s_cur = max(range(len(last)), key=lambda s: (last[s], -s))
+    decoded = [0] * len(phrase)
+    for i in range(len(phrase) - 1, -1, -1):
+        decoded[i] = states[i][s_cur]
+        s_cur = back[i][s_cur]
+    return decoded
+
+
+def _viterbi_regularize_pitch_phrases(result: list, profile: list, tonic_k: int, spb: float) -> None:
+    """Phrase-level Viterbi pitch-sequence regularizer (in place).
+
+    Notes are split into phrases at rests longer than VITERBI_PHRASE_GAP_SEC; within each
+    phrase the pitch sequence is decoded jointly, with candidates {p0-1, p0, p0+1} for
+    uncertain out-of-key notes and {p0} for edited/long/confident/in-key notes.
+    """
+    if not result:
+        return
+    phrases: list[list] = [[result[0]]]
+    for prev, cur in zip(result, result[1:]):
+        rest_sec = (float(cur.start) - (float(prev.start) + float(prev.duration))) * spb
+        if rest_sec > VITERBI_PHRASE_GAP_SEC:
+            phrases.append([])
+        phrases[-1].append(cur)
+    for phrase in phrases:
+        for n, cand_opt_p in zip(phrase, _viterbi_decode_phrase(phrase, profile, tonic_k)):
+            if cand_opt_p != int(n.pitch):
+                n.pitch = cand_opt_p
+
+
 def regulate_singing_notes_for_score(
     notes: list,
     bpm: float,
@@ -231,6 +306,34 @@ def regulate_singing_notes_for_score(
 
     wb_set = sorted(set(float(w) for w in (word_boundaries_sec or []) if math.isfinite(w))) if word_boundaries_sec else []
 
+    # Robust articulation-tempo statistics of the singer (medians are insensitive
+    # to the very micro-glitches we are about to merge). Inside the reference
+    # band the scales are exactly 1.0, so standard inputs keep the original
+    # time constants; only unusually fast/slow articulation rescales them.
+    durs_sorted = sorted(float(n.raw_duration) for n in filtered)
+    median_dur = durs_sorted[len(durs_sorted) // 2] if len(durs_sorted) % 2 else \
+        0.5 * (durs_sorted[len(durs_sorted) // 2 - 1] + durs_sorted[len(durs_sorted) // 2])
+    gaps_pos = sorted(g for g in (b.raw_start - (a.raw_start + a.raw_duration)
+                                  for a, b in zip(filtered, filtered[1:])) if g > 0.0)
+    if gaps_pos:
+        median_gap = gaps_pos[len(gaps_pos) // 2] if len(gaps_pos) % 2 else \
+            0.5 * (gaps_pos[len(gaps_pos) // 2 - 1] + gaps_pos[len(gaps_pos) // 2])
+    else:
+        median_gap = 0.0
+    DUR_BAND_LO, DUR_BAND_HI = 0.15, 0.60
+    if median_dur < DUR_BAND_LO:
+        dur_scale = max(0.6, median_dur / DUR_BAND_LO)
+    elif median_dur > DUR_BAND_HI:
+        dur_scale = min(1.5, median_dur / DUR_BAND_HI)
+    else:
+        dur_scale = 1.0
+    GAP_BAND_HI = 0.25
+    gap_scale = min(1.4, median_gap / GAP_BAND_HI) if median_gap > GAP_BAND_HI else 1.0
+    merge_gap_tau = 0.05 * dur_scale * gap_scale
+    merge_max_prev_dur = 0.16 * dur_scale
+    scoop_gap_tau = 0.07 * dur_scale * gap_scale
+    scoop_max_prev_dur = 0.21 * dur_scale
+
     merged: list = []
     for n in filtered:
         if merged:
@@ -242,12 +345,15 @@ def regulate_singing_notes_for_score(
             dur_ratio = min(prev.raw_duration, n.raw_duration) / max(prev.raw_duration, n.raw_duration, 1e-6)
             has_wb = _has_wb_between(prev, n, wb_set)
 
-            log_odds = -2.0 * max(0.0, gap_t) / 0.05 - 1.5 * dp + 1.2 * dur_ratio + 0.8 * (prev_conf + cur_conf) - 1.5
+            # Uncalibrated linear affinity (not a probability): > 0 favours merging.
+            merge_affinity = (-2.0 * max(0.0, gap_t) / merge_gap_tau - 1.5 * dp + 1.2 * dur_ratio
+                              + 0.8 * (prev_conf + cur_conf) - 1.5)
             if has_wb:
-                log_odds -= 3.0
+                merge_affinity -= 3.0
 
             if (not getattr(prev, 'edited', False) and not getattr(n, 'edited', False)
-                    and not has_wb and dp <= 1 and log_odds > 0.0 and prev.raw_duration < 0.16):
+                    and not has_wb and dp <= 1 and merge_affinity > 0.0
+                    and prev.raw_duration < merge_max_prev_dur):
                 prev_dur = prev.raw_duration
                 prev.raw_duration = (n.raw_start + n.raw_duration) - prev.raw_start
                 if n.raw_duration > prev_dur:
@@ -267,18 +373,19 @@ def regulate_singing_notes_for_score(
             cur_conf = max(0.35, float(getattr(cur, 'confidence', 1.0)))
             has_wb = _has_wb_between(prev, cur, wb_set)
 
-            scoop_log_odds = (-2.0 * max(0.0, gap_t) / 0.07
+            # Uncalibrated linear affinity (not a probability): > 0 favours absorbing the scoop.
+            scoop_affinity = (-2.0 * max(0.0, gap_t) / scoop_gap_tau
                               + 1.5 * (cur.raw_duration / max(prev.raw_duration, 1e-6) - 1.0)
                               + 0.8 * (cur_conf - prev_conf)
                               - 0.5 * max(0, dp - 1))
             if has_wb:
-                scoop_log_odds -= 3.0
+                scoop_affinity -= 3.0
 
             if (not getattr(prev, 'edited', False) and not getattr(cur, 'edited', False)
                     and not has_wb and 1 <= dp <= 3
-                    and prev.raw_duration < 0.21 and gap_t < 0.07
+                    and prev.raw_duration < scoop_max_prev_dur and gap_t < scoop_gap_tau
                     and cur.raw_duration >= prev.raw_duration * 1.35
-                    and scoop_log_odds > 0.0):
+                    and scoop_affinity > 0.0):
                 old_end = cur.raw_start + cur.raw_duration
                 cur.raw_start = prev.raw_start
                 cur.raw_duration = old_end - cur.raw_start
@@ -416,36 +523,7 @@ def regulate_singing_notes_for_score(
     if len(result) >= 4:
         key_info = estimate_key_albrecht_shanahan(result)
         if key_info['confidence'] >= 0.45:
-            profile = key_info['profile']
-            tonic_k = key_info['tonic_pc']
-            for i, n in enumerate(result):
-                if getattr(n, 'edited', False):
-                    continue
-                conf_i = max(0.35, float(getattr(n, 'confidence', 1.0)))
-                if n.duration > 0.8 or conf_i > 0.85:
-                    continue
-                p0 = int(n.pitch)
-                pc0 = p0 % 12
-                rel0 = (pc0 - tonic_k) % 12
-                if profile[rel0] > 0.05:
-                    continue
-                prev_p = int(result[i - 1].pitch) if i > 0 else p0
-                next_p = int(result[i + 1].pitch) if i + 1 < len(result) else p0
-                best_p, best_score = p0, -math.inf
-                lam = max(0.3, min(1.5, 1.0 - 0.8 * conf_i + 0.5 * (1.0 - n.duration)))
-                for candidate_p in (p0 - 1, p0, p0 + 1):
-                    if not 21 <= candidate_p <= 108:
-                        continue
-                    cp_rel = (candidate_p % 12 - tonic_k) % 12
-                    log_prior = math.log(max(1e-6, profile[cp_rel]))
-                    obs_score = -abs(candidate_p - p0) * (0.5 + 0.5 * conf_i)
-                    vl = -0.1 * (abs(candidate_p - prev_p) + abs(candidate_p - next_p))
-                    score = obs_score + lam * log_prior + vl
-                    if score > best_score:
-                        best_score = score
-                        best_p = candidate_p
-                if best_p != p0:
-                    n.pitch = best_p
+            _viterbi_regularize_pitch_phrases(result, key_info['profile'], key_info['tonic_pc'], spb)
 
     max_beats = None
     if clip_duration > 0.0 and clip_duration > beat_origin:

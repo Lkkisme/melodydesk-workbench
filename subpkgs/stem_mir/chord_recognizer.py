@@ -1,31 +1,67 @@
-"""Pure Vocal-Melody-Conditioned Functional Harmony & Vocal Dynamics Generator.
+"""Vocal-melody-conditioned functional harmony and vocal dynamics generator.
 
-Driven by the singer's vocal melody notes, phrase cadences, and vocal register/density dynamics (returning N.C. and 0.0 dynamics when notes is empty).
+Chords are decoded per bar with a Dirichlet-smoothed functional Markov chain and
+a Tonal Interval Space (TIS) Viterbi harmonizer, driven only by the singer's
+vocal melody notes, phrase cadences, and vocal register/density dynamics
+(returning N.C. and 0.0 dynamics when notes is empty).
 Zero accompaniment audio or background CQT is ever read or used.
+
+Transition model
+----------------
+The 7x7 functional-degree pseudo-count tables below are hand-specified expert
+priors (they are NOT fitted to Hooktheory or any other corpus). Each row is
+Dirichlet-smoothed with a symmetric concentration ``_DIRICHLET_ALPHA`` and
+row-normalized into a proper stochastic matrix (``sum_j P_ij = 1``, ``P_ij > 0``).
+The additive Viterbi transition weight is the scaled log-likelihood ratio
+against a uniform chain, ``c * log(P_ij / (1/K))``, so a transition that is more
+likely than chance scores > 0 and a less likely one scores < 0.
 """
 from __future__ import annotations
 import math
 import numpy as np
 
-MAJOR_TRANS_MATRIX = np.array([
-    [-0.04, 0.08, 0.04, 0.14, 0.14, 0.10, 0.04],
-    [ 0.04,-0.06, 0.02, 0.06, 0.16, 0.04, 0.02],
-    [ 0.02, 0.06,-0.06, 0.10, 0.04, 0.12, 0.02],
-    [ 0.12, 0.06, 0.02,-0.04, 0.14, 0.06, 0.02],
-    [ 0.18, 0.02, 0.02, 0.06,-0.06, 0.12, 0.02],
-    [ 0.04, 0.10, 0.06, 0.12, 0.08,-0.06, 0.02],
-    [ 0.10, 0.02, 0.02, 0.08, 0.06, 0.04,-0.04],
-])
+_DIRICHLET_ALPHA = 1.0
+_TRANS_LOG_SCALE = 0.06
 
-MINOR_TRANS_MATRIX = np.array([
-    [-0.04, 0.08, 0.12, 0.06, 0.06, 0.12, 0.04],
-    [ 0.06,-0.06, 0.08, 0.04, 0.06, 0.08, 0.02],
-    [ 0.08, 0.06,-0.04, 0.10, 0.06, 0.08, 0.10],
-    [ 0.10, 0.06, 0.06,-0.06, 0.08, 0.06, 0.04],
-    [ 0.06, 0.08, 0.08, 0.06,-0.04, 0.10, 0.06],
-    [ 0.12, 0.08, 0.06, 0.04, 0.06,-0.04, 0.04],
-    [ 0.16, 0.04, 0.04, 0.02, 0.08, 0.04,-0.06],
-])
+# Degree order (major): I, ii, iii, IV, V, vi, bVII.
+_MAJOR_TRANS_COUNTS = np.array([
+    [  2,  21,  10,  59,  59,  30,  10],
+    [ 15,   2,  10,  21, 116,  15,  10],
+    [ 10,  21,   2,  42,  15,  59,  10],
+    [ 42,  15,   7,   2,  59,  15,   7],
+    [163,  10,  10,  21,   2,  59,  10],
+    [ 15,  42,  21,  59,  30,   2,  10],
+    [ 30,   7,   7,  21,  15,  10,   2],
+], dtype=np.float64)
+
+# Degree order (minor): i, III, iv/IV, v, VI, VII, V.
+_MINOR_TRANS_COUNTS = np.array([
+    [  2,  21,  42,  15,  15,  42,  10],
+    [ 21,   2,  30,  15,  21,  30,  10],
+    [ 21,  15,   2,  30,  15,  21,  30],
+    [ 42,  21,  21,   2,  30,  21,  15],
+    [ 15,  21,  21,  15,   2,  30,  15],
+    [ 42,  21,  15,  10,  15,   2,  10],
+    [116,  15,  15,  10,  30,  15,   2],
+], dtype=np.float64)
+
+
+def _dirichlet_row_normalize(counts: np.ndarray, alpha: float = _DIRICHLET_ALPHA) -> np.ndarray:
+    """Posterior-mean transition matrix: P_ij = (n_ij + alpha) / sum_k (n_ik + alpha)."""
+    smoothed = np.asarray(counts, dtype=np.float64) + float(alpha)
+    return smoothed / smoothed.sum(axis=1, keepdims=True)
+
+
+def _log_likelihood_ratio(probs: np.ndarray, scale: float = _TRANS_LOG_SCALE) -> np.ndarray:
+    """Scaled log-likelihood ratio c * log(P_ij / P_uniform) of each transition."""
+    p_uniform = 1.0 / probs.shape[1]
+    return scale * np.log(probs / p_uniform)
+
+
+MAJOR_TRANS_PROBS = _dirichlet_row_normalize(_MAJOR_TRANS_COUNTS)
+MINOR_TRANS_PROBS = _dirichlet_row_normalize(_MINOR_TRANS_COUNTS)
+MAJOR_TRANS_MATRIX = _log_likelihood_ratio(MAJOR_TRANS_PROBS)
+MINOR_TRANS_MATRIX = _log_likelihood_ratio(MINOR_TRANS_PROBS)
 
 
 def _timing(bpm: float, beat_origin: float, meter: str) -> tuple[float, float, float]:
@@ -75,17 +111,20 @@ def _gttm_note_salience(rel_onset_beats: float, overlap_beats: float, measure_be
             grid.append((q * sub_unit, 1.05))
         for q in range(num_m * 2):
             grid.append((q * sub_unit * 0.5, 0.85))
-    best = 0.85
+    # Circular (von Mises) metrical kernel: the phase coherence term
+    # cos(2*pi*(rel_onset - pos) / measure) makes salience smooth and periodic in
+    # the bar; kappa is matched so the kernel equals a Gaussian of width sigma
+    # near each grid position.
+    period = measure_beats if measure_beats > 0 else 4.0
+    kappa = (period / (2.0 * math.pi * sigma)) ** 2
+    max_salience = 0.85
     for pos, weight in grid:
-        dist = abs(rel_onset_beats - pos)
-        if dist > measure_beats / 2:
-            dist = measure_beats - dist
-        gauss = math.exp(-0.5 * (dist / sigma) ** 2)
-        val = weight * gauss
-        if val > best:
-            best = val
+        phase_coherence = math.cos(2.0 * math.pi * (rel_onset_beats - pos) / period)
+        val = weight * math.exp(kappa * (phase_coherence - 1.0))
+        if val > max_salience:
+            max_salience = val
     dur_factor = min(1.45, max(0.35, 0.40 + 0.65 * math.log(1 + 2.2 * overlap_beats)))
-    return best * dur_factor
+    return max_salience * dur_factor
 
 
 _W_TIS = np.array([2.0, 11.0, 17.0, 16.0, 19.0, 7.0], dtype=np.float64)
@@ -131,13 +170,17 @@ def synthesize_melody_conditioned_harmony(
     clip_duration: float = 0.0,
     bar_start_seconds: list[float] | None = None,
 ) -> dict:
-    """Pure Vocal-Melody-Conditioned Functional Harmony & Dynamics Engine.
+    """Dirichlet-Smoothed Functional Markov & Tonal Interval Space (TIS) Viterbi Harmonizer.
 
     Scores diatonic, modal, and secondary-dominant guitar chords per bar from the
-    singer's vocal melody notes (`notes`), resolves harmonic progressions via functional
-    Hooktheory-grounded Viterbi decoding with GTTM metrical salience and TIV emission,
-    and derives per-bar guitar dynamics (`bar_dynamics`) from the singer's vocal note
-    density and pitch register.
+    singer's vocal melody notes (`notes`). Each bar's emission combines weighted
+    pitch-class coverage with the cosine similarity of 6-coefficient Tonal Interval
+    Vectors (bar chroma vs. chord template), using GTTM-style circular metrical
+    salience as note weights. Progressions are decoded by Viterbi over the
+    log-likelihood-ratio transitions of row-normalized, Dirichlet-smoothed
+    functional Markov matrices (``MAJOR_TRANS_PROBS`` / ``MINOR_TRANS_PROBS``,
+    hand-specified priors, not corpus-fitted). Per-bar guitar dynamics
+    (`bar_dynamics`) are derived from the singer's vocal note density and register.
     """
     NAMES = "C C# D D# E F F# G G# A A# B".split()
     if not isinstance(tonic, str):

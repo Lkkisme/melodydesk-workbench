@@ -1,6 +1,7 @@
-"""Extended & Slash Chord Parser, CAGED/Open/Shell Voicing Generator, Biomechanical Ergonomic Energy, and Soprano Voice-Leading Viterbi DP."""
+"""Extended & Slash Chord Parser, CAGED/Open/Shell Voicing Generator, Millimetre Scale-Length Fret Geometry with Anatomical 4-Finger Strain, and Soprano Voice-Leading Viterbi DP."""
 from __future__ import annotations
 
+import math
 import re
 from functools import lru_cache
 
@@ -66,7 +67,7 @@ def _required(parsed):
         required.discard((parsed['root'] + 2) % 12)
     bass_set = {parsed['bass_pc']}
     if len(required | bass_set) > 4:
-        for drop_iv in (14, 13, 15, 17, 16, 18, 20, 21, 9, 6, 8, 2, 5, 4, 3):
+        for drop_iv in (14, 13, 15, 17, 18, 20, 21, 9, 6, 8, 2, 5, 4, 3):
             if len(required | bass_set) <= 4:
                 break
             pc_drop = (parsed['root'] + drop_iv) % 12
@@ -140,41 +141,178 @@ def _internal_mutes(frets):
     return sum(1 for f in frets[lo:hi+1] if f < 0)
 
 
+# --- Physical fretboard geometry (steel-string dreadnought reference) ---------------------------
+SCALE_LENGTH_MM = 648.0          # nut-to-saddle scale length L
+STRING_SPACING_NUT_MM = 7.2      # centre-to-centre string pitch at the nut (≈43 mm nut width)
+STRING_SPACING_SADDLE_MM = 10.5  # centre-to-centre string pitch at the saddle
+# Comfortable fingertip-to-fingertip reach per anatomical finger pair (1=index, 2=middle, 3=ring, 4=pinky).
+FINGER_PAIR_COMFORT_MM = {
+    (1, 2): 38.0, (2, 3): 32.0, (3, 4): 28.0, (1, 4): 85.0,
+    (1, 3): 62.0, (2, 4): 52.0,
+}
+_SPAN_REFERENCE_MM = 32.0        # ≈ one first-position fret width; normalises hand-span energy
+
+
+def _fret_position_mm(fret: float, capo: int = 0) -> float:
+    """Distance from the nut (mm) of the fret wire for `fret` frets above the capo: x(f) = L(1 - 2^(-(f+capo)/12))."""
+    return SCALE_LENGTH_MM * (1.0 - 2.0 ** (-(fret + capo) / 12.0))
+
+
+def _fingertip_position_mm(fret: int, capo: int) -> float:
+    """Fingertip contact point: just behind the fret wire (≈35% of the way back into the fret slot)."""
+    if fret <= 0:
+        return _fret_position_mm(0, capo)
+    wire = _fret_position_mm(fret, capo)
+    previous_wire = _fret_position_mm(fret - 1, capo)
+    return wire - 0.35 * (wire - previous_wire)
+
+
+def _string_spacing_mm(x_mm: float) -> float:
+    ratio = min(1.0, max(0.0, x_mm / SCALE_LENGTH_MM))
+    return STRING_SPACING_NUT_MM + (STRING_SPACING_SADDLE_MM - STRING_SPACING_NUT_MM) * ratio
+
+
+def _pair_strain_mm(assignment, capo):
+    """Sum of squared excess fingertip distance (mm) over each finger pair's comfortable reach.
+
+    Distance is Euclidean over longitudinal fret geometry and transverse string spacing; for a barre the
+    closest contact point is used.  A higher-numbered finger placed nearer the nut than a lower one is a
+    crossed-finger posture and pays a fixed penalty.
+    """
+    strain = 0.0
+    fingers = sorted(assignment)
+    for a_idx, da in enumerate(fingers):
+        for db in fingers[a_idx + 1:]:
+            comfort = FINGER_PAIR_COMFORT_MM[(da, db)]
+            dist, backward = float('inf'), False
+            for sa, fa in assignment[da]:
+                xa = _fingertip_position_mm(fa, capo)
+                for sb, fb in assignment[db]:
+                    xb = _fingertip_position_mm(fb, capo)
+                    longitudinal = xb - xa
+                    transverse = abs(sb - sa) * _string_spacing_mm(0.5 * (xa + xb))
+                    d = math.hypot(longitudinal, transverse)
+                    if d < dist:
+                        dist, backward = d, longitudinal < -1e-9
+            strain += 0.6 * (max(0.0, dist - comfort) / 10.0) ** 2
+            if backward:
+                strain += 1.0
+    return strain
+
+
+_PARTIAL_BARRE_MM_PENALTY = 0.15  # per extra string held by one non-index finger (mini-barre)
+
+
+def _barre_feasible(frets, strings, fret):
+    """One finger flattened across `strings` at `fret` must not cover a sounding string at a lower fret."""
+    lo, hi = min(strings), max(strings)
+    return all(frets[k] < 0 or frets[k] >= fret for k in range(lo, hi + 1))
+
+
+def _same_fret_groupings(notes):
+    """Yield partitions of (fret, string)-sorted notes into consecutive same-fret groups."""
+    if not notes:
+        yield []
+        return
+    fret = notes[0][0]
+    run = 1
+    while run < len(notes) and notes[run][0] == fret:
+        run += 1
+    for size in range(1, run + 1):
+        head = notes[:size]
+        for tail in _same_fret_groupings(notes[size:]):
+            yield [head] + tail
+
+
+@lru_cache(maxsize=8192)
+def _assign_fingers(frets: tuple, capo: int):
+    """Anatomical 4-finger assignment (1=index, 2=middle, 3=ring, 4=pinky).
+
+    Fretted notes are sorted by (fret, string_idx) and receive strictly increasing finger numbers, so the
+    index finger always takes the lowest fret (as a barre when it holds several strings).  Notes sharing a
+    fret may be held by one finger (full or partial barre) when no lower-fretted sounding string lies under
+    it.  Among all order-preserving assignments - including which fingers are skipped, e.g. index + ring
+    across a two-fret gap - the one with the least millimetre pair strain is chosen.
+    Returns (assignment: finger -> [(string_idx, fret)], overflow: notes no finger can take, strain).
+    """
+    from itertools import combinations
+    notes = sorted((f, i) for i, f in enumerate(frets) if f > 0)
+    if not notes:
+        return {}, 0, 0.0
+    chosen, chosen_strain = None, float('inf')
+    for groups in _same_fret_groupings(notes):
+        if len(groups) > 4:
+            continue
+        if any(len(g) > 1 and not _barre_feasible(frets, [i for _, i in g], g[0][0]) for g in groups):
+            continue
+        # Index finger is pinned to the lowest-fret group; the remaining groups choose from middle/ring/pinky.
+        for combo in combinations((2, 3, 4), len(groups) - 1):
+            assignment = {1: [(i, f) for f, i in groups[0]]}
+            for finger, group in zip(combo, groups[1:]):
+                assignment[finger] = [(i, f) for f, i in group]
+            strain = _pair_strain_mm(assignment, capo)
+            strain += sum(_PARTIAL_BARRE_MM_PENALTY * (len(g) - 1) for g in groups[1:])
+            if strain < chosen_strain:
+                chosen, chosen_strain = assignment, strain
+    if chosen is not None:
+        return chosen, 0, chosen_strain
+    # No four-finger solution: index takes the lowest fret, the next three notes take 2/3/4, the rest overflow.
+    min_f = notes[0][0]
+    assignment = {1: [(i, f) for f, i in notes if f == min_f]}
+    rest = [(f, i) for f, i in notes if f != min_f]
+    for finger, (fret, string_idx) in zip((2, 3, 4), rest):
+        assignment[finger] = [(string_idx, fret)]
+    return assignment, max(0, len(rest) - 3), _pair_strain_mm(assignment, capo)
+
+
+def _biomechanical_strain_mm(frets, capo):
+    """Millimetre-geometry strain energy of the fretting hand.
+
+    Fret positions follow x(f) = L(1 - 2^(-(f+capo)/12)) with L = 648 mm.  Returns
+    (hand_span_mm, span_energy, pair_strain, position_energy, overflow).
+    """
+    positive = [f for f in frets if f > 0]
+    if not positive:
+        return 0.0, 0.0, 0.0, 0.0, 0
+    xs = [_fingertip_position_mm(f, capo) for f in positive]
+    hand_span_mm = max(xs) - min(xs)
+    span_energy = 0.15 * (hand_span_mm / _SPAN_REFERENCE_MM) ** 2
+    # Arm reach / hand rotation away from the first position, in mm from the nut.
+    # 0.0075/mm ≈ 1.15 at the 5th fret and ≈ 2.3 at the 12th (body joint), preferring open-position resonance.
+    position_energy = 0.0075 * (sum(xs) / len(xs))
+    _, overflow, pair_strain = _assign_fingers(tuple(frets), capo)
+    return hand_span_mm, span_energy, pair_strain, position_energy, overflow
+
+
 def _ergonomic_voicing_cost(frets, parsed, capo):
+    """Total voicing cost = biomechanical millimetre strain energy + harmonic completeness + bass-root fidelity
+    + internal-mute / richness / string-crossing penalties.  Lower is better."""
     sounding = [i for i, f in enumerate(frets) if f >= 0]
     if not sounding:
         return 100.0
-    pitches = [STANDARD_TUNING[i] + capo + f for i in sounding for f in [frets[i]]]
+    pitches = [STANDARD_TUNING[i] + capo + frets[i] for i in sounding]
     pcs = {p % 12 for p in pitches}
-    bass_pc = parsed['bass_pc']
-    actual_bass_pc = pitches[0] % 12
-    bass_cost = 0.0 if actual_bass_pc == bass_pc else 3.0
+    # Harmonic: bass-root fidelity and chord-tone completeness.
+    bass_cost = 0.0 if pitches[0] % 12 == parsed['bass_pc'] else 3.0
     req = _required(parsed)
     non_fifth = set(parsed['pcs']) - ({(parsed['root'] + 7) % 12} if len(parsed['pcs']) >= 4 and 7 in parsed['intervals'] else set())
     completeness_cost = len(req - pcs) * 2.5 + len(non_fifth - pcs) * 1.5
+    # Texture: internal mutes (hard to damp cleanly) and thin voicings.
     interior = _internal_mutes(frets)
     mute_cost = interior * 2.0 if not (interior == 1 and parsed['bass']) else interior * 0.8
     richness_cost = max(0, 4 - len(sounding)) * 1.5
+    # Biomechanics: physical millimetre geometry with anatomical finger assignment.
+    _, span_energy, pair_strain, position_energy, overflow = _biomechanical_strain_mm(frets, capo)
     positive = [f for f in frets if f > 0]
+    barre_cost = 0.0
     if positive:
-        min_f, max_f = min(positive), max(positive)
-        span_cost = (max_f - min_f) ** 2 * 0.15
-        centroid = sum(positive) / len(positive)
-        centroid_cost = centroid * 0.18
-        barre_strings = sum(1 for f in frets if f == min_f and f > 0)
+        barre_strings = sum(1 for f in frets if f == min(positive))
         barre_cost = (barre_strings - 1) * 0.8 if barre_strings > 1 else 0.0
-        stretch_cost = 0.0
-        for i in range(len(frets) - 1):
-            if frets[i] > 0 and frets[i + 1] > 0 and abs(frets[i] - frets[i + 1]) >= 3:
-                stretch_cost += (abs(frets[i] - frets[i + 1]) - 2) * 0.5
-    else:
-        span_cost = centroid_cost = barre_cost = stretch_cost = 0.0
     fingers_cnt, is_barre = _fingers(frets)
-    fingers_cost = max(0, fingers_cnt - 3) * 1.5 + (0.35 if is_barre else 0.0)
-    pitches_act = [STANDARD_TUNING[i] + capo + f for i, f in enumerate(frets) if f >= 0]
-    cross_cost = sum(0.35 for a, b in zip(pitches_act, pitches_act[1:]) if b < a)
+    fingers_cost = max(0, fingers_cnt - 3) * 1.5 + (0.35 if is_barre else 0.0) + overflow * 4.0
+    cross_cost = sum(0.35 for a, b in zip(pitches, pitches[1:]) if b < a)
     return (bass_cost + completeness_cost + mute_cost + richness_cost
-            + span_cost + centroid_cost + barre_cost + stretch_cost + fingers_cost + cross_cost)
+            + span_energy + pair_strain + position_energy + barre_cost + fingers_cost + cross_cost)
 
 
 @lru_cache(maxsize=512)
@@ -413,7 +551,7 @@ def _optimize_candidates(layers):
 
 
 def optimize_voice_leading(chord_sequence: list[str], capo: int = 0) -> list[dict]:
-    """Select optimal fretboard voicing per chord via Viterbi dynamic programming over hand centroid shift, common-finger anchor retention, per-string movement, and soprano voice-leading continuity."""
+    """Select the minimum-cost fretboard voicing per chord via Viterbi dynamic programming over hand centroid shift, common-finger anchor retention, per-string movement, and soprano voice-leading continuity."""
     layers = []
     for index, chord in enumerate(chord_sequence):
         layer = generate_voicings(chord,capo)
