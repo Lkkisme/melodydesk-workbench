@@ -57,6 +57,7 @@ class Project:
     reference_notes: list = field(default_factory=list)
     lyrics: list = field(default_factory=list)
     bar_start_seconds: list = field(default_factory=list)
+    beat_times: list = field(default_factory=list)
 
     def validate(self):
         self.bpm = finite(self.bpm, '速度')
@@ -70,6 +71,14 @@ class Project:
             self.bar_start_seconds = [finite(x, '小节起点') for x in self.bar_start_seconds]
             if any(b <= a for a, b in zip(self.bar_start_seconds, self.bar_start_seconds[1:])):
                 raise ValueError('小节起点必须严格递增')
+        if self.beat_times is None:
+            self.beat_times = []
+        elif not isinstance(self.beat_times, (list, tuple)):
+            raise ValueError('拍点时间列表无效')
+        else:
+            self.beat_times = [finite(x, '拍点时间') for x in self.beat_times]
+            if any(b <= a for a, b in zip(self.beat_times, self.beat_times[1:])):
+                raise ValueError('拍点时间必须严格递增')
         if len(self.lyrics)>20000:
             raise ValueError('歌词过长')
         for line in self.lyrics:
@@ -109,13 +118,19 @@ class Project:
         if self.notes and self.notes[-1].start + self.notes[-1].duration > 14400:
             raise ValueError('乐谱长度过大')
 
+    MAX_PROJECT_BYTES = 64_000_000
+
     def save(self, path):
         self.validate()
-        Path(path).write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2), encoding='utf-8')
+        serialized = json.dumps(asdict(self), ensure_ascii=False, indent=2)
+        if len(serialized.encode('utf-8')) > self.MAX_PROJECT_BYTES:
+            raise ValueError('项目文件过大')
+        Path(path).write_text(serialized, encoding='utf-8')
 
     @classmethod
-    def load(cls, path):
-        if Path(path).stat().st_size > 10_000_000:
+    def load(cls, path, max_bytes=None):
+        limit = cls.MAX_PROJECT_BYTES if max_bytes is None else int(max_bytes)
+        if Path(path).stat().st_size > limit:
             raise ValueError('项目文件过大')
         data = json.loads(Path(path).read_text(encoding='utf-8'))
         if data.get('schema_version') != 1:
@@ -168,8 +183,11 @@ def performance_timing(notes, bpm, origin=0.0):
     return result
 
 
-def parse_jianpu(text, tonic='C', bpm=120):
+def parse_jianpu(text, tonic='C', bpm=120, origin=0.0):
     """Tokens: #4':0.5, 1:1, 0:1; apostrophe/comma denote octaves."""
+    origin = finite(origin, '拍点起点')
+    if origin < 0:
+        raise ValueError('拍点起点不能为负数')
     scale = [0, 2, 4, 5, 7, 9, 11]
     beat = 0.0
     notes = []
@@ -185,7 +203,7 @@ def parse_jianpu(text, tonic='C', bpm=120):
             pitch = 60 + NAMES.index(tonic) + scale[int(degree) - 1]
             pitch += 12 * (octave.count("'") - octave.count(','))
             pitch += 1 if accidental == '#' else -1 if accidental == 'b' else 0
-            note = Note(pitch, beat, duration, beat * 60 / bpm, duration * 60 / bpm, 1.0, True)
+            note = Note(pitch, beat, duration, origin + beat * 60 / bpm, duration * 60 / bpm, 1.0, True)
             note.validate()
             notes.append(note)
         elif accidental or octave:

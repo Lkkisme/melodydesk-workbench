@@ -79,6 +79,8 @@ def _cosine(a,b):
 
 def _pearson(x,y):
     """Mean-centered, variance-normalized Pearson correlation; 0 for flat inputs."""
+    if not x or not y or len(x)!=len(y):
+        return 0.0
     mx=sum(x)/len(x);my=sum(y)/len(y)
     dx=[v-mx for v in x];dy=[v-my for v in y]
     den=math.sqrt(sum(v*v for v in dx)*sum(v*v for v in dy))
@@ -139,7 +141,7 @@ def voicing(name,capo=0):
         return OPEN[shape][:]
     if isinstance(minor,str):
         from subpkgs.guitar_reharm.chord_voicing import generate_voicings
-        vs=generate_voicings(name,capo=capo) if '/' in minor else generate_voicings(shape,capo=0)
+        vs=generate_voicings(name,capo=capo)
         if vs:return list(vs[0]['frets'])
         raise ValueError(f'无法在当前把位生成可弹奏指型: {name}')
     root=(root-capo)%12
@@ -191,7 +193,7 @@ def _gttm_salience(rel_onset,overlap,measure,meter='4/4'):
             grid.append((measure*0.5,1.22))
         for q in range(1,num_m):grid.append((q*sub_u,1.05))
         for q in range(num_m*2):grid.append((q*sub_u*0.5,0.85))
-    max_salience=0.85
+    max_salience=0.70
     for pos,w in grid:
         d=abs(rel_onset-pos)
         if d>measure/2:d=measure-d
@@ -200,6 +202,25 @@ def _gttm_salience(rel_onset,overlap,measure,meter='4/4'):
         if v>max_salience:max_salience=v
     dur_f=min(1.45,max(0.35,0.40+0.65*math.log(1+2.2*overlap)))
     return max_salience*dur_f
+
+
+def _bt_sec_to_beat(sec,bt,spb):
+    if sec<=bt[0]:
+        return (sec-bt[0])/spb
+    for k in range(len(bt)-1):
+        if sec<=bt[k+1]:
+            return k+(sec-bt[k])/max(1e-6,bt[k+1]-bt[k])
+    return (len(bt)-1)+(sec-bt[-1])/spb
+
+
+def _bt_beat_to_sec(b_pos,bt,spb):
+    if b_pos<=0:
+        return bt[0]+b_pos*spb
+    n_seg=len(bt)-1
+    if b_pos<=n_seg:
+        k=min(n_seg-1,int(b_pos))
+        return bt[k]+(b_pos-k)*(bt[k+1]-bt[k])
+    return bt[-1]+(b_pos-n_seg)*spb
 
 
 def suggest(project,root=None,minor=False):
@@ -215,11 +236,17 @@ def suggest(project,root=None,minor=False):
     elif isinstance(root,bool) or not isinstance(root,int) or not 0<=root<12:
         raise ValueError('无效的主音或调号')
     measure=int(project.meter.split('/')[0])*4/int(project.meter.split('/')[1])
+    spb=60/project.bpm
     note_count=math.ceil(max((n.start+n.duration for n in project.notes),default=0)/measure)
     bs=getattr(project,'bar_start_seconds',None)
+    raw_bt=getattr(project,'beat_times',None)
+    bt=[float(x) for x in raw_bt] if (raw_bt is not None and len(raw_bt)>=2) else None
     if bs is not None and len(bs)>=2:
         clip_extra=math.ceil(max(0.0,project.clip_duration-bs[-1])*project.bpm/60/measure) if project.source else 0
         count=max(note_count,(len(bs)-1)+clip_extra)
+    elif bt is not None and project.source:
+        clip_beats=max(0.0,_bt_sec_to_beat(project.clip_duration,bt,spb)-_bt_sec_to_beat(project.beat_origin,bt,spb))
+        count=max(note_count,math.ceil(clip_beats/measure))
     elif project.source:
         count=max(note_count,math.ceil((project.clip_duration-project.beat_origin)*project.bpm/60/measure))
     else:
@@ -259,7 +286,8 @@ def suggest(project,root=None,minor=False):
             if 7 in bpcs and 7 not in rel_s:
                 if 6 in rel_s and 6 not in bpcs:mods.append('b5');bpcs.discard(7);bpcs.add(6)
                 elif 8 in rel_s and 8 not in bpcs:mods.append('#5');bpcs.discard(7);bpcs.add(8)
-                else:mods.append('no5');bpcs.discard(7)
+                elif 10 in rel_s or 11 in rel_s or len(b_pcs)>=4:mods.append('no5');bpcs.discard(7)
+                else:continue
             has_7=(10 in rel_s or 11 in rel_s)
             for p_rel in sorted(rel_s-bpcs):
                 if p_rel==1:mods.append('b9' if has_7 else 'addb9')
@@ -334,12 +362,18 @@ def arrange(project,chords,style='分解和弦',capo=0):
             or isinstance(capo,bool) or not isinstance(capo,int) or not 0<=capo<=7):
         raise ValueError('编配风格或变调夹位置无效')
     measure=int(project.meter.split('/')[0])*4/int(project.meter.split('/')[1])
+    spb=60/project.bpm
     note_count=math.ceil(max((n.start+n.duration for n in project.notes),default=0)/measure)
     bs=getattr(project,'bar_start_seconds',None)
+    raw_bt=getattr(project,'beat_times',None)
+    bt=[float(x) for x in raw_bt] if (raw_bt is not None and len(raw_bt)>=2) else None
     if bs is not None and len(bs)>=2:
         clip_extra=math.ceil(max(0.0,project.clip_duration-bs[-1])*project.bpm/60/measure)
         min_count=max(note_count,(len(bs)-1)+(clip_extra if project.source else 0))
         max_count=max(min_count,(len(bs)-1)+clip_extra)
+    elif bt is not None and project.source:
+        clip_beats=max(0.0,_bt_sec_to_beat(project.clip_duration,bt,spb)-_bt_sec_to_beat(project.beat_origin,bt,spb))
+        min_count=max_count=max(note_count,math.ceil(clip_beats/measure))
     elif project.source:
         min_count=max_count=max(note_count,math.ceil((project.clip_duration-project.beat_origin)*project.bpm/60/measure))
     else:
@@ -357,7 +391,10 @@ def arrange(project,chords,style='分解和弦',capo=0):
             if not active:
                 slots.append([]);continue
             if style in _arpeggio_styles:
-                order=[active[0],active[-3],active[-2],active[-1],active[-2],active[-3],active[-2],active[-1]]
+                s_lo=active[max(0,len(active)-3)]
+                s_mid=active[max(0,len(active)-2)]
+                s_hi=active[-1]
+                order=[active[0],s_lo,s_mid,s_hi,s_mid,s_lo,s_mid,s_hi]
                 strings=[order[step%len(order)]]
                 direction=''
             elif style in _groove_styles:
@@ -391,23 +428,32 @@ def arrange(project,chords,style='分解和弦',capo=0):
     return {'title':project.title,'bpm':project.bpm,'meter':project.meter,'capo':capo,'style':style,'bars':bars,'events':events,
             'measure':measure,'tonic':project.tonic,'beat_origin':project.beat_origin,
             'bar_start_seconds':([float(x) for x in bs]+[float(bs[-1])+(k+1)*measure*60/project.bpm for k in range(max(0,len(chords)-(len(bs)-1)))]) if (bs is not None and len(bs)>=2) else None,
+            'beat_times':bt,
             'melody':[asdict(n) for n in project.notes],'lyrics':copy.deepcopy(project.lyrics),
             'warning':'旋律条件下的编配草稿，不是原曲和弦识别。每小节一个和弦；请确认调性、拍点和和弦。'}
 
 
 def midi(project,arrangement):
+    project.validate()
     ticks=480
     tracks=[]
     numerator,denominator=map(int,project.meter.split('/'))
     measure=numerator*4/denominator
     spb=60/project.bpm
+    raw_bt=arrangement.get('beat_times') if isinstance(arrangement,dict) else None
+    if not raw_bt:
+        raw_bt=getattr(project,'beat_times',None)
+    bt=[float(x) for x in raw_bt] if (raw_bt is not None and len(raw_bt)>=2) else None
     raw_bs=arrangement.get('bar_start_seconds') if isinstance(arrangement,dict) else None
     if not raw_bs:
         raw_bs=getattr(project,'bar_start_seconds',None)
     bs=[float(x) for x in raw_bs] if (raw_bs is not None and len(raw_bs)>=2) else None
     eff_origin=float(project.beat_origin)
-    lead_sec=max(0.0,bs[0]) if bs else max(0.0,eff_origin)
+    bt_origin_beat=_bt_sec_to_beat(eff_origin,bt,spb) if bt else 0.0
+    lead_sec=max(0.0,_bt_beat_to_sec(bt_origin_beat,bt,spb)) if bt else (max(0.0,bs[0]) if bs else max(0.0,eff_origin))
     def _sec_to_beat(sec):
+        if bt:
+            return _bt_sec_to_beat(sec,bt,spb)-bt_origin_beat
         if not bs:
             return (sec-eff_origin)/spb
         if sec<=bs[0]:
@@ -416,11 +462,18 @@ def midi(project,arrangement):
             if sec<=bs[k+1]:
                 return (k+(sec-bs[k])/max(1e-6,bs[k+1]-bs[k]))*measure
         return (len(bs)-1)*measure+(sec-bs[-1])/spb
-    beat_shift=(-_sec_to_beat(0.0)) if (bs and bs[0]<0) else ((eff_origin/spb) if (not bs and eff_origin<0) else 0.0)
+    if bt:
+        beat_shift=(-_sec_to_beat(0.0)) if _bt_beat_to_sec(bt_origin_beat,bt,spb)<0 else 0.0
+    else:
+        beat_shift=(-_sec_to_beat(0.0)) if (bs and bs[0]<0) else ((eff_origin/spb) if (not bs and eff_origin<0) else 0.0)
     end_beats=max([n.start+n.duration for n in project.notes]+[n['start']+n['duration'] for n in arrangement['events']]+[len(arrangement.get('bars',[]))*measure],default=0.0)
     if project.source:
         end_beats=max(end_beats,max(0.0,_sec_to_beat(project.clip_duration)))
-    if bs:
+    if bt:
+        for k in range(len(bt)-1):
+            if round((bt[k+1]-bt[k])*1_000_000)>16_777_215:
+                raise ValueError('小节速度超出有效范围')
+    elif bs:
         for b_idx in range(len(bs)-1):
             if round((bs[b_idx+1]-bs[b_idx])*1_000_000/measure)>16_777_215:
                 raise ValueError('小节速度超出有效范围')
@@ -433,7 +486,24 @@ def midi(project,arrangement):
         tick_offset=round(lead_beats*ticks)
     else:
         tick_offset=0
-    if bs:
+    if bt:
+        if -bt_origin_beat+beat_shift>1e-6:
+            nom_us=max(1,min(16_777_215,round(60_000_000/project.bpm)))
+            header.append((tick_offset,0,b'\xff\x51\x03'+nom_us.to_bytes(3,'big')))
+        for k in range(len(bt)-1):
+            b_rel=(k-bt_origin_beat)+beat_shift
+            if b_rel+1.0<=1e-6:
+                continue
+            beat_sec=max(1e-4,bt[k+1]-bt[k])
+            us_per_beat=max(1,min(16_777_215,round(beat_sec*1_000_000)))
+            t_pos=tick_offset+round(max(0.0,b_rel)*ticks)
+            header.append((t_pos,0,b'\xff\x51\x03'+us_per_beat.to_bytes(3,'big')))
+        tail_beat=(len(bt)-1)-bt_origin_beat
+        if end_beats>tail_beat:
+            nom_us=max(1,min(16_777_215,round(60_000_000/project.bpm)))
+            t_pos=tick_offset+round(max(0.0,tail_beat+beat_shift)*ticks)
+            header.append((t_pos,0,b'\xff\x51\x03'+nom_us.to_bytes(3,'big')))
+    elif bs:
         for b_idx in range(len(bs)-1):
             if (b_idx+1)*measure+beat_shift<=1e-6:
                 continue
@@ -468,15 +538,23 @@ def midi(project,arrangement):
 
 
 def render_audio(project,arrangement,path,with_melody=True):
+    project.validate()
     import numpy as np
     sr=22050;spb=60/project.bpm
     measure=float(arrangement.get('measure',int(project.meter.split('/')[0])*4/int(project.meter.split('/')[1])))
+    raw_bt=arrangement.get('beat_times') if isinstance(arrangement,dict) else None
+    if not raw_bt:
+        raw_bt=getattr(project,'beat_times',None)
+    bt=[float(x) for x in raw_bt] if (raw_bt is not None and len(raw_bt)>=2) else None
     raw_bs=arrangement.get('bar_start_seconds') if isinstance(arrangement,dict) else None
     if not raw_bs:
         raw_bs=getattr(project,'bar_start_seconds',None)
     bs=[float(x) for x in raw_bs] if (raw_bs is not None and len(raw_bs)>=2) else None
     eff_origin=float(project.beat_origin)
+    bt_origin_beat=_bt_sec_to_beat(eff_origin,bt,spb) if bt else 0.0
     def _beat_to_sec(b_pos):
+        if bt:
+            return _bt_beat_to_sec(b_pos+bt_origin_beat,bt,spb)
         if not bs:
             return eff_origin+b_pos*spb
         n_bars=len(bs)-1

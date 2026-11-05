@@ -30,6 +30,7 @@ FG = '#eaf0f8'
 MUTED = '#9cacc2'
 ACCENT = '#60dbc0'
 AMBER = '#f6c177'
+CONFIDENCE_THRESHOLD = 0.7
 
 
 class App(tk.Tk):
@@ -42,14 +43,21 @@ class App(tk.Tk):
         self.project = Project()
         self.source = ''
         self.source_duration = 0
+        self.source_probed = False
+        self.clip_end = 0
         self.events = queue.Queue()
         self.cancel = threading.Event()
         self.busy = False
+        self.active_job_kind = None
+        self.job_token = 0
+        self._destroyed = False
         self.dirty = False
         self.undo_stack = []
         self.play_started = None
         self.play_duration = 0
         self.play_kind = 'grid'
+        self.play_pending = False
+        self.play_token = 0
         self.pending_probe = 0
         self.pending_close = False
         self.status = tk.StringVar(value='导入一首歌曲，或切换到「手动简谱」。')
@@ -252,6 +260,13 @@ class App(tk.Tk):
 
     def _job(self, worker, kind):
         self.busy = True
+        self.active_job_kind = kind
+        self.job_token = getattr(self, 'job_token', 0) + 1
+        my_job_token = self.job_token
+        if kind == 'play':
+            self.play_token = getattr(self, 'play_token', 0) + 1
+            self.play_pending = True
+        my_play_token = getattr(self, 'play_token', 0)
         self.cancel.clear()
         self.extract_button.configure(state='disabled')
         self.choose_button.configure(state='disabled')
@@ -259,91 +274,130 @@ class App(tk.Tk):
         def task():
             try:
                 result = worker()
-                self.events.put((kind, result))
+                if my_job_token != getattr(self, 'job_token', 0):
+                    return
+                if kind == 'play':
+                    if my_play_token != getattr(self, 'play_token', 0):
+                        return
+                    if isinstance(result, tuple) and len(result) == 3:
+                        result = (*result, my_play_token)
+                self.events.put((kind, result, my_job_token))
             except engine.Cancelled:
-                self.events.put(('cancelled', None))
+                if my_job_token == getattr(self, 'job_token', 0):
+                    self.events.put(('cancelled', None, my_job_token))
             except Exception as exc:
                 engine.WORK.mkdir(parents=True, exist_ok=True)
                 (engine.WORK / 'last-error.log').write_text(traceback.format_exc(), encoding='utf-8')
-                self.events.put(('error', str(exc)))
+                if my_job_token == getattr(self, 'job_token', 0):
+                    self.events.put(('error', str(exc), my_job_token))
         threading.Thread(target=task, daemon=True).start()
 
     def _poll(self):
         try:
-            while True:
-                kind, value = self.events.get_nowait()
-                if kind == 'progress':
-                    self.progress['value'], text = value
-                    self.status.set(text)
-                    continue
-                self.busy = False
-                if self.pending_close:
-                    self.stop()
-                    self.destroy()
-                    return
-                self.extract_button.configure(state='normal')
-                self.choose_button.configure(state='normal')
-                self.cancel_button.configure(state='disabled')
-                if kind == 'result':
-                    self.set_project(value)
-                    self.dirty = True
-                    self.status.set('提取完成。拍号与调号仍需确认；橙色音符建议优先试听检查。')
-                elif kind == 'probe':
-                    path, length = value
-                    self.source = path
-                    self.source_duration = length
-                    self.filename.set(f'{Path(path).name}  ·  {int(length // 60):02}:{int(length % 60):02}')
-                    self.start.set('0')
-                    self.duration.set(str(round(min(30, length), 2)))
-                    self.status.set('歌曲已加载。选择主唱清楚的片段，然后开始提取。')
-                elif kind == 'guitar':
-                    self.status.set('吉他草稿已导出：' + str(value))
-                    try:
-                        os.startfile(str(value))
-                    except OSError:
-                        messagebox.showinfo('吉他谱已保存', str(value), parent=self)
-                elif kind == 'lyrics':
-                    self.remember()
-                    self.project.lyrics=value
-                    self.project.validate()
-                    self.status.set(f'识别得到 {len(value)} 段歌词，需人工校对。请打开「歌词」修改。')
-                elif kind == 'play':
-                    path, duration, mode = value
-                    flags = winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT
-                    if mode == 'loop':
-                        flags |= winsound.SND_LOOP
-                    self.looping = mode == 'loop'
-                    winsound.PlaySound(str(path), flags)
-                    self.play_started = time.monotonic()
-                    self.play_duration = duration
-                    self.play_kind = mode
-                    self.status.set('正在循环选中谱面，点击「停止」结束。' if mode == 'loop' else '正在试听；「原曲＋旋律」使用原始演唱时间对齐。')
-                elif kind == 'error':
-                    self.status.set('处理未完成，可重试或更换片段。')
-                    messagebox.showerror('处理失败', value, parent=self)
-                elif kind == 'cancelled':
-                    self.progress['value'] = 0
-                    self.status.set('已取消，原有旋律保留。')
-        except queue.Empty:
-            pass
-        if self.play_started is not None:
-            elapsed = time.monotonic() - self.play_started
-            if elapsed >= self.play_duration:
-                if self.looping:
-                    self.play_started = time.monotonic()
+            try:
+                while True:
+                    item = self.events.get_nowait()
+                    if isinstance(item, tuple) and len(item) == 3:
+                        kind, value, event_job_token = item
+                        if event_job_token != getattr(self, 'job_token', 0):
+                            continue
+                    else:
+                        kind, value = item
+                    if kind == 'progress':
+                        self.progress['value'], text = value
+                        self.status.set(text)
+                        continue
+                    if kind == 'play':
+                        if isinstance(value, tuple) and len(value) == 4:
+                            path, duration, mode, event_token = value
+                            if event_token != getattr(self, 'play_token', 0) or not getattr(self, 'play_pending', False):
+                                continue
+                        else:
+                            if not getattr(self, 'play_pending', False):
+                                continue
+                            path, duration, mode = value
+                    self.busy = False
+                    self.active_job_kind = None
+                    if self.pending_close:
+                        self.stop()
+                        self.destroy()
+                        return
+                    self.extract_button.configure(state='normal')
+                    self.choose_button.configure(state='normal')
+                    self.cancel_button.configure(state='disabled')
+                    if kind == 'result':
+                        self.set_project(value)
+                        self.dirty = True
+                        self.status.set('提取完成。拍号与调号仍需确认；橙色音符建议优先试听检查。')
+                    elif kind == 'probe':
+                        path, length = value
+                        self.source = path
+                        self.source_duration = length
+                        self.source_probed = True
+                        self.filename.set(f'{Path(path).name}  ·  {int(length // 60):02}:{int(length % 60):02}')
+                        self.start.set('0')
+                        self.duration.set(str(round(min(30, length), 2)))
+                        self.status.set('歌曲已加载。选择主唱清楚的片段，然后开始提取。')
+                    elif kind == 'guitar':
+                        self.status.set('吉他草稿已导出：' + str(value))
+                        try:
+                            os.startfile(str(value))
+                        except OSError:
+                            messagebox.showinfo('吉他谱已保存', str(value), parent=self)
+                    elif kind == 'lyrics':
+                        candidate = copy.deepcopy(self.project); candidate.lyrics = value; candidate.validate()
+                        self.remember()
+                        self.project = candidate
+                        self.status.set(f'识别得到 {len(value)} 段歌词，需人工校对。请打开「歌词」修改。')
+                    elif kind == 'play':
+                        self.play_pending = False
+                        flags = winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT
+                        if mode == 'loop':
+                            flags |= winsound.SND_LOOP
+                        try:
+                            winsound.PlaySound(str(path), flags)
+                        except Exception as exc:
+                            self.looping = False
+                            self.play_started = None
+                            self.status.set('试听启动失败：' + str(exc))
+                            messagebox.showerror('播放失败', str(exc), parent=self)
+                            continue
+                        self.looping = mode == 'loop'
+                        self.play_started = time.monotonic()
+                        self.play_duration = duration
+                        self.play_kind = mode
+                        self.status.set('正在循环选中谱面，点击「停止」结束。' if mode == 'loop' else '正在试听；「原曲＋旋律」使用原始演唱时间对齐。')
+                    elif kind == 'error':
+                        self.play_pending = False
+                        self.status.set('处理未完成，可重试或更换片段。')
+                        messagebox.showerror('处理失败', value, parent=self)
+                    elif kind == 'cancelled':
+                        self.play_pending = False
+                        self.progress['value'] = 0
+                        self.status.set('已取消，原有旋律保留。')
+            except queue.Empty as exc:
+                _ = exc
+            if self.play_started is not None:
+                elapsed = time.monotonic() - self.play_started
+                if elapsed >= self.play_duration:
+                    if self.looping:
+                        self.play_started = time.monotonic()
+                    else:
+                        self.stop()
                 else:
-                    self.stop()
-            else:
-                self.draw_roll(elapsed + self.play_offset)
-        self.poll_timer = self.after(100, self._poll)
+                    self.draw_roll(elapsed + self.play_offset)
+        finally:
+            if not getattr(self, '_destroyed', False) and self.winfo_exists():
+                self.poll_timer = self.after(100, self._poll)
 
     def destroy(self):
+        self._destroyed = True
         for timer in (getattr(self,'poll_timer',None),getattr(self,'show_timer',None)):
             if timer:
                 try:
                     self.after_cancel(timer)
-                except tk.TclError:
-                    pass
+                except tk.TclError as exc:
+                    _ = exc
         super().destroy()
 
     def choose_audio(self):
@@ -359,20 +413,30 @@ class App(tk.Tk):
             return
         if not self.source:
             raise ValueError('请先选择歌曲')
-        start, duration = float(self.start.get()), float(self.duration.get())
-        if self.full_song.get():
-            start,duration=0,engine.probe(self.source)
-        if not 0 <= start or not 2 <= duration <= 3600 or (not self.full_song.get() and start + duration > self.source_duration + 0.05):
+        is_full = bool(self.full_song.get())
+        start = 0.0 if is_full else float(self.start.get())
+        if not is_full and not getattr(self, 'source_probed', False):
+            self.source_duration = float(engine.probe(self.source))
+            self.source_probed = True
+        duration = float(self.source_duration or self.duration.get() or 0.0) if is_full else float(self.duration.get())
+        if not 0 <= start or (not is_full and (not 2 <= duration <= 3600 or start + duration > self.source_duration + 0.05)):
             raise ValueError('请选择歌曲范围内的 2 秒至 60 分钟音频')
         if not self.confirm_replace():
             return
         self.stop()
         self.progress['value'] = 0
         self.status.set('开始处理…')
-        backend = 'rosvot' if self.model_choice.get() == '演唱音符模型（实验）' else 'pyin'
+        backend = 'rosvot' if self.model_choice.get().strip().startswith('演唱音符模型') else 'pyin'
         vocal_only = self.vocal_only.get()
-        self._job(lambda: engine.analyze(self.source, start, duration, self.cancel,
-                   lambda p, s: self.events.put(('progress', (p, s))), backend, vocal_only), 'result')
+        def _run_analysis():
+            eff_dur = engine.probe(self.source) if is_full else duration
+            if not 2 <= eff_dur <= 3600:
+                raise ValueError('请选择歌曲范围内的 2 秒至 60 分钟音频')
+            return engine.analyze(
+                self.source, start, eff_dur, self.cancel,
+                lambda p, s: self.events.put(('progress', (p, s))), backend, vocal_only
+            )
+        self._job(_run_analysis, 'result')
 
     def cancel_job(self):
         self.cancel.set()
@@ -389,8 +453,10 @@ class App(tk.Tk):
 
     def remember(self):
         self.stop()
-        self.undo_stack.append(copy.deepcopy(self.project))
-        self.undo_stack = self.undo_stack[-30:]
+        snap = copy.deepcopy(self.project)
+        snap._saved_timing_choice = self.timing_choice.get()
+        snap._saved_source_state = (self.source, self.source_duration, getattr(self, 'source_probed', False), self.clip_end, self.filename.get(), self.start.get(), self.duration.get())
+        self.undo_stack = (self.undo_stack + [snap])[-30:]
         self.dirty = True
 
     def apply_settings(self):
@@ -412,8 +478,8 @@ class App(tk.Tk):
             return
         candidate.notes = quantize(candidate.notes, candidate.bpm, candidate.beat_origin)
         candidate.validate()
-        self.remember()
-        self.project = candidate
+        self.remember(); self.project = candidate
+        self.timing_choice.set('谱面节奏')
         self.refresh()
         self.status.set('已按原始时间重排，请检查切分音和三连音。')
 
@@ -421,23 +487,23 @@ class App(tk.Tk):
         if not self.available():
             return
         candidate = self.settings(Project(title='手动输入旋律'))
-        notes, beats = parse_jianpu(self.manual_text.get('1.0', 'end'), candidate.tonic, candidate.bpm)
+        notes, beats = parse_jianpu(self.manual_text.get('1.0', 'end'), candidate.tonic, candidate.bpm, candidate.beat_origin)
         candidate.notes = notes
-        candidate.clip_duration = beats * 60 / candidate.bpm
+        candidate.clip_duration = candidate.beat_origin + beats * 60 / candidate.bpm
         candidate.validate()
         if not self.confirm_replace():
             return
-        self.set_project(candidate)
+        self.remember(); self.set_project(candidate, keep_undo=True)
         self.dirty = True
         self.status.set('手动旋律已生成，可试听、编辑并导出。')
 
-    def set_project(self, project):
+    def set_project(self, project, keep_undo=False):
         self.stop()
         if not project.reference_notes:
             project.reference_notes = copy.deepcopy(project.notes)
         self.project = project
         self.timing_choice.set('谱面节奏' if project.reference_notes != project.notes else '原演唱节奏')
-        self.undo_stack = []
+        if not keep_undo: self.undo_stack = []
         self.dirty = False
         self.bpm.set(f'{project.bpm:.2f}')
         self.meter.set(project.meter)
@@ -446,26 +512,41 @@ class App(tk.Tk):
         if project.source:
             old_source = self.source
             self.source = project.source
-            # Source is verified on actual reanalysis, not trusted from the JSON.
-            self.source_duration = max(project.clip_start + project.clip_duration, self.source_duration if old_source == project.source else 0)
+            self.clip_end = project.clip_start + project.clip_duration
+            if old_source == project.source and getattr(self, 'source_probed', False):
+                self.source_duration = max(self.clip_end, self.source_duration)
+            elif Path(project.source).is_file():
+                try:
+                    self.source_duration = float(engine.probe(project.source))
+                    self.source_probed = True
+                except Exception as exc:
+                    self.source_duration = self.clip_end
+                    self.source_probed = False
+                    self.status.set(f'音频总时长读取失败（{exc}），暂按片段结束时间估算。')
+            else:
+                self.source_duration = self.clip_end
+                self.source_probed = False
             self.filename.set(Path(project.source).name)
             self.start.set(f'{project.clip_start:g}')
             self.duration.set(f'{project.clip_duration:g}')
         else:
             self.source = ''
             self.source_duration = 0
+            self.source_probed = False
+            self.clip_end = 0
             self.filename.set('尚未选择歌曲')
         self.refresh()
 
     def refresh(self):
         self.table.delete(*self.table.get_children())
         for i, note in enumerate(self.project.notes):
-            state = '已手动修改' if note.edited else '建议检查' if note.confidence < 0.7 else '待试听'
+            low_conf = note.confidence < CONFIDENCE_THRESHOLD and not note.edited
+            state = '已手动修改' if note.edited else '建议检查' if low_conf else '待试听'
             self.table.insert('', 'end', iid=str(i), values=(i + 1, numbered(note.pitch, self.project.tonic),
                   pitch_name(note.pitch) + f' / {note.pitch}', f'{note.start:g}', f'{note.duration:g}',
                   f'{self.project.clip_start + note.raw_start:.2f}', state),
-                  tags=('uncertain',) if note.confidence < 0.7 and not note.edited else ())
-        count = sum(n.confidence < 0.7 and not n.edited for n in self.project.notes)
+                  tags=('uncertain',) if low_conf else ())
+        count = sum(n.confidence < CONFIDENCE_THRESHOLD and not n.edited for n in self.project.notes)
         self.stats.set(f'{len(self.project.notes)} 个音符 · {count} 处建议检查 · 拖动音符移动，拖边缘改时值 · Ctrl 多选，空白处框选 · 修改可撤销')
         self.draw_roll()
 
@@ -503,16 +584,16 @@ class App(tk.Tk):
             y = height - 10 - (note.pitch - low + 0.5) * ys
             end = max(x + 3, x + note.duration * scale - 2)
             half = max(3, min(8, ys * 0.4))
-            color = AMBER if note.confidence < 0.7 and not note.edited else ACCENT
+            color = AMBER if note.confidence < CONFIDENCE_THRESHOLD and not note.edited else ACCENT
             self.roll.create_rectangle(x, y - half, end, y + half, fill=color, outline=FG if str(i) in selected else color)
             self.roll_hits.append((x, y - half - 2, end, y + half + 2, i))
         if elapsed is not None:
             beat = elapsed * self.project.bpm / 60
             if self.play_kind == 'raw':
-                # Raw performance timing is non-linear relative to quantized beats.
+                # Interpolate score beat position linearly within the active raw note span.
                 before = [n for n in notes if n.raw_start <= elapsed]
                 if before:
-                    n = before[-1]
+                    n = max(before, key=lambda item: (item.raw_start, item.start))
                     beat = n.start + min(n.duration, max(0, (elapsed - n.raw_start) / max(n.raw_duration, 0.001)) * n.duration)
                 else:
                     beat = 0
@@ -586,7 +667,7 @@ class App(tk.Tk):
             raise ValueError('请先提取或输入旋律')
         if indices!=list(range(indices[0],indices[-1]+1)):
             raise ValueError('局部整理请选择连续音符')
-        mode={'自动节奏':'auto','普通节奏':'binary','三连音':'triplet'}[self.rhythm_mode.get()]
+        mode={'自动节奏':'auto','普通节奏':'binary','三连音':'triplet'}.get(self.rhythm_mode.get(),'auto')
         candidate=self.settings(copy.deepcopy(self.project))
         if not candidate.reference_notes:
             candidate.reference_notes=copy.deepcopy(candidate.notes)
@@ -612,10 +693,14 @@ class App(tk.Tk):
         if len(indices)<2 or indices!=list(range(indices[0],indices[-1]+1)):
             raise ValueError('请选择至少两个连续音符；归并使用音高输入框的 MIDI 音高')
         notes=copy.deepcopy(self.project.notes)
+        selected=[notes[i] for i in indices]
         first,last=notes[indices[0]],notes[indices[-1]]
+        raw_lo=min(n.raw_start for n in selected)
+        raw_hi=max(n.raw_start+n.raw_duration for n in selected)
         first.pitch=int(self.pitch.get())
         first.duration=last.start+last.duration-first.start
-        first.raw_duration=last.raw_start+last.raw_duration-first.raw_start
+        first.raw_start=raw_lo
+        first.raw_duration=raw_hi-raw_lo
         first.edited=True
         notes[indices[0]:indices[-1]+1]=[first]
         self.commit_notes(notes)
@@ -631,9 +716,10 @@ class App(tk.Tk):
         for n in project.notes:
             n.start-=offset
         self.play_offset=offset*60/project.bpm
+        job_id=getattr(self,'job_token',0)+1
         def prepare():
             engine.JOBS.mkdir(parents=True,exist_ok=True)
-            path=engine.JOBS/'preview-loop.wav'
+            path=engine.JOBS/f'preview-loop-{job_id}.wav'
             engine.synthesize(project,path,tail=0)
             return path,engine.probe(path),'loop'
         self._job(prepare,'play')
@@ -702,7 +788,7 @@ class App(tk.Tk):
         right = copy.deepcopy(left)
         right.start += left.duration
         right.raw_start += left.raw_duration
-        notes.extend([left, right])
+        notes[index:index] = [left, right]
         self.commit_notes(notes)
 
     def merge_notes(self):
@@ -714,31 +800,60 @@ class App(tk.Tk):
         selected = [self.project.notes[i] for i in indices]
         if len({n.pitch for n in selected}) != 1:
             raise ValueError('合并仅支持相同音高，避免无意改变旋律')
+        raw_lo = min(n.raw_start for n in selected)
+        raw_hi = max(n.raw_start + n.raw_duration for n in selected)
         first = copy.deepcopy(selected[0])
         first.duration = selected[-1].start + selected[-1].duration - first.start
-        first.raw_duration = selected[-1].raw_start + selected[-1].raw_duration - first.raw_start
+        first.raw_start = raw_lo
+        first.raw_duration = raw_hi - raw_lo
         first.edited = True
-        notes = [copy.deepcopy(n) for i, n in enumerate(self.project.notes) if i not in indices]
-        self.commit_notes(notes + [first])
+        notes = copy.deepcopy(self.project.notes)
+        notes[indices[0] : indices[-1] + 1] = [first]
+        self.commit_notes(notes)
 
     def undo(self):
         if not self.available() or not self.undo_stack:
             return
         self.stop()
-        self.project = self.undo_stack.pop()
+        saved = self.undo_stack.pop()
+        if isinstance(saved, tuple):
+            self.project, saved_timing = saved
+        else:
+            self.project = saved
+            saved_timing = getattr(self.project, '_saved_timing_choice',
+                '谱面节奏' if self.project.reference_notes != self.project.notes else '原演唱节奏')
+        src_state = getattr(self.project, '_saved_source_state', None)
+        if src_state is not None:
+            self.source, self.source_duration, self.source_probed, self.clip_end, fn, st, du = src_state
+            self.filename.set(fn); self.start.set(st); self.duration.set(du)
+        self.timing_choice.set(saved_timing)
         self.bpm.set(f'{self.project.bpm:.2f}')
         self.meter.set(self.project.meter)
         self.tonic.set(self.project.tonic)
         self.origin.set(f'{self.project.beat_origin:.4f}')
-        self.dirty = True
-        self.refresh()
+        self.dirty = True; self.refresh()
         self.status.set('已撤销上一步修改。')
 
     def stop(self):
-        winsound.PlaySound(None, 0)
+        self.play_token = getattr(self, 'play_token', 0) + 1
+        self.play_pending = False
+        if getattr(self, 'active_job_kind', None) == 'play':
+            self.job_token = getattr(self, 'job_token', 0) + 1
+            self.busy = False
+            self.active_job_kind = None
+            if hasattr(self, 'extract_button'):
+                self.extract_button.configure(state='normal')
+            if hasattr(self, 'choose_button'):
+                self.choose_button.configure(state='normal')
+            if hasattr(self, 'cancel_button'):
+                self.cancel_button.configure(state='disabled')
         self.play_started = None
         self.looping = False
         self.play_offset = 0
+        try:
+            winsound.PlaySound(None, 0)
+        except Exception as exc:
+            self.status.set('停止播放异常：' + str(exc))
         if hasattr(self, 'roll'):
             self.draw_roll()
 
@@ -750,9 +865,8 @@ class App(tk.Tk):
         self.stop()
         project = copy.deepcopy(self.project)
         raw_timing = self.timing_choice.get() == '原演唱节奏' and project.engine != 'manual'
-        if mode == 'melody' and raw_timing and project.reference_notes:
-            project.notes=copy.deepcopy(project.reference_notes)
         self.status.set('准备试听…')
+        job_id = getattr(self, 'job_token', 0) + 1
         def prepare():
             engine.JOBS.mkdir(parents=True, exist_ok=True)
             if mode in ('mix', 'vocals'):
@@ -760,7 +874,7 @@ class App(tk.Tk):
                 if not path.is_file():
                     raise ValueError('此项目没有对应音轨；手动简谱可使用「旋律」试听')
                 return path, engine.probe(path), 'raw'
-            path = engine.JOBS / ('preview-' + mode + '.wav')
+            path = engine.JOBS / f'preview-{mode}-{job_id}.wav'
             if mode == 'compare':
                 engine.compare_audio(project, path)
                 return path, engine.probe(path), 'raw'
@@ -795,14 +909,17 @@ class App(tk.Tk):
         window.transient(self);window.grab_set()
         frame=ttk.Frame(window,padding=20);frame.pack(fill='both',expand=True)
         ttk.Label(frame,text='先确认调性，再修改每小节和弦',style='Title.TLabel').pack(anchor='w')
-        candidates=guitar.key_candidates(project)[:3]
+        candidates=guitar.key_candidates(project)
         labels=[name+suffix for name in NAMES for suffix in (' 大调',' 小调')]
-        key=tk.StringVar(value=NAMES[candidates[0][1]]+(' 小调' if candidates[0][2] else ' 大调'))
-        style=tk.StringVar(value='分解和弦')
+        default_key=(NAMES[candidates[0][1]]+(' 小调' if candidates[0][2] else ' 大调')) if candidates else f'{project.tonic} 大调'
+        key=tk.StringVar(value=default_key)
+        style_options=['分解和弦','流行扫弦']
+        capo_options=[str(i) for i in range(13)]
+        style=tk.StringVar(value=style_options[0])
         capo=tk.StringVar(value='0')
         ttk.Label(frame,text='旋律调性候选：'+' / '.join(NAMES[r]+(' 小调' if m else ' 大调') for _,r,m in candidates)+'（可能混淆关系大小调）',style='Muted.TLabel').pack(anchor='w',pady=10)
         row=ttk.Frame(frame);row.pack(fill='x')
-        for label,var,values,width in [('调性',key,labels,10),('风格',style,['分解和弦','流行扫弦'],12),('变调夹',capo,[str(i) for i in range(8)],4)]:
+        for label,var,values,width in [('调性',key,labels,10),('风格',style,style_options,12),('变调夹',capo,capo_options,4)]:
             ttk.Label(row,text=label).pack(side='left',padx=(0,5))
             ttk.Combobox(row,textvariable=var,values=values,state='readonly',width=width).pack(side='left',padx=(0,14))
         ttk.Label(frame,text='每项对应一小节，可改为 C、Am、F#m、Bb 等；N.C. 表示不伴奏。\n和弦名称为实际音高，品位相对变调夹。仅凭旋律生成的候选不代表原曲和弦。',style='Muted.TLabel').pack(anchor='w',pady=12)
@@ -819,17 +936,23 @@ class App(tk.Tk):
         def load_arrangement():
             path=filedialog.askopenfilename(parent=window,title='打开编配数据',filetypes=[('编配数据','*.json')])
             if not path:return
-            if Path(path).stat().st_size>10_000_000:
+            if Path(path).stat().st_size>Project.MAX_PROJECT_BYTES:
                 raise ValueError('编配文件过大')
             data=json.loads(Path(path).read_text(encoding='utf-8'))
             names=[bar['chord'] for bar in data['bars']]
-            guitar.arrange(project,names,data['style'],int(data['capo']))
-            fill(names);style.set(data['style']);capo.set(str(data['capo']))
+            loaded_style=str(data['style'])
+            loaded_capo=int(data['capo'])
+            if loaded_style not in style_options or str(loaded_capo) not in capo_options:
+                raise ValueError('不支持的编配风格或变调夹品位')
+            guitar.arrange(project,names,loaded_style,loaded_capo)
+            fill(names);style.set(loaded_style);capo.set(str(loaded_capo))
         def generate():
             names=[token.split(':')[-1] for token in chords.get('1.0','end').split()]
             chosen_style=style.get();chosen_capo=int(capo.get())
+            if chosen_style not in style_options or str(chosen_capo) not in capo_options:
+                raise ValueError('不支持的编配风格或变调夹品位')
             guitar.arrange(project,names,chosen_style,chosen_capo)
-            directory=engine.ROOT.parent/'吉他编配'/uuid.uuid4().hex[:10]
+            directory=engine.ROOT.parent/'吉他编配'/uuid.uuid4().hex
             window.destroy()
             self.status.set('生成吉他六线谱、双轨 MIDI 和试听…')
             self._job(lambda:guitar.export_bundle(project,names,directory,chosen_style,chosen_capo),'guitar')

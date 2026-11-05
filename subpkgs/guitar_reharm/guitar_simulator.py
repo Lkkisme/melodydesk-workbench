@@ -1,4 +1,4 @@
-"""Studio Multi-Sampled 6-String Acoustic Guitar Engine (375 Per-String Velocity-Layered Studio Recordings + FSS Seagull Steel-String Layer + True 6-String 'Let Ring' Physical Choke) & Real-Vocal Unplugged Mixer."""
+"""Multi-Sampled 6-String Acoustic Guitar Synthesizer (375 Meta Steel Guitar OGG Samples + FSS Steel-String WAV Layer + Karplus-Strong Fallback + Per-String Polyphonic Scheduler) & Vocal/Guitar Stem Mixer."""
 from __future__ import annotations
 from pathlib import Path
 import math
@@ -13,15 +13,11 @@ from .chord_voicing import _integer
 
 def _resolve_samples_base() -> Path:
     env_dir = os.environ.get("MELODYDESK_GUITAR_SAMPLES")
-    if env_dir and Path(env_dir).is_dir():
-        return Path(env_dir)
-    here = Path(__file__).resolve()
-    for ancestor in here.parents:
-        for rel in (("guitar_samples",), ("work", "guitar_samples")):
-            cand = ancestor.joinpath(*rel)
-            if cand.is_dir():
-                return cand
-    return here.parents[2] / "guitar_samples"
+    if env_dir:
+        cand = Path(env_dir)
+        if cand.is_dir():
+            return cand
+    return Path(__file__).resolve().parents[2] / "guitar_samples"
 
 
 _SAMPLES_BASE = _resolve_samples_base()
@@ -48,6 +44,7 @@ _WAVE_CACHE: dict[tuple[str, int], np.ndarray] = {}
 _BLENDED_NOTE_CACHE: dict[tuple[int, int, int, int, bool], np.ndarray] = {}
 _SLAP_CACHE: dict[int, np.ndarray] = {}
 _INDEX_BUILT = False
+_INDEX_DIRS_SCANNED: tuple[str, str] | None = None
 
 
 def _sample_rate(sr):
@@ -55,11 +52,12 @@ def _sample_rate(sr):
 
 
 def _ensure_sample_index():
-    global _INDEX_BUILT
-    if _INDEX_BUILT:
+    global _INDEX_BUILT, _INDEX_DIRS_SCANNED
+    current_dirs = (str(_META_OGG_DIR), str(_FSS_WAV_DIR))
+    if _INDEX_BUILT or _INDEX_DIRS_SCANNED == current_dirs:
         return
     with _CACHE_LOCK:
-        if _INDEX_BUILT:
+        if _INDEX_BUILT or _INDEX_DIRS_SCANNED == current_dirs:
             return
         if _META_OGG_DIR.is_dir():
             for p in _META_OGG_DIR.glob("*.ogg"):
@@ -75,6 +73,7 @@ def _ensure_sample_index():
                 if m:
                     _FSS_INDEX[(int(m.group(2)), m.group(1))] = p
         _INDEX_BUILT = bool(_META_INDEX or _FSS_INDEX)
+        _INDEX_DIRS_SCANNED = current_dirs
 
 
 def _read_cached_audio(path: Path, target_sr: int) -> np.ndarray:
@@ -121,14 +120,12 @@ def _select_vel_layer(velocity: float, technique: str) -> tuple[int, float]:
         return (3 if velocity >= 82 else 2), float(0.85 + 0.28 * vel_norm)
     if velocity <= 68:
         layer = 1
-        span_pos = (velocity - 1.0) / 67.0
     elif velocity <= 94:
         layer = 2
-        span_pos = (velocity - 69.0) / 25.0
     else:
         layer = 3
-        span_pos = (velocity - 95.0) / 32.0
-    db_offset = -2.2 + 3.4 * np.clip(span_pos, 0.0, 1.0)
+    span_pos = np.clip((velocity - 1.0) / 126.0, 0.0, 1.0)
+    db_offset = -2.2 + 3.4 * span_pos
     return layer, float(10.0 ** (db_offset / 20.0))
 
 
@@ -245,6 +242,8 @@ def _fetch_studio_guitar_note(
 
 
 def _pluck_fallback(pitch, string, duration_samples, sr, velocity, technique, seed):
+    if duration_samples <= 0:
+        return np.zeros(0, dtype=np.float64)
     frequency = 440.0 * 2.0 ** ((pitch - 69) / 12.0)
     omega = 2 * np.pi * frequency / sr
     alpha = 0.18 + 0.30 * (string - 1) / 5
@@ -299,6 +298,8 @@ def _pluck_fallback(pitch, string, duration_samples, sr, velocity, technique, se
 
 
 def _pluck(pitch, string, duration_samples, sr, velocity, technique, seed):
+    if duration_samples <= 0:
+        return np.zeros(0, dtype=np.float64)
     frequency = 440.0 * 2.0 ** ((pitch - 69) / 12.0)
     if sr / frequency < 2.2:
         raise ValueError("Pitch is too high for the sample rate")
@@ -312,18 +313,26 @@ _SLAP_BODY_GAIN = 0.38
 _SLAP_CLICK_GAIN = 0.45
 
 
+def _find_slap_click_sample() -> Path | None:
+    if not _META_INDEX:
+        return None
+    selected_key = min(_META_INDEX.keys(), key=lambda k: (-k[0], k[1], -k[2]))
+    return _META_INDEX[selected_key]
+
+
 def _slap(sr, velocity, seed):
-    """Warm cedar-top thumb/body tap: 95 Hz + 210 Hz wood resonance plus a subtle string click."""
+    """Two-mode body-tap synthesis (95 Hz + 210 Hz decaying sinusoids) plus bandpass-filtered transient click."""
     _ensure_sample_index()
+    click_sample = _find_slap_click_sample()
     with _CACHE_LOCK:
         cached = _SLAP_CACHE.get(sr)
-    if cached is not None and (6, 40, 3) in _META_INDEX:
+    if cached is not None and click_sample is not None:
         return cached * (velocity / 127.0)
     n_samples = round(0.16 * sr)
     t = np.arange(n_samples, dtype=np.float64) / sr
     body = (np.sin(2 * np.pi * 95 * t) * np.exp(-t / 0.045) + 0.55 * np.sin(2 * np.pi * 210 * t) * np.exp(-t / 0.028))
-    if (6, 40, 3) in _META_INDEX:
-        source = _read_cached_audio(_META_INDEX[(6, 40, 3)], sr)[:n_samples].astype(np.float64)
+    if click_sample is not None:
+        source = _read_cached_audio(click_sample, sr)[:n_samples].astype(np.float64)
         if len(source) < n_samples:
             source = np.pad(source, (0, n_samples - len(source)))
     else:
@@ -335,14 +344,14 @@ def _slap(sr, velocity, seed):
     result[:attack] *= np.sin(np.linspace(0, np.pi / 2, attack)) ** 2
     rel = max(1, round(0.012 * sr))
     result[-rel:] *= np.linspace(1, 0, rel)
-    if (6, 40, 3) in _META_INDEX:
+    if click_sample is not None:
         result.flags.writeable = False
         with _CACHE_LOCK:
             _SLAP_CACHE[sr] = result
     return result * (velocity / 127.0)
 
 
-def _schedule(events, bpm, sr, measure_beats=4.0, bars=None, chords=None):
+def _schedule(events, bpm, sr, measure_beats=4.0, bars=None, chords=None, beat_to_sec=None):
     if not math.isfinite(bpm) or bpm <= 0:
         raise ValueError("BPM must be positive and finite")
     groups, scheduled = {}, []
@@ -358,7 +367,7 @@ def _schedule(events, bpm, sr, measure_beats=4.0, bars=None, chords=None):
         if event["technique"] not in {"X", "CM", "H", "P", "PB"}:
             groups.setdefault(event["start"], []).append(event["string"])
 
-    spb = 60.0 / bpm
+    spb, b2s = 60.0 / bpm, (beat_to_sec or (lambda b: float(b) * (60.0 / bpm)))
     max_event_end_beat = max((e["start"] + e["duration"] for e in events), default=measure_beats)
     natural_ring_beats = min(4.0, max(2.5, 2.4 / spb))
 
@@ -370,35 +379,41 @@ def _schedule(events, bpm, sr, measure_beats=4.0, bars=None, chords=None):
     for e in sorted_by_start:
         bar_idx = e.get("bar", int(e["start"] // measure_beats))
         seg_idx = e.get("segment", 0)
-        chord_sym = e.get("chord", "")
+        chord_sym = str(e.get("chord", "")).strip()
         cid = (bar_idx, seg_idx, chord_sym)
         if prev_chord_id is not None and cid != prev_chord_id:
             if chord_sym != prev_chord_id[2]:
-                boundary_beats.add(float(round(e["start"] * 4.0) / 4.0))
+                boundary_beats.add(float(e["start"]))
         prev_chord_id = cid
         nc_b = e.get("nc_bound")
         if nc_b is not None and math.isfinite(float(nc_b)):
             nc_boundary_beats.add(float(nc_b))
             boundary_beats.add(float(nc_b))
-    if bars:
-        for b in bars:
-            b_idx = int(b.get("bar", 0))
-            segs = b.get("split_segments") or []
-            if not segs and b.get("chord") == "N.C.":
-                nc_t = float(b_idx * measure_beats)
-                nc_boundary_beats.add(nc_t)
-                boundary_beats.add(nc_t)
-            for seg in segs:
+    bars_by_idx = {int(b.get("bar", idx)): b for idx, b in enumerate(bars or [])}
+    n_harm_bars = max(len(chords or []), (max(bars_by_idx) + 1) if bars_by_idx else 0)
+    prev_seg_chord = None
+    for b_idx in range(n_harm_bars):
+        b = bars_by_idx.get(b_idx)
+        segs = (b.get("split_segments") or []) if b is not None else []
+        if segs:
+            for seg in sorted(segs, key=lambda s: float(s.get("beat", 0.0))):
                 seg_t = float(b_idx * measure_beats + float(seg.get("beat", 0.0)))
-                if seg.get("chord") == "N.C." or all(int(f) < 0 for f in seg.get("frets", [-1])):
+                seg_ch = str(seg.get("chord", "")).strip()
+                if seg_ch == "N.C." or ("frets" in seg and all(int(f) < 0 for f in seg.get("frets", [-1]))):
                     nc_boundary_beats.add(seg_t)
                     boundary_beats.add(seg_t)
-    if chords:
-        for b_idx, ch in enumerate(chords):
-            if ch == "N.C.":
-                nc_t = float(b_idx * measure_beats)
-                nc_boundary_beats.add(nc_t)
-                boundary_beats.add(nc_t)
+                elif prev_seg_chord is not None and seg_ch != prev_seg_chord:
+                    boundary_beats.add(seg_t)
+                prev_seg_chord = seg_ch
+        else:
+            b_ch = str(b.get("chord", "") if b is not None else (chords[b_idx] if chords and b_idx < len(chords) else "")).strip()
+            seg_t = float(b_idx * measure_beats)
+            if b_ch == "N.C." or (b is not None and "frets" in b and all(int(f) < 0 for f in b.get("frets", [-1]))):
+                nc_boundary_beats.add(seg_t)
+                boundary_beats.add(seg_t)
+            elif prev_seg_chord is not None and b_ch != prev_seg_chord:
+                boundary_beats.add(seg_t)
+            prev_seg_chord = b_ch
     sorted_boundaries = sorted(boundary_beats)
     sorted_nc_boundaries = sorted(nc_boundary_beats)
 
@@ -412,7 +427,7 @@ def _schedule(events, bpm, sr, measure_beats=4.0, bars=None, chords=None):
                 is_downstroke = abs((event["start"] * 2.0) % 2.0) < 1e-6
                 step_sec = 0.011 if len(unique_strings) >= 3 else 0.002
                 rake = ((max(unique_strings) - event["string"]) if is_downstroke else (event["string"] - min(unique_strings))) * step_sec
-        onset = round((event["start"] * spb + rake) * sr)
+        onset = max(0, round((b2s(event["start"]) + rake) * sr))
         if tech not in {"X", "CM", "H", "P", "PB"}:
             played = groups[event["start"]]
             unique_strings = sorted(set(played))
@@ -427,19 +442,25 @@ def _schedule(events, bpm, sr, measure_beats=4.0, bars=None, chords=None):
             # Cap passing-bass pickup note ring duration
             ring_beats = min(event["duration"] + 0.08, 0.75)
         elif tech == "CM":
-            ring_beats = min(event["duration"] + 0.12, 2.5)
+            ring_beats = event["duration"] + 0.12
         else:
             # Let string ring across the current chord/bar up to the next chord change boundary
             next_bound = next((b for b in sorted_boundaries if b > event["start"] + 0.05), event["start"] + natural_ring_beats)
-            overlap_beats = 0.0 if next_bound in nc_boundary_beats else (0.045 / spb)
+            overlap_beats = 0.0 if (next_bound in nc_boundary_beats or beat_to_sec is not None) else (0.045 / spb)
             chord_span_beats = (next_bound - event["start"]) + overlap_beats
             remaining_song_beats = max(event["duration"], max_event_end_beat - event["start"] + 1.0)
             string_ring_cap = natural_ring_beats if event['string'] >= 4 else min(natural_ring_beats, max(1.5, 1.45 / spb))
             ring_beats = min(max(event["duration"], chord_span_beats), string_ring_cap, remaining_song_beats)
+        duration = max(1, round((b2s(event["start"] + ring_beats) - b2s(event["start"]) + (0.045 if (beat_to_sec is not None and tech not in {"X", "PM", "PB", "CM"} and next_bound not in nc_boundary_beats) else 0.0)) * sr))
+        ev_nc = event.get("nc_bound")
         next_nc = next((b for b in sorted_nc_boundaries if b > event["start"] + 1e-6), None)
-        if next_nc is not None and tech != "X":
-            ring_beats = min(ring_beats, max(1e-3, next_nc - event["start"]))
-        duration = max(1, round(ring_beats * spb * sr))
+        if ev_nc is not None and float(ev_nc) > event["start"] + 1e-6:
+            next_nc = float(ev_nc) if next_nc is None else min(next_nc, float(ev_nc))
+        if next_nc is not None:
+            nc_sample = round(b2s(next_nc) * sr)
+            if onset >= nc_sample:
+                continue
+            duration = min(duration, nc_sample - onset)
         scheduled.append(dict(event=event, onset=onset, duration=duration, index=index))
 
     # 1. Physical 6-String Choke: a new pluck on the SAME string cuts the previous note on that string
@@ -509,6 +530,26 @@ def _sf2_attacks(path, scheduled, sr, length):
     return result
 
 
+def _recording_origin_sec(project, arrangement: dict) -> float:
+    if arrangement.get("time_origin_shifted"):
+        return float(arrangement.get("warp_origin", getattr(project, "beat_origin", 0.0)))
+    bss = arrangement.get("bar_start_seconds")
+    if bss is None:
+        bss = getattr(project, "bar_start_seconds", None)
+    has_warp = bss is not None and hasattr(bss, "__len__") and len(bss) >= 2
+    bt = arrangement.get("beat_times")
+    if bt is None:
+        bt = getattr(project, "beat_times", None)
+    has_beat_warp = bt is not None and hasattr(bt, "__len__") and len(bt) >= 2
+    if has_beat_warp and has_warp:
+        return min(float(bt[0]), float(bss[0]))
+    if has_beat_warp:
+        return float(bt[0])
+    if has_warp:
+        return float(bss[0])
+    return float(getattr(project, "beat_origin", 0.0))
+
+
 def synthesize_realistic_guitar(
     project,
     arrangement: dict,
@@ -516,26 +557,27 @@ def synthesize_realistic_guitar(
     sr: int = 44100,
     sf2_path: str | Path | None = None,
 ) -> np.ndarray:
-    """Synthesize stereo (N, 2) float32 studio-sampled acoustic guitar audio at 44.1 kHz.
+    """Synthesize stereo (N, 2) float32 multi-sampled acoustic guitar audio at `sr` Hz.
 
-    Engine:
-    1. 375 Per-String × 3-Velocity-Layer Studio Recordings (`Meta Steel Guitar`, E2-C6 across Strings 6..1)
-       blended with close-miked `FSS Seagull Steel-String Acoustic Guitar` studio recordings.
-    2. True 6-String 'Let Ring' Polyphony & Physical String Choke:
-       Notes on different strings ring together freely across arpeggios and strums; re-plucking the same
-       string damps the previous vibration; a percussive 'X' slap gently damps treble strings while bass rings on.
-    3. Articulation physics:
-       - Strumming Rake Delay (12 ms/string downstroke & upstroke sweep)
-       - 'X' Thumb Slap (warm 95/210 Hz cedar-top body tap + subtle string click)
-       - 'P.M.' Palm Mute (Vel01 soft layer + bridge palm damping + 1150 Hz low-pass warmth)
-       - 'H' / 'P' Hammer-on & Pull-off (suppressed pick transient, smooth legato transition)
-    4. Beat-Synchronous Time-Warping:
-       When `arrangement['bar_start_seconds']` provides real detected bar onset times,
-       events are placed at the actual rubato-following positions instead of a rigid BPM grid.
+    Components:
+    1. 375 `Meta Steel Guitar` OGG recordings (Strings 6..1 across 3 velocity layers) blended with
+       `FSS Steel-String` WAV samples, with Karplus-Strong physical-modeling fallback when samples are absent.
+    2. 6-string polyphonic scheduler with same-string re-pluck truncation, chord/bar boundary damping,
+       and treble truncation on `'X'` slap events.
+    3. Articulation envelopes and delays:
+       - Strumming rake delay (11 ms/string sweep)
+       - `'X'` slap (95/210 Hz decaying sinusoids + bandpass click)
+       - `'PM'` palm mute (low-velocity layer + 1150 Hz low-pass filter)
+       - `'H'` / `'P'` hammer-on & pull-off (softened attack ramp)
+    4. Beat-to-time piecewise linear interpolation when `bar_start_seconds` or `beat_times` are supplied.
     """
     _sample_rate(sr)
     measure_beats = float(arrangement.get("measure_beats", 4.0))
-    bpm = project.bpm
+    if not math.isfinite(measure_beats) or measure_beats <= 0:
+        raise ValueError("measure_beats must be positive and finite")
+    bpm = float(project.bpm)
+    if not math.isfinite(bpm) or bpm <= 0:
+        raise ValueError("BPM must be positive and finite")
     spb = 60.0 / bpm
     beats_per_bar = measure_beats
     n_bars = int(arrangement.get("bar_count", max((e.get("bar", 0) for e in arrangement["events"]), default=0) + 1))
@@ -546,11 +588,11 @@ def synthesize_realistic_guitar(
     has_warp = (bar_start_seconds is not None
                 and hasattr(bar_start_seconds, '__len__')
                 and len(bar_start_seconds) >= 2)
+    raw_bss = []
     if has_warp:
         raw_bss = [float(x) for x in bar_start_seconds]
-        bss_origin = raw_bss[0]
-        bar_start_seconds = [max(0.0, x - bss_origin) for x in raw_bss]
-        avg_bar_dur = (bar_start_seconds[-1] - bar_start_seconds[0]) / max(1, len(bar_start_seconds) - 1)
+        if not all(math.isfinite(x) for x in raw_bss) or any(b <= a for a, b in zip(raw_bss, raw_bss[1:])):
+            raise ValueError("bar_start_seconds must be finite and strictly increasing")
 
     beat_times_raw = arrangement.get("beat_times")
     if beat_times_raw is None:
@@ -558,8 +600,23 @@ def synthesize_realistic_guitar(
     has_beat_warp = (beat_times_raw is not None
                      and hasattr(beat_times_raw, '__len__')
                      and len(beat_times_raw) >= 2)
+    raw_bt = []
     if has_beat_warp:
-        bt = [max(0.0, float(x) - float(beat_times_raw[0])) for x in beat_times_raw]
+        raw_bt = [float(x) for x in beat_times_raw]
+        if not all(math.isfinite(x) for x in raw_bt) or any(b <= a for a, b in zip(raw_bt, raw_bt[1:])):
+            raise ValueError("beat_times must be finite and strictly increasing")
+
+    if arrangement.get("time_origin_shifted"):
+        warp_origin = 0.0
+    elif has_beat_warp or has_warp:
+        warp_origin = _recording_origin_sec(project, arrangement)
+    else:
+        warp_origin = 0.0
+    if has_warp:
+        bar_start_seconds = [x - warp_origin for x in raw_bss]
+        avg_bar_dur = (bar_start_seconds[-1] - bar_start_seconds[0]) / max(1, len(bar_start_seconds) - 1)
+    if has_beat_warp:
+        bt = [x - warp_origin for x in raw_bt]
         bt_avg_dur = (bt[-1] - bt[0]) / max(1, len(bt) - 1)
 
     bar_dynamics = arrangement.get("bar_dynamics")
@@ -586,7 +643,7 @@ def synthesize_realistic_guitar(
         else:
             bar_t0 = bar_start_seconds[-1] + (b_idx - len(bar_start_seconds) + 1) * avg_bar_dur
             bar_t1 = bar_t0 + avg_bar_dur
-        bar_dur = max(0.25, bar_t1 - bar_t0)
+        bar_dur = max(0.0, bar_t1 - bar_t0)
         return bar_t0 + (local_beat / beats_per_bar) * bar_dur
 
     scheduled = _schedule(
@@ -596,38 +653,39 @@ def synthesize_realistic_guitar(
         measure_beats=measure_beats,
         bars=arrangement.get("bars"),
         chords=arrangement.get("chords"),
+        beat_to_sec=_beat_to_warped_sec if (has_warp or has_beat_warp) else None,
     )
 
-    if has_warp or has_beat_warp or has_dynamics:
+    if has_dynamics:
         for item in scheduled:
             event = item["event"]
-            if has_warp or has_beat_warp:
-                sched_start_beat = item["onset"] / (spb * sr)
-                sched_end_beat = (item["onset"] + item["duration"]) / (spb * sr)
-                t0_sec = _beat_to_warped_sec(sched_start_beat)
-                t1_sec = _beat_to_warped_sec(sched_end_beat)
-                item["onset"] = max(0, round(t0_sec * sr))
-                item["duration"] = max(1, round((t1_sec - t0_sec) * sr))
-            if has_dynamics:
-                b_idx = event.get("bar", int(event["start"] // beats_per_bar))
-                if 0 <= b_idx < len(bar_dynamics):
-                    dyn = float(np.clip(bar_dynamics[b_idx], 0.55, 1.15))
-                    item["event"] = dict(event, velocity=max(1, min(127, round(event["velocity"] * dyn))))
+            b_idx = event.get("bar", int(event["start"] // beats_per_bar))
+            if 0 <= b_idx < len(bar_dynamics):
+                dyn = float(np.clip(bar_dynamics[b_idx], 0.55, 1.15))
+                orig_vel = int(event["velocity"])
+                new_vel = 0 if orig_vel <= 0 else max(1, min(127, round(orig_vel * dyn)))
+                item["event"] = dict(event, velocity=new_vel)
 
+
+
+
+
+
+
+
+    nominal_sec = _beat_to_warped_sec(max(0.0, n_bars * beats_per_bar))
+    total_sec = (max(float(bar_start_seconds[-1]), nominal_sec) + 0.5) if has_warp else nominal_sec
     length = max(
-        (s["onset"] + (round(0.16 * sr) if s["event"]["technique"] == "X" else s["duration"]) for s in scheduled),
-        default=1,
+        [1, round(total_sec * sr)]
+        + [s["onset"] + (min(round(0.16 * sr), s["duration"]) if s["event"]["technique"] == "X" else s["duration"]) for s in scheduled]
     )
-    if has_warp:
-        total_sec = max(float(bar_start_seconds[-1]), n_bars * beats_per_bar * spb) + 0.5
-        length = max(length, round(total_sec * sr))
 
     stereo_dry = np.zeros((length, 2), dtype=np.float64)
     for item in scheduled:
         event = item["event"]
         seed = item["index"] * 100003 + event["pitch"] * 101 + event["string"]
         signal = (
-            _slap(sr, event["velocity"], seed)
+            _slap(sr, event["velocity"], seed)[: item["duration"]]
             if event["technique"] == "X"
             else _pluck(
                 event["pitch"],
@@ -687,9 +745,10 @@ def mix_real_vocal_and_guitar(
     vocal_gain: float = 1.0,
     guitar_gain: float = 0.85,
 ) -> dict:
-    """Time-align the simulated acoustic guitar (`beat_origin` + `bpm` timeline) with the real singer's `vocals.wav`, apply subtle room ambience, write stereo WAV, and return objective acoustic evaluation metrics."""
+    """Time-align the simulated acoustic guitar (`beat_origin` + `bpm` timeline) with the real singer's `vocals.wav`, apply subtle room ambience, write stereo WAV, and return spectral/envelope mix summary descriptors."""
     _sample_rate(sr)
-    if not all(math.isfinite(v) for v in (vocal_gain, guitar_gain, project.beat_origin)):
+    origin_sec = _recording_origin_sec(project, arrangement)
+    if not all(math.isfinite(v) for v in (vocal_gain, guitar_gain, float(getattr(project, "beat_origin", 0.0)), origin_sec)):
         raise ValueError("Nonfinite gain or recording origin")
     vocal_channels, source_sr = sf.read(str(vocal_wav_path), dtype="float64", always_2d=True)
     if not np.isfinite(vocal_channels).all():
@@ -699,7 +758,7 @@ def mix_real_vocal_and_guitar(
         divisor = math.gcd(source_sr, sr)
         vocal = resample_poly(vocal, sr // divisor, source_sr // divisor)
     guitar = synthesize_realistic_guitar(project, arrangement, sr=sr).astype(np.float64)
-    offset = int(round(getattr(project, "beat_origin", 0.0) * sr))
+    offset = int(round(origin_sec * sr))
     guitar = np.pad(guitar, ((offset, 0), (0, 0))) if offset >= 0 else guitar[min(-offset, len(guitar)) :]
     vocal_room = _room(vocal, 0.023, 0.039, 0.04, 0.03, sr)
     length = max(len(vocal_room), len(guitar))
@@ -707,12 +766,13 @@ def mix_real_vocal_and_guitar(
     padded_vocal_room = np.pad(vocal_room, ((0, length - len(vocal_room)), (0, 0)))
     mix = vocal_gain * padded_vocal_room + guitar_gain * padded_guitar
     peak = np.max(np.abs(mix)) if mix.size else 0.0
+    norm_gain = (10 ** (-1 / 20) / peak) if peak > 0 else 1.0
     if peak > 0:
-        mix *= 10 ** (-1 / 20) / peak
+        mix *= norm_gain
     sf.write(str(out_wav_path), mix, sr, format="WAV", subtype="PCM_16")
-    # Evaluate exactly the gain-scaled, room-processed stems that were summed into the written mix.
-    wet_vocal_mono = vocal_gain * padded_vocal_room.mean(axis=1)
-    scaled_guitar_mono = guitar_gain * padded_guitar.mean(axis=1)
+    # Evaluate the normalized, room-processed stems at the exact gain scale written to disk.
+    wet_vocal_mono = (vocal_gain * norm_gain) * padded_vocal_room.mean(axis=1)
+    scaled_guitar_mono = (guitar_gain * norm_gain) * padded_guitar.mean(axis=1)
     return evaluate_vocal_guitar_mix(wet_vocal_mono, scaled_guitar_mono, sr=sr)
 
 
@@ -754,16 +814,28 @@ def _interval_class_kernels():
         harmonicity = 1.0 - tenney / tenney.max()
         consonance_by_class = 0.5 * (1.0 - roughness) + 0.5 * harmonicity
         intervals = (np.arange(12)[:, None] - np.arange(12)[None, :]) % 12
-        # Blended single-dyad scores (acoustic + TIS) to place the clash threshold on the same scale as frames.
+        # Blended single-dyad scores (chroma kernel + reference-register Plomp-Levelt + TIS) for the clash threshold.
         unit = np.eye(12)
         tis01 = 0.5 * (1.0 + _tis_frame_cosine(unit[[0] * 12], unit))
-        blended = _ACOUSTIC_SHARE * consonance_by_class + (1.0 - _ACOUSTIC_SHARE) * tis01
+        f_k = f0 * (2.0 ** (np.arange(12, dtype=np.float64) / 12.0))
+        pl_dyad = _pl_pair_roughness(f0, f_k)
+        reg_dyad = np.clip(1.0 - pl_dyad / 0.22, 0.0, 1.0)
+        acoustic_dyad = 0.75 * consonance_by_class + 0.25 * reg_dyad
+        blended = _ACOUSTIC_SHARE * acoustic_dyad + (1.0 - _ACOUSTIC_SHARE) * tis01
         threshold = 0.5 * (blended[2] + blended[10])
         _interval_class_kernels.cache = (consonance_by_class[intervals], float(threshold))
     return _interval_class_kernels.cache
 
 
 _interval_class_kernels.cache = None
+
+
+def _pl_pair_roughness(f_a: np.ndarray | float, f_b: np.ndarray | float) -> np.ndarray:
+    """Register-aware Plomp-Levelt (1965) / Sethares (1993) sensory roughness curve for unit-weight spectral peak pairs."""
+    f_min = np.minimum(f_a, f_b)
+    df = np.abs(f_a - f_b)
+    s_pl = 0.24 / (0.0207 * f_min + 18.96)
+    return np.exp(-3.5 * s_pl * df) - np.exp(-5.75 * s_pl * df)
 
 
 def _tis_frame_cosine(chroma_a: np.ndarray, chroma_b: np.ndarray) -> np.ndarray:
@@ -786,13 +858,14 @@ def evaluate_vocal_guitar_mix(
     guitar_audio: np.ndarray,
     sr: int = 44100,
 ) -> dict:
-    """Objective audio-domain metrics for the vocal/guitar mix.
+    """Heuristic spectral and envelope summary descriptors for a vocal/guitar mix.
 
-    spectral_consonance: energy-weighted mean over co-active frames of graded Plomp-Levelt consonance between
-    the vocal and guitar chroma, blended with TIS frame coherence (range [0, 1]).  clash_frame_ratio: fraction
-    of co-active frames whose blended roughness/incoherence exceeds their consonance (range [0, 1]).
-    beat_sync_corr: correlation of positive RMS onset envelopes.  crest_factor_db: peak-to-RMS of the summed
-    signals.  active_overlap_frames: frames where both stems are active.
+    spectral_consonance: energy-weighted mean over co-active STFT frames combining (1) register-aware Plomp-Levelt /
+    Sethares roughness between the dominant STFT spectral peaks in Hz, (2) a 12x12 interval-class kernel
+    (Plomp-Levelt + Tenney-height harmonicity), and (3) 6-coefficient TIS chroma cosine similarity (range [0, 1]).
+    clash_frame_ratio: fraction of co-active frames where the composite score falls below the whole-tone reference
+    threshold (range [0, 1]).  beat_sync_corr: correlation of positive RMS onset envelopes.  crest_factor_db:
+    peak-to-RMS of the summed signals.  active_overlap_frames: frames where both stems have non-zero energy.
     """
     _sample_rate(sr)
 
@@ -812,27 +885,50 @@ def evaluate_vocal_guitar_mix(
     guitar = np.pad(guitar, (0, length - len(guitar)))
     frequencies = np.fft.rfftfreq(4096, 1 / sr)
     mask = (frequencies >= 50) & (frequencies <= 5000)
-    pcs = np.rint(69 + 12 * np.log2(frequencies[mask] / 440)).astype(np.int64) % 12
+    masked_freqs = frequencies[mask]
+    pcs = np.rint(69 + 12 * np.log2(masked_freqs / 440)).astype(np.int64) % 12
     starts = range(0, max(1, length), 1024)
     window = np.hanning(4096)
+    n_peaks = min(4, len(masked_freqs))
 
     def analyze(audio):
-        chroma, rms = [], []
+        chroma, rms, peak_freqs, peak_amps = [], [], [], []
         for start in starts:
             frame = np.pad(audio[start : start + 4096], (0, max(0, start + 4096 - len(audio))))
             rms.append(np.sqrt(np.mean(frame ** 2)))
-            power = np.abs(np.fft.rfft(frame * window)) ** 2
-            vector = np.bincount(pcs, weights=power[mask], minlength=12)
+            power = (np.abs(np.fft.rfft(frame * window)) ** 2)[mask]
+            vector = np.bincount(pcs, weights=power, minlength=12)
             total = vector.sum()
             chroma.append(vector / total if total > 0 else vector)
-        return np.asarray(chroma), np.asarray(rms)
+            if total > 0 and n_peaks > 0:
+                if len(power) >= 3:
+                    loc = np.flatnonzero((power[1:-1] > power[:-2]) & (power[1:-1] >= power[2:])) + 1
+                else:
+                    loc = np.arange(len(power))
+                if len(loc) >= n_peaks:
+                    top_local = loc[np.argpartition(power[loc], -n_peaks)[-n_peaks:]]
+                else:
+                    top_local = np.argpartition(power, -n_peaks)[-n_peaks:]
+                amps = np.sqrt(power[top_local])
+                a_sum = amps.sum()
+                peak_freqs.append(masked_freqs[top_local])
+                peak_amps.append(amps / a_sum if a_sum > 0 else amps)
+            else:
+                peak_freqs.append(np.full(n_peaks, 330.0))
+                peak_amps.append(np.zeros(n_peaks))
+        return np.asarray(chroma), np.asarray(rms), np.asarray(peak_freqs), np.asarray(peak_amps)
 
-    vc, vr = analyze(vocal)
-    gc, gr = analyze(guitar)
-    # Graded Helmholtz / Plomp-Levelt interval-class kernels (replacing binary consonant/clash masks).
+    vc, vr, vf, va = analyze(vocal)
+    gc, gr, gf, ga = analyze(guitar)
+    # 1. Register-aware multi-peak Plomp-Levelt / Sethares sensory consonance in Hz across top STFT peaks.
+    w_pair = va[:, :, None] * ga[:, None, :]
+    pl_rough = np.sum(w_pair * _pl_pair_roughness(vf[:, :, None], gf[:, None, :]), axis=(1, 2))
+    register_consonance = np.clip(1.0 - pl_rough / 0.22, 0.0, 1.0)
+    # 2. Graded Helmholtz / Plomp-Levelt interval-class kernels on chroma.
     consonance_kernel, clash_threshold = _interval_class_kernels()
-    acoustic_consonance = np.einsum("bi,ij,bj->b", vc, consonance_kernel, gc)
-    # Tonal Interval Space frame coherence: cosine similarity of 6-coefficient weighted chroma DFTs, mapped to [0, 1].
+    chroma_consonance = np.einsum("bi,ij,bj->b", vc, consonance_kernel, gc)
+    acoustic_consonance = 0.75 * chroma_consonance + 0.25 * register_consonance
+    # 3. Tonal Interval Space frame coherence: cosine similarity of 6-coefficient weighted chroma DFTs, mapped to [0, 1].
     tis_coherence = 0.5 * (1.0 + _tis_frame_cosine(vc, gc))
     consonance = _ACOUSTIC_SHARE * acoustic_consonance + (1.0 - _ACOUSTIC_SHARE) * tis_coherence
     overlap = (vr > 0) & (gr > 0)

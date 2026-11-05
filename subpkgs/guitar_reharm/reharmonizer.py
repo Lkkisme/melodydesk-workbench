@@ -1,4 +1,4 @@
-"""Functional Roman Numeral Analysis, 12-D TIS Consonance & Plomp-Levelt / Sethares Roughness + Avoid-Note Clash Detector, 6 Re-harmonization Presets with Global Viterbi Bass-Line Decoder, and Split-Bar Cadential / Secondary-Dominant Solver."""
+"""Functional Roman Numeral Analysis, 12-D TIS Consonance & Plomp-Levelt / Sethares Roughness + Avoid-Note Clash Detector, 6 Re-harmonization Presets with Viterbi Bass-Line & TIS Decoder, and Split-Bar Cadential / Secondary-Dominant Solver."""
 from __future__ import annotations
 
 import cmath
@@ -6,7 +6,6 @@ from functools import lru_cache
 import math
 from .chord_voicing import parse_extended_chord, _note_pc, EXTENDED_INTERVALS, generate_voicings, optimize_voice_leading
 
-_NAMES = ('C','C#','D','D#','E','F','F#','G','G#','A','A#','B')
 _SCALE = (0,2,4,5,7,9,11)
 _MAJOR = {'','7','maj7','add9','add11','add#11','add2','add4','6','6/9','9','maj9','11','maj11','13','maj13','7b9','7#9','7b5','7#5','7#11','maj7#11','9#11','maj9#11','13#11','maj13#11','7b13','7alt','aug7'}
 _MINOR = {'m','m7','madd9','madd11','m6','m6/9','m9','m11','m13','mmaj7','mmaj9','mmaj11','mmaj13'}
@@ -96,16 +95,19 @@ def _chord_voice_pitch(pc: int, melody_pitch: int) -> int:
 
 def _avoid_note_reason(chord_tones: set[int], parsed: dict, melody_pc: int) -> str | None:
     """Functional avoid-note rules from jazz / pop harmony pedagogy (chord-scale theory)."""
-    interval = (melody_pc - parsed['root']) % 12
-    if (parsed['root'] + 4) % 12 in chord_tones and interval == 5 and (parsed['root'] + 5) % 12 not in chord_tones:
+    root = parsed['root']
+    interval = (melody_pc - root) % 12
+    if (root + 4) % 12 in chord_tones and interval == 5 and (root + 5) % 12 not in chord_tones:
         return 'fourth_over_major_third'
-    if (parsed['root'] + 5) % 12 in chord_tones and (parsed['root'] + 3) % 12 not in chord_tones \
-            and (parsed['root'] + 4) % 12 not in chord_tones and interval == 4:
+    if (root + 5) % 12 in chord_tones and (root + 3) % 12 not in chord_tones \
+            and (root + 4) % 12 not in chord_tones and interval == 4:
         return 'third_against_sus4'
     if any((melody_pc - ct) % 12 == 1 for ct in chord_tones):
         return 'minor_ninth'
-    if any((ct - melody_pc) % 12 == 1 for ct in chord_tones):
-        return 'semitone_below_chord_tone'
+    if (root + 11) % 12 in chord_tones and interval == 10:
+        return 'minor_seventh_against_major_seventh'
+    if (root + 4) % 12 in chord_tones and (root + 10) % 12 not in chord_tones and interval == 3:
+        return 'minor_third_against_major_third'
     return None
 
 
@@ -113,9 +115,9 @@ def _dyadic_roughness(chord_tones: set[int], parsed: dict | None, melody_pc: int
     """Clash score of a melody note against a chord: functional avoid-note rules + acoustic roughness.
 
     The acoustic term is the multi-partial Plomp-Levelt / Sethares roughness of the melody note against each
-    chord tone voiced in the octave below it, normalised so a C4-C#4 minor second ≈ 1.0.  Exact semitone /
-    major-seventh pitch-class collisions keep a functional weight of 1.0 each (an inverted major seventh is
-    acoustically smooth but still a voice-leading clash), and a perfect fourth over a major third adds 0.8.
+    chord tone voiced in the octave below it, normalised so a C4-C#4 minor second ≈ 1.0.  Semitone above a
+    chord tone (`b9`), third against `sus4`, minor seventh against `maj7`, or minor third against an
+    un-altered major chord add a functional penalty of 1.0, and a perfect fourth over a major third adds 0.8.
     """
     if parsed is None:
         return 0.0
@@ -124,15 +126,20 @@ def _dyadic_roughness(chord_tones: set[int], parsed: dict | None, melody_pc: int
     ref = _pl_reference() or 1.0
     acoustic = 0.0
     functional = 0.0
+    reason = _avoid_note_reason(chord_tones, parsed, melody_pc % 12)
+    m3_pc = (parsed['root'] + 4) % 12
     for ct in chord_tones:
         if ct == melody_pc % 12:
             continue
         acoustic += _plomp_levelt_roughness(f_mel, _midi_hz(_chord_voice_pitch(ct, mel_pitch))) / ref
-        if (melody_pc - ct) % 12 in (1, 11):
+        if (melody_pc - ct) % 12 == 1:
+            if reason == 'fourth_over_major_third' and ct == m3_pc:
+                continue
             functional += 1.0
-    reason = _avoid_note_reason(chord_tones, parsed, melody_pc % 12)
     if reason == 'fourth_over_major_third':
         functional += 0.8
+    elif reason in ('third_against_sus4', 'minor_seventh_against_major_seventh', 'minor_third_against_major_third'):
+        functional += 1.0
     # Acoustic roughness contributes a graded share (a lone major second ≈ 0.3) without overriding the rules.
     return functional + 0.35 * acoustic
 
@@ -155,6 +162,11 @@ def _spell_from(base_name: str, semitones: int, letter_steps: int) -> str:
     target_pc = (_note_pc(base_name) + semitones) % 12
     natural_pc = _note_pc(target_letter)
     diff = ((target_pc - natural_pc + 6) % 12) - 6
+    if abs(diff) > 1:
+        use_flat = ('b' in base_name) or (_note_pc(base_name) in (5, 10, 3, 8, 1))
+        flat_names = ('C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B')
+        sharp_names = ('C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B')
+        return flat_names[target_pc] if use_flat else sharp_names[target_pc]
     if diff > 0:
         return target_letter + ('#' * diff)
     if diff < 0:
@@ -185,8 +197,14 @@ def _parse(symbol):
 
 @lru_cache(maxsize=1024)
 def _degree(name, tonic):
+    semis = (_note_pc(name) - _note_pc(tonic)) % 12
+    if semis in _SCALE:
+        return '', _SCALE.index(semis)
     degree = ('CDEFGAB'.index(name[0].upper())-'CDEFGAB'.index(tonic[0].upper())) % 7
-    difference = ((_note_pc(name)-_note_pc(tonic)-_SCALE[degree]+6)%12)-6
+    difference = ((semis - _SCALE[degree] + 6) % 12) - 6
+    if abs(difference) > 1:
+        chrom_map = {1: ('b', 1), 3: ('b', 2), 6: ('#', 3), 8: ('b', 5), 10: ('b', 6)}
+        return chrom_map[semis]
     accidental = '#' * difference if difference >= 0 else 'b' * -difference
     return accidental, degree
 
@@ -194,12 +212,14 @@ def _degree(name, tonic):
 def _transform(parsed, tonic, preset):
     candidates = _generate_preset_candidates(parsed, _note_pc(tonic), preset, 0, 1)
     if candidates:
-        return candidates[0][0]
+        return max(candidates, key=lambda item: item[1])[0]
     return parsed['root_name'] + parsed['quality'] + ('/' + parsed['bass'] if parsed['bass'] else '')
 
 
 def _generate_preset_candidates(parsed: dict, tonic_pc: int, preset: str, bar_idx: int, total_bars: int) -> list[tuple[str, float]]:
     root = parsed['root_name']
+    if '#' in root and tonic_pc in (5, 10, 3, 8, 1):
+        root = {1: 'Db', 3: 'Eb', 6: 'Gb', 8: 'Ab', 10: 'Bb'}.get(parsed['root'], root)
     quality = parsed['quality']
     bass = parsed['bass']
     displacement = (parsed['root'] - tonic_pc) % 12
@@ -269,19 +289,21 @@ def _generate_preset_candidates(parsed: dict, tonic_pc: int, preset: str, bar_id
             candidates.append((original_sym, 0.8))
 
     elif preset == 'walking_bass':
-        third_semis, third_steps = (3, 2) if 3 in ivs else ((4, 2) if 4 in ivs else ((2, 1) if 2 in ivs else (5, 3)))
-        fifth_semis = 6 if 6 in ivs else (8 if 8 in ivs else 7)
-        _bass_3rd = _spell_from(root, third_semis, third_steps)
-        _bass_5th = _spell_from(root, fifth_semis, 4)
         candidates.append((original_sym, 0.7))
-        candidates.append((root + quality + '/' + _bass_3rd, 0.85))
-        candidates.append((root + quality + '/' + _bass_5th, 0.75))
-        if is_min_q or 10 in ivs:
+        third_pair = (3, 2) if 3 in ivs else ((4, 2) if 4 in ivs else ((2, 1) if 2 in ivs else ((5, 3) if 5 in ivs else None)))
+        if third_pair is not None:
+            _bass_3rd = _spell_from(root, third_pair[0], third_pair[1])
+            candidates.append((root + quality + '/' + _bass_3rd, 0.85))
+        fifth_semis = 6 if 6 in ivs else (8 if 8 in ivs else (7 if 7 in ivs else None))
+        if fifth_semis is not None:
+            _bass_5th = _spell_from(root, fifth_semis, 4)
+            candidates.append((root + quality + '/' + _bass_5th, 0.75))
+        if 10 in ivs or quality == 'm':
             _bass_b7 = _spell_from(root, 10, 6)
             candidates.append((root + (quality if quality != 'm' else 'm7') + '/' + _bass_b7, 0.8))
-        if is_maj_q and not is_dom_q:
+        elif 11 in ivs or quality == '':
             _bass_maj7 = _spell_from(root, 11, 6)
-            candidates.append((root + 'maj7/' + _bass_maj7, 0.55))
+            candidates.append((root + (quality if quality else 'maj7') + '/' + _bass_maj7, 0.55))
 
     elif preset == 'suspend_dreamy':
         if is_dom_q:
@@ -311,6 +333,8 @@ def _generate_preset_candidates(parsed: dict, tonic_pc: int, preset: str, bar_id
             valid.append((sym, adj_prior))
     if not valid:
         valid = [(original_sym, 0.5)]
+    else:
+        valid.sort(key=lambda item: item[1], reverse=True)
     return valid
 
 
@@ -371,6 +395,14 @@ def check_melody_clash(
     roughness per non-chord melody note, plus 12-D TIS similarity of the duration-weighted melody pitch-class
     distribution to the chord."""
     notes = _overlapping_notes(melody_notes, bar_start, bar_end)
+    all_notes = [
+        n for n in (melody_notes or [])
+        if math.isfinite(getattr(n, 'start', math.nan))
+        and math.isfinite(getattr(n, 'duration', math.nan))
+        and math.isfinite(getattr(n, 'pitch', math.nan))
+        and n.duration > 0
+    ]
+    all_notes.sort(key=lambda n: (n.start, n.duration, n.pitch))
     parsed = None if (isinstance(chord_symbol, str) and chord_symbol.strip() == 'N.C.') else _parse(chord_symbol)
     tones = set(parsed['pcs']) | {parsed['bass_pc']} if parsed else set()
     report = dict(status='safe', clashes=[], tensions=[], chord_tones=sorted(tones), notes_checked=len(notes),
@@ -408,8 +440,16 @@ def check_melody_clash(
         if overlap_dur <= 0:
             continue
 
-        prev_n = notes[idx_n - 1] if idx_n > 0 else None
-        next_n = notes[idx_n + 1] if idx_n + 1 < len(notes) else None
+        full_idx = next(
+            (k for k, m in enumerate(all_notes) if m is n or (abs(m.start - n.start) <= 1e-9 and abs(m.duration - n.duration) <= 1e-9 and m.pitch == n.pitch)),
+            None,
+        )
+        if full_idx is not None:
+            prev_n = all_notes[full_idx - 1] if full_idx > 0 else None
+            next_n = all_notes[full_idx + 1] if full_idx + 1 < len(all_notes) else None
+        else:
+            prev_n = notes[idx_n - 1] if idx_n > 0 else None
+            next_n = notes[idx_n + 1] if idx_n + 1 < len(notes) else None
         has_step_in = (
             prev_n is not None
             and abs((prev_n.start + prev_n.duration) - n.start) <= 0.08
@@ -477,9 +517,28 @@ def suggest_bar_substitutions(
     tonic_pc = _note_pc(tonic)
     neighbors = [_parse(s) for s in (prev_chord,next_chord) if s is not None and s.strip() != 'N.C.']
     scale = {(tonic_pc+x)%12 for x in _SCALE}
-    roots = [(tonic_pc+x)%12 for x in _SCALE]
-    roots += [x for x in range(12) if x not in scale]
-    symbols = list(dict.fromkeys([current_chord]+[_NAMES[r]+q for r in roots for q in EXTENDED_INTERVALS]))
+    degree_steps = ((0, 0), (2, 1), (4, 2), (5, 3), (7, 4), (9, 5), (11, 6),
+                    (1, 1), (3, 2), (6, 3), (8, 5), (10, 6))
+    step_by_semis = dict(degree_steps)
+    root_names = [_spell_from(tonic, semis, steps) for semis, steps in degree_steps]
+    raw_symbols = [current_chord] + [r_name + q for r_name in root_names for q in EXTENDED_INTERVALS]
+    symbols = []
+    seen_chords = set()
+    for sym in raw_symbols:
+        p_sym = parse_extended_chord(sym)
+        if p_sym is None:
+            continue
+        canon_key = (p_sym['root'], p_sym['quality'], p_sym['bass_pc'])
+        if canon_key not in seen_chords:
+            seen_chords.add(canon_key)
+            if p_sym['bass'] is None:
+                semis_off = (p_sym['root'] - tonic_pc) % 12
+                sym = _spell_from(tonic, semis_off, step_by_semis[semis_off]) + p_sym['quality']
+            symbols.append(sym)
+    valid_bounds = math.isfinite(bar_start) and math.isfinite(bar_end) and bar_end > bar_start
+    all_n = sorted([n for n in (melody_notes or []) if math.isfinite(getattr(n,'start',math.nan)) and math.isfinite(getattr(n,'duration',math.nan)) and math.isfinite(getattr(n,'pitch',math.nan)) and n.duration > 0], key=lambda n: (n.start, n.duration, n.pitch)) if valid_bounds else []
+    ov = {i for i, n in enumerate(all_n) if n.start < bar_end and n.start + n.duration > bar_start}
+    bar_notes = [all_n[i] for i in sorted(ov | {i - 1 for i in ov if i > 0} | {i + 1 for i in ov if i + 1 < len(all_n)})] if valid_bounds else melody_notes
     func_map = {0: 'T', 4: 'T', 9: 'T', 2: 'S', 5: 'S', 7: 'D', 11: 'D'}
     cur_func = func_map.get((current['root'] - tonic_pc) % 12)
     cur_pcs = set(current['pcs'])
@@ -487,19 +546,17 @@ def suggest_bar_substitutions(
     for index, symbol in enumerate(symbols):
         parsed = _parse(symbol)
         pcs = set(parsed['pcs'])
-        report = check_melody_clash(symbol,melody_notes,bar_start,bar_end,tonic)
+        report = check_melody_clash(symbol,bar_notes,bar_start,bar_end,tonic)
         status = report['status']
         cand_func = func_map.get((parsed['root'] - tonic_pc) % 12)
         same_func = (parsed['root'] == current['root']) or (
             cur_func is not None and cand_func == cur_func and len(pcs & cur_pcs) >= 2
         )
-        if status == 'clash':
-            reason_label = '避用音冲突'
-        elif status == 'tension':
-            reason_label = '同功能张力代用' if same_func else '色彩张力代用'
-        else:
-            reason_label = '同功能安全代用' if same_func else '异功能协和代用'
-        is_harsh_q = 1 if parsed['quality'] in {'aug', 'dim', 'dim7', 'm7b5'} else 0
+        reason_label = ('避用音冲突' if status == 'clash' else
+                        ('同功能张力代用' if same_func else '色彩张力代用') if status == 'tension'
+                        else ('同功能安全代用' if same_func else '异功能协和代用'))
+        is_harsh_q = (2 if parsed['quality'] in {'5', 'aug', 'dim', 'dim7', 'm7b5', '7alt', '7b9', '7#9', '7b5', '7#5', '7b13', 'aug7', 'mmaj7', 'mmaj9', 'mmaj11', 'mmaj13', '13#11', 'maj13#11'}
+                      else 1 if ('#11' in parsed['quality'] or 'add11' in parsed['quality'] or 'maj11' in parsed['quality']) else 0)
         key = ({'safe':0,'tension':1,'clash':2}[status], 0 if same_func else 1, len(pcs-scale), is_harsh_q,
                len(pcs ^ cur_pcs), sum(len(pcs ^ set(n['pcs'])) for n in neighbors), index)
         ranked.append((key,dict(chord=symbol,roman=roman_numeral(symbol,tonic),clash=report,reason=reason_label)))
@@ -528,19 +585,17 @@ def _bass_transition_score(bass_a, bass_b, preset):
     if delta in (5, 7):
         score = 0.6
     elif delta in (1, 2, 10, 11):
-        score = 0.5 if preset == 'walking_bass' else 0.25
+        score = 0.9 if preset == 'walking_bass' else 0.25
     elif delta == 0:
         score = -0.1
     elif delta == 6:
         score = -0.4
     else:
         score = 0.0
-    if preset == 'walking_bass' and delta in (1, 2, 10, 11):
-        score += 0.4
     return score
 
 
-def _solve_split_bar_chord(chosen_sym, base_sym, next_base_sym, notes, bar_idx, measure, tonic):
+def _solve_split_bar_chord(chosen_sym, next_sym, notes, bar_idx, measure, tonic, preset='walking_bass'):
     mid = bar_idx * measure + measure / 2.0
     bar_end = (bar_idx + 1) * measure
     chosen_parsed = parse_extended_chord(chosen_sym)
@@ -548,21 +603,22 @@ def _solve_split_bar_chord(chosen_sym, base_sym, next_base_sym, notes, bar_idx, 
         return None
 
     root = chosen_parsed['root_name']
+    tonic_pc = _note_pc(tonic) if tonic else None
+    if '#' in root and tonic_pc in (5, 10, 3, 8, 1):
+        root = {1: 'Db', 3: 'Eb', 6: 'Gb', 8: 'Ab', 10: 'Bb'}.get(chosen_parsed['root'], root)
     quality = chosen_parsed['quality']
-    next_bass = _bass_pc_of(next_base_sym) if next_base_sym else chosen_parsed['root']
+    next_bass = _bass_pc_of(next_sym) if next_sym else chosen_parsed['root']
 
     candidates = []
 
     ivs = chosen_parsed['intervals']
-    third_semis, third_steps = (3, 2) if 3 in ivs else ((4, 2) if 4 in ivs else ((2, 1) if 2 in ivs else (5, 3)))
-    fifth_semis = 6 if 6 in ivs else (8 if 8 in ivs else 7)
-    _3rd_name = _spell_from(root, third_semis, third_steps)
-    _5th_name = _spell_from(root, fifth_semis, 4)
-
-    inversions = [
-        root + quality + '/' + _3rd_name,
-        root + quality + '/' + _5th_name,
-    ]
+    inversions = []
+    third_pair = (3, 2) if 3 in ivs else ((4, 2) if 4 in ivs else ((2, 1) if 2 in ivs else ((5, 3) if 5 in ivs else None)))
+    if third_pair is not None:
+        inversions.append(root + quality + '/' + _spell_from(root, third_pair[0], third_pair[1]))
+    fifth_semis = 6 if 6 in ivs else (8 if 8 in ivs else (7 if 7 in ivs else None))
+    if fifth_semis is not None:
+        inversions.append(root + quality + '/' + _spell_from(root, fifth_semis, 4))
     if 10 in ivs or quality == 'm':
         inversions.append(root + (quality if quality != 'm' else 'm7') + '/' + _spell_from(root, 10, 6))
     elif 11 in ivs or quality == '':
@@ -581,17 +637,18 @@ def _solve_split_bar_chord(chosen_sym, base_sym, next_base_sym, notes, bar_idx, 
             if parse_extended_chord(sym) and generate_voicings(sym):
                 candidates.append(sym)
     if 5 in ivs and 10 in ivs and 3 not in ivs and 4 not in ivs:
-        candidates.append(root + '7')
+        sym7 = root + '7'
+        if parse_extended_chord(sym7) and generate_voicings(sym7):
+            candidates.append(sym7)
     if is_maj_split and 3 not in ivs and 4 in ivs:
         sym = root + 'm6'
         if parse_extended_chord(sym) and generate_voicings(sym):
             candidates.append(sym)
 
-    if next_base_sym and next_base_sym.strip() != 'N.C.':
-        next_parsed = parse_extended_chord(next_base_sym)
+    if next_sym and next_sym.strip() != 'N.C.':
+        next_parsed = parse_extended_chord(next_sym)
         if next_parsed:
-            v_root_pc = (next_parsed['root'] + 7) % 12
-            v_root_name = _NAMES[v_root_pc]
+            v_root_name = _spell_from(next_parsed['root_name'], 7, 4)
             v_3rd_name = _spell_from(v_root_name, 4, 2)
             for q in ['7', '', '/' + v_3rd_name]:
                 sym = v_root_name + q
@@ -613,7 +670,7 @@ def _solve_split_bar_chord(chosen_sym, base_sym, next_base_sym, notes, bar_idx, 
         chord_tiv = _chord_tiv(p)
         mel_tiv, has_mel = _melody_tiv_for_bar(notes, mid, bar_end)
         tis_score = _tis_similarity(chord_tiv, mel_tiv) if has_mel else 0.5
-        bass_score = _bass_transition_score(p['bass_pc'], next_bass, 'walking_bass')
+        bass_score = _bass_transition_score(p['bass_pc'], next_bass, preset)
         score = tis_score * 2.0 + bass_score
         if score > max_cand_score:
             max_cand_score = score
@@ -628,6 +685,7 @@ def reharmonize_progression(
     preset: str = "original",
     tonic: str | None = None,
     split_bar: bool = False,
+    capo: int = 0,
 ) -> list[dict]:
     """Transform base chord progression using Viterbi-decoded TIS reharmonization with optional Split-Bar cadential solver."""
     if preset not in REHARMONIZE_PRESETS:
@@ -735,8 +793,8 @@ def reharmonize_progression(
             if fallback_report['status'] != 'clash' and generate_voicings(base_sym):
                 sym = base_sym
             else:
-                prev_c = base_chords[b - 1] if b > 0 else None
-                next_c = base_chords[b + 1] if b + 1 < n_bars else None
+                prev_c = chosen_syms[b - 1] if b > 0 else None
+                next_c = candidate_lists[b + 1][chosen_indices[b + 1]][0] if b + 1 < n_bars else None
                 safe_sym, _ = _resolve_harmony(base_sym, prev_c, next_c, tonic, project.notes, b * measure, (b + 1) * measure)
                 sym = safe_sym
         chosen_syms.append(sym)
@@ -750,21 +808,21 @@ def reharmonize_progression(
         chosen = chosen_syms[idx]
 
         if split_bar and chosen.strip() != 'N.C.':
-            next_base = base_chords[idx + 1] if idx + 1 < n_bars else None
-            second_sym = _solve_split_bar_chord(chosen, original, next_base, project.notes, idx, measure, tonic)
+            next_sym = chosen_syms[idx + 1] if idx + 1 < n_bars else None
+            second_sym = _solve_split_bar_chord(chosen, next_sym, project.notes, idx, measure, tonic, preset=preset)
             if second_sym and second_sym != chosen:
                 half = measure / 2.0
                 rep1 = check_melody_clash(chosen, project.notes, bar_start, bar_start + half, tonic)
                 rep2 = check_melody_clash(second_sym, project.notes, bar_start + half, bar_end, tonic)
                 if rep1['status'] != 'clash' and rep2['status'] != 'clash':
-                    seg1 = dict(beat=0.0, duration=half, chord=chosen, roman=roman_numeral(chosen, tonic), frets=[], capo=0)
-                    seg2 = dict(beat=half, duration=half, chord=second_sym, roman=roman_numeral(second_sym, tonic), frets=[], capo=0)
+                    seg1 = dict(beat=0.0, duration=half, chord=chosen, roman=roman_numeral(chosen, tonic), frets=[], capo=capo)
+                    seg2 = dict(beat=half, duration=half, chord=second_sym, roman=roman_numeral(second_sym, tonic), frets=[], capo=capo)
                     segments = [seg1, seg2]
                     reports = [rep1, rep2]
                     flattened.extend(segments)
                     aggregate = _build_aggregate(reports)
-                    prev_c = base_chords[idx - 1] if idx > 0 else None
-                    next_c = base_chords[idx + 1] if idx + 1 < n_bars else None
+                    prev_c = chosen_syms[idx - 1] if idx > 0 else None
+                    next_c = chosen_syms[idx + 1] if idx + 1 < n_bars else None
                     cands = suggest_bar_substitutions(chosen, prev_c, next_c, tonic, project.notes, bar_start, bar_end)[:8]
                     bars.append(dict(bar=idx, original_chord=original, chord=chosen, roman=roman_numeral(chosen, tonic),
                                      frets=[], clash=aggregate, split_segments=segments, candidates=cands))
@@ -773,12 +831,12 @@ def reharmonize_progression(
         report = clash_cache.get((idx, chosen))
         if report is None:
             report = check_melody_clash(chosen, project.notes, bar_start, bar_end, tonic)
-        segment = dict(beat=0.0, duration=measure, chord=chosen, roman=roman_numeral(chosen, tonic), frets=[], capo=0)
+        segment = dict(beat=0.0, duration=measure, chord=chosen, roman=roman_numeral(chosen, tonic), frets=[], capo=capo)
         segments = [segment]
         flattened.append(segment)
         aggregate = _build_aggregate([report])
-        prev_c = base_chords[idx - 1] if idx > 0 else None
-        next_c = base_chords[idx + 1] if idx + 1 < n_bars else None
+        prev_c = chosen_syms[idx - 1] if idx > 0 else None
+        next_c = chosen_syms[idx + 1] if idx + 1 < n_bars else None
         parsed_orig = parse_extended_chord(original)
         cands = suggest_bar_substitutions(chosen, prev_c, next_c, tonic, project.notes, bar_start, bar_end)[:8] if parsed_orig else []
         bars.append(dict(bar=idx, original_chord=original, chord=chosen, roman=roman_numeral(chosen, tonic),
@@ -786,7 +844,7 @@ def reharmonize_progression(
 
     chord_seq = [s['chord'] for s in flattened]
     if chord_seq:
-        voicings = optimize_voice_leading(chord_seq)
+        voicings = optimize_voice_leading(chord_seq, capo=capo)
         for segment, voicing in zip(flattened, voicings):
             segment['frets'] = list(voicing['frets'])
     for bar in bars:

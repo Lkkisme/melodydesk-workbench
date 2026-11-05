@@ -4,7 +4,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torchaudio.transforms import Resample
-import pyworld as pw
+try:
+    import pyworld as pw
+except ImportError:
+    pw = None
 
 from utils.audio.pitch_utils import interp_f0, resample_align_curve
 from .constants import *

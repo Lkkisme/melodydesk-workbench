@@ -92,14 +92,14 @@ def _dsp_separate(samples, sr):
 
     For the mid channel M (and side channel S when stereo):
       1. HPSS splits M into harmonic H and percussive P components.
-      2. A smooth vocal-band / formant spectral prior w(f) is evaluated on ``fft_frequencies``.
-      3. Spatial posterior rho = |H|^2 / (|H|^2 + |S|^2) (1 for mono) gives the fraction of
-         harmonic energy that is centre-panned.
+      2. A smooth vocal-band / formant spectral weight w(f) is evaluated on ``fft_frequencies``.
+      3. Mid-to-side harmonic energy ratio rho = |H|^2 / (|H|^2 + |S|^2) (1 for mono) measures the
+         fraction of harmonic energy that is centre-panned.
       4. Vocal PSD  V = w(f) * rho * |H|^2  (centre-panned, vocal-band harmonic energy),
          accompaniment PSD A = |P|^2 + (1 - w(f) * rho) * |H|^2 (percussive energy plus the
          off-centre / out-of-band harmonic remainder); both are smoothed over a few frames.
       5. Soft-Wiener mask G = V / (V + A) is applied to the mid mixture STFT, then ``istft``.
-    Accompaniment is the residual ``samples - vocals`` so the stems sum to the input.
+    Accompaniment is returned as ``samples - vocals`` prior to final output peak-clipping and PCM_16 quantization.
     """
     import librosa
 
@@ -132,6 +132,10 @@ def _dsp_separate(samples, sr):
     return vocals, samples - vocals
 
 
+_KARAOKE_ROFORMER_CKPT = "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"
+_BS_ROFORMER_CKPT = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+
+
 def separate_stems(
     audio_path: str | Path,
     out_dir: str | Path,
@@ -143,6 +147,8 @@ def separate_stems(
     The DSP tier estimates harmonic/center audio; it cannot promise isolated dry
     lead vocals or backing-harmony removal.
     """
+    import os
+
     audio_path, out_dir = Path(audio_path).resolve(), Path(out_dir).resolve()
     if not audio_path.is_file():
         raise FileNotFoundError(audio_path)
@@ -161,17 +167,15 @@ def separate_stems(
             import torch
             from audio_separator.separator import Separator
 
-            roformer_cache = Path(__file__).resolve().parents[4] / "work" / "model-cache" / "roformer"
-            if getattr(Separator, "__module__", "").startswith("audio_separator"):
+            env_cache = os.environ.get("MELODYDESK_MODEL_CACHE", "").strip()
+            roformer_cache = Path(env_cache) / "roformer" if env_cache else (Path(__file__).resolve().parents[4] / "work" / "model-cache" / "roformer")
+            try:
                 roformer_cache.mkdir(parents=True, exist_ok=True)
                 separator = Separator(output_dir=str(tier_dir), output_format="WAV", model_file_dir=str(roformer_cache))
-            else:
+            except TypeError:
                 separator = Separator(output_dir=str(tier_dir), output_format="WAV")
             separator.torch_device = torch.device(device)
-            model_filename = (
-                "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"
-                if strip_backing_harmonies else "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
-            )
+            model_filename = _KARAOKE_ROFORMER_CKPT if strip_backing_harmonies else _BS_ROFORMER_CKPT
             separator.load_model(model_filename=model_filename)
             files = separator.separate(str(audio_path), custom_output_names={"Vocals": "vocals", "Instrumental": "no_vocals"})
             returned = {Path(f).resolve() if Path(f).is_absolute() else (tier_dir / f).resolve() for f in files}
@@ -181,7 +185,6 @@ def separate_stems(
             pair_v, pair_a, tier_sr = _validate_pair(*candidates)
             if (
                 strip_backing_harmonies
-                and getattr(Separator, "__module__", "").startswith("audio_separator")
                 and float(np.sqrt(np.mean(samples ** 2))) > 0.01
                 and float(np.sqrt(np.mean(pair_v ** 2))) < 0.008
             ):
@@ -189,14 +192,18 @@ def separate_stems(
                     "Karaoke lead-vocal separator muted multi-voice choir (rms=%.6f); retrying with BS-RoFormer ViperX SDR 12.9755",
                     float(np.sqrt(np.mean(pair_v ** 2))),
                 )
-                for p in candidates:
-                    p.unlink(missing_ok=True)
-                separator.load_model(model_filename="model_bs_roformer_ep_317_sdr_12.9755.ckpt")
-                files = separator.separate(str(audio_path), custom_output_names={"Vocals": "vocals", "Instrumental": "no_vocals"})
-                returned = {Path(f).resolve() if Path(f).is_absolute() else (tier_dir / f).resolve() for f in files}
-                if not all(p.resolve() in returned for p in candidates):
-                    raise ValueError("BS-RoFormer fallback did not return the requested stem pair")
-                pair_v, pair_a, tier_sr = _validate_pair(*candidates)
+                try:
+                    for p in candidates:
+                        p.unlink(missing_ok=True)
+                    separator.load_model(model_filename=_BS_ROFORMER_CKPT)
+                    files = separator.separate(str(audio_path), custom_output_names={"Vocals": "vocals", "Instrumental": "no_vocals"})
+                    returned = {Path(f).resolve() if Path(f).is_absolute() else (tier_dir / f).resolve() for f in files}
+                    if all(p.resolve() in returned for p in candidates):
+                        pair_v, pair_a, tier_sr = _validate_pair(*candidates)
+                    else:
+                        logger.warning("BS-RoFormer fallback did not return the requested stem pair; retaining primary RoFormer separation")
+                except Exception as retry_exc:
+                    logger.warning("BS-RoFormer retry failed (%s); retaining primary RoFormer separation", retry_exc)
             pair = (pair_v, pair_a)
             out_sr = tier_sr
             actual_device = "cuda" if separator.torch_device.type == "cuda" else "cpu"
