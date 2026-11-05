@@ -3,8 +3,8 @@
 Pipeline:
   1. Neural tier (``beat_this.inference.File2Beats``) or librosa ``beat_track``.
   2. Metrical-level / tactus disambiguation for the neural downbeat sequence via an
-     onset-envelope autocorrelation likelihood, a vocal syllable inter-onset-interval
-     (IOI) log-likelihood and a log-normal tempo-range prior.
+     additive log-domain score combining onset-envelope autocorrelation at beat/bar lags,
+     vocal syllable inter-onset-interval (IOI) proximity, and a quadratic log2-BPM penalty.
   3. Grid construction:
        * neural tier: downbeat-locked bars whose interior beats keep the native
          ``beat_this`` detections (or snap per subdivision, then interpolate monotonically);
@@ -19,16 +19,22 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Empirical ratio of the median sung-syllable IOI to the tactus period (calibrated on the
-# repository's vocal repertoire); used as the centre of the vocal-IOI log-likelihood.
+# Heuristic target ratio of median sung-syllable IOI to tactus period.
 _SYLLABLE_IOI_PER_BEAT = 0.68
-# Standard deviation (in octaves) of the vocal-IOI log-likelihood.
+# Scale parameter (in octaves) for the quadratic vocal-IOI log2-deviation penalty.
 _SYLLABLE_IOI_SIGMA_OCT = 1.05
+# Plausible sung-syllable inter-onset-interval passband in seconds (excludes sub-160ms trills and >2.4s phrase pauses).
+_SYLLABLE_IOI_MIN_SEC = 0.16
+_SYLLABLE_IOI_MAX_SEC = 2.4
 # Kalman observation noise standard deviations, as fractions of the beat period.
 # Ordering R_downbeat < R_beat < R_vocal reflects decreasing reliability of the cue.
 _R_DOWNBEAT_FRAC = 0.03
 _R_BEAT_FRAC = 0.05
 _R_VOCAL_FRAC = 0.09
+# Kalman validation gate half-widths, as fractions of the beat period (downbeat > beat > vocal).
+_GATE_DOWNBEAT_FRAC = 0.45
+_GATE_BEAT_FRAC = 0.35
+_GATE_VOCAL_FRAC = 0.24
 # Kalman process noise standard deviations (per beat step), as fractions of the beat period.
 _Q_PHASE_FRAC = 0.01
 _Q_PERIOD_FRAC = 0.015
@@ -94,7 +100,7 @@ def beats_to_seconds_piecewise(
 
 
 # ---------------------------------------------------------------------------
-# Onset-autocorrelation & vocal-IOI log-likelihood meter/tactus disambiguator
+# Onset-autocorrelation & vocal-IOI heuristic meter/tactus disambiguator
 # ---------------------------------------------------------------------------
 
 def _onset_autocorrelation(onset_env: np.ndarray) -> np.ndarray:
@@ -115,27 +121,27 @@ def _onset_autocorrelation(onset_env: np.ndarray) -> np.ndarray:
 def _acf_at(acf: np.ndarray, lag_frames: float, halfwidth: int = 2) -> float:
     """Peak autocorrelation within +-halfwidth frames of a (fractional) lag; 0 if out of range."""
     centre = int(round(lag_frames))
-    if centre < 1 or centre >= len(acf) - 1:
+    if centre < 1 or centre >= len(acf):
         return 0.0
     lo, hi = max(1, centre - halfwidth), min(len(acf), centre + halfwidth + 1)
     return float(np.max(acf[lo:hi]))
 
 
-def _tempo_range_log_prior(bpm: float, lo_bpm: float, hi_bpm: float) -> float:
-    """Quadratic log2-BPM penalty centred on the geometric mean of [lo_bpm, hi_bpm] (sigma = range/4 octaves)."""
-    if bpm <= 0.0 or bpm < 0.95 * lo_bpm or bpm > 1.05 * hi_bpm:
+def _tempo_range_penalty(bpm: float, lo_bpm: float, hi_bpm: float) -> float:
+    """Quadratic log2-BPM penalty centred on the geometric mean of [lo_bpm, hi_bpm] (scale = max(1e-3, range/4) octaves)."""
+    if bpm <= 0.0 or bpm < lo_bpm or bpm > hi_bpm:
         return -np.inf
     centre = math.sqrt(lo_bpm * hi_bpm)
-    sigma_oct = max(0.1, math.log2(hi_bpm / lo_bpm) / 4.0)
+    sigma_oct = max(1e-3, math.log2(hi_bpm / lo_bpm) / 4.0) if hi_bpm > lo_bpm else 0.1
     return -0.5 * (math.log2(bpm / centre) / sigma_oct) ** 2
 
 
-def _syllable_ioi_log_likelihood(syl_arr: np.ndarray, spb: float) -> float:
-    """Quadratic log2-deviation score between the median vocal syllable IOI and the expected beat-scaled syllable IOI."""
+def _syllable_ioi_penalty(syl_arr: np.ndarray, spb: float) -> float:
+    """Quadratic log2-deviation penalty between median vocal syllable IOI (within [_SYLLABLE_IOI_MIN_SEC, _SYLLABLE_IOI_MAX_SEC]) and target beat-scaled syllable IOI; returns 0.0 when fewer than 4 syllables or 2 in-band IOIs are available."""
     if len(syl_arr) < 4:
         return 0.0
     iois = np.diff(syl_arr)
-    iois = iois[(iois >= 0.16) & (iois <= 2.4)]
+    iois = iois[(iois >= _SYLLABLE_IOI_MIN_SEC) & (iois <= _SYLLABLE_IOI_MAX_SEC)]
     if len(iois) < 2:
         return 0.0
     med_ioi = float(np.median(iois))
@@ -144,11 +150,11 @@ def _syllable_ioi_log_likelihood(syl_arr: np.ndarray, spb: float) -> float:
     return -0.5 * z * z
 
 
-def _metrical_level_log_posterior(
+def _metrical_level_score(
     acf: np.ndarray,
     frames_per_sec: float,
     bar_sec: float,
-    measure_beats: int,
+    measure_beats: float,
     syl_arr: np.ndarray,
     lo_bpm: float,
     hi_bpm: float,
@@ -156,13 +162,13 @@ def _metrical_level_log_posterior(
     """Additive log-domain metrical score combining onset autocorrelation at beat/bar lags, syllable-IOI alignment, and log-tempo range preference."""
     spb = bar_sec / measure_beats
     bpm = 60.0 / max(1e-6, spb)
-    log_prior = _tempo_range_log_prior(bpm, lo_bpm, hi_bpm)
-    if not np.isfinite(log_prior):
+    range_pen = _tempo_range_penalty(bpm, lo_bpm, hi_bpm)
+    if not np.isfinite(range_pen):
         return -np.inf
     acf_beat = max(1e-3, _acf_at(acf, spb * frames_per_sec))
     acf_bar = max(1e-3, _acf_at(acf, bar_sec * frames_per_sec))
     log_acf = math.log(acf_beat) + math.log(acf_bar)
-    return log_acf + _syllable_ioi_log_likelihood(syl_arr, spb) + log_prior
+    return log_acf + _syllable_ioi_penalty(syl_arr, spb) + range_pen
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +220,7 @@ def _kalman_rts_beat_grid(
     beat_origin: float,
     spb: float,
     duration: float,
-    measure_beats: int,
+    measure_beats: float,
     downbeat_arr: np.ndarray,
     beat_arr: np.ndarray,
     syl_arr: np.ndarray,
@@ -236,7 +242,9 @@ def _kalman_rts_beat_grid(
     r_downbeat = (_R_DOWNBEAT_FRAC * spb) ** 2
     r_beat = (_R_BEAT_FRAC * spb) ** 2
     r_vocal = (_R_VOCAL_FRAC * spb) ** 2
-    downbeat_gate, beat_gate, vocal_gate = 0.45 * spb, 0.35 * spb, 0.24 * spb
+    downbeat_gate = _GATE_DOWNBEAT_FRAC * spb
+    beat_gate = _GATE_BEAT_FRAC * spb
+    vocal_gate = _GATE_VOCAL_FRAC * spb
 
     x = np.array([float(beat_origin), spb])
     P = np.diag([r_downbeat, (0.1 * spb) ** 2])
@@ -255,7 +263,8 @@ def _kalman_rts_beat_grid(
         beat_idx = len(xs_filt)
 
         z, r = None, None
-        if beat_idx % measure_beats == 0 and len(downbeat_arr):
+        is_bar_beat = measure_beats > 0 and abs(round(beat_idx / measure_beats) * measure_beats - beat_idx) < 1e-4
+        if is_bar_beat and len(downbeat_arr):
             cands = downbeat_arr[(downbeat_arr > pos + cur_spb * 0.35) & (downbeat_arr < pos + cur_spb * 1.65)]
             if len(cands):
                 c = _nearest(cands, pred_t)
@@ -327,19 +336,24 @@ def track_beats_and_downbeats(
     """Track beats, downbeats, meter, bpm, and beat_origin from audio.
 
     Returns dict:
-        - `bpm`: float (normalized to bpm_range)
-        - `beat_origin`: float (first downbeat or earliest beat in seconds >= 0.0)
-        - `meter`: str ('4/4' or '3/4')
+        - `bpm`: float (octave-folded into bpm_range when compatible; otherwise physical grid tempo)
+        - `bpm_in_range`: bool (whether bpm lies within bpm_range)
+        - `beat_origin`: float (1-bar pre-vocal pickup origin or first downbeat/beat in seconds >= 0.0)
+        - `meter`: str (inferred 'num/den' or validated meter_hint 'num/den')
         - `beats`: list[float]
         - `downbeats`: list[float]
         - `backend`: str ('beat_this' or 'librosa')
-        - `beat_times`: list[float] — piecewise beat grid snapped to detected beats
+        - `beat_times`: list[float] — piecewise quarter-note beat grid snapped to detected beats
         - `bar_start_seconds`: list[float] — bar boundary timestamps
     """
     import librosa
     from .separator_engine import resolve_device
 
+    if not isinstance(bpm_range, (tuple, list)) or len(bpm_range) != 2:
+        raise ValueError(f"Invalid bpm_range: {bpm_range!r}")
     lo_bpm, hi_bpm = float(bpm_range[0]), float(bpm_range[1])
+    if not (math.isfinite(lo_bpm) and math.isfinite(hi_bpm) and 0.0 < lo_bpm <= hi_bpm):
+        raise ValueError(f"Invalid bpm_range: {bpm_range!r}")
 
     y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
     if not y.size or not np.all(np.isfinite(y)):
@@ -347,9 +361,14 @@ def track_beats_and_downbeats(
     duration = len(y) / sr
     beats, downbeats, backend = None, None, "librosa"
     try:
+        import os
         from beat_this.inference import File2Beats
 
-        tracker = File2Beats(device=resolve_device(prefer_cuda))
+        env_cache = os.environ.get("MELODYDESK_MODEL_CACHE", "").strip()
+        cache_root = Path(env_cache) if env_cache else (Path(__file__).resolve().parents[4] / "work" / "model-cache")
+        ckpt_file = cache_root / "hub" / "checkpoints" / "beat_this-final0.ckpt"
+        ckpt_arg = str(ckpt_file) if ckpt_file.is_file() else "final0"
+        tracker = File2Beats(checkpoint_path=ckpt_arg, device=resolve_device(prefer_cuda))
         candidate_beats, candidate_downbeats = tracker(str(audio_path))
         candidate_beats = _timestamps(candidate_beats, duration)
         candidate_downbeats = _timestamps(candidate_downbeats, duration)
@@ -371,31 +390,77 @@ def track_beats_and_downbeats(
             beats = _timestamps(librosa.frames_to_time(frames, sr=sr, hop_length=hop) - n_fft / sr, duration)
         if len(beats) < 2:
             raise ValueError("Insufficient periodic onsets to estimate tempo")
-    raw_diffs = np.diff(beats)
+    native_beats = np.asarray(beats, dtype=np.float64)
+    raw_diffs = np.diff(native_beats)
     bpm = 60.0 / float(np.median(raw_diffs))
-    while bpm < lo_bpm:
-        beats = np.sort(np.concatenate((beats, (beats[:-1] + beats[1:]) / 2)))
+    folded_beats = native_beats.copy()
+    while bpm < lo_bpm and bpm * 2.0 <= hi_bpm:
+        folded_beats = np.sort(np.concatenate((folded_beats, (folded_beats[:-1] + folded_beats[1:]) / 2)))
         bpm *= 2.0
-    while bpm > hi_bpm:
-        if len(beats) >= 4:
+    while bpm > hi_bpm and bpm * 0.5 >= lo_bpm:
+        if len(folded_beats) >= 4:
             parity = 0
             if downbeats is not None and len(downbeats):
-                parity = int(np.argmin(np.abs(beats - downbeats[0]))) % 2
-            beats = beats[parity::2]
+                parity = int(np.argmin(np.abs(folded_beats - downbeats[0]))) % 2
+            target_spb = 120.0 / bpm
+            decimated = [float(folded_beats[parity])]
+            for b_t in folded_beats[parity + 1:]:
+                if float(b_t) - decimated[-1] >= 0.7 * target_spb:
+                    decimated.append(float(b_t))
+            if len(decimated) >= 2:
+                folded_beats = np.asarray(decimated, dtype=np.float64)
         bpm /= 2.0
-    # When tracking a pure vocal stem (with held vowels and breath pauses), fold multi-beat IOIs (k=1..4) into [lo_bpm, hi_bpm]
+    has_neural_downbeats = backend == "beat_this" and downbeats is not None and len(downbeats) >= 2
+    syl_arr = np.asarray(sorted(vocal_onsets_sec), dtype=np.float64) if vocal_onsets_sec else np.empty(0, dtype=np.float64)
+    # When tracking a vocal stem (vocal_onsets_sec supplied) with held vowels/pauses or out-of-range BPM, fold multi-beat IOIs (k=1..4) using a globally consistent base period in [60/hi_bpm, 60/lo_bpm]
     high_cv = len(raw_diffs) >= 4 and float(np.std(raw_diffs) / max(1e-6, np.mean(raw_diffs))) > 0.25
-    if bpm < lo_bpm or bpm > hi_bpm or vocal_onsets_sec is not None or high_cv:
-        folded_spbs = []
-        for d in raw_diffs:
+    if len(syl_arr) >= 2 and (bpm < lo_bpm or bpm > hi_bpm or high_cv):
+        t_min, t_max = 60.0 / hi_bpm, 60.0 / lo_bpm
+        pos_diffs = [float(d) for d in raw_diffs if d > 0]
+        cand_periods: list[float] = []
+        for d in pos_diffs:
             for mult in (1, 2, 3, 4):
-                cand_bpm = 60.0 / (d / mult) if d > 0 else 0.0
-                if lo_bpm <= cand_bpm <= hi_bpm:
-                    folded_spbs.append(float(d / mult))
-                    break
-        if len(folded_spbs) >= 4:
-            bpm = 60.0 / float(np.median(folded_spbs))
-    bpm = float(np.clip(bpm, lo_bpm, hi_bpm))
+                p_cand = d / mult
+                if t_min <= p_cand <= t_max:
+                    cand_periods.append(p_cand)
+        best_folded: list[float] = []
+        best_loss = np.inf
+        for t_cand in cand_periods:
+            cur_folded: list[float] = []
+            loss_sum = 0.0
+            for d in pos_diffs:
+                k = max(1, min(4, int(round(d / t_cand))))
+                p = d / k
+                rel_err = abs(p - t_cand) / t_cand
+                if t_min <= p <= t_max:
+                    cur_folded.append(p)
+                    loss_sum += rel_err + 0.02 * (k - 1)
+                else:
+                    loss_sum += 1.0 + rel_err
+            mean_loss = loss_sum / len(pos_diffs)
+            if len(cur_folded) >= 4 and mean_loss < best_loss:
+                best_loss = mean_loss
+                best_folded = cur_folded
+        if len(best_folded) >= 4:
+            spb_refold = float(np.median(best_folded))
+            bpm = 60.0 / spb_refold
+            refolded_pts: list[float] = [float(native_beats[0])]
+            for idx_b in range(len(native_beats) - 1):
+                b0 = float(native_beats[idx_b])
+                b1 = float(native_beats[idx_b + 1])
+                d = b1 - b0
+                if d > 0:
+                    k = max(1, min(4, int(round(d / spb_refold))))
+                    if t_min <= d / k <= t_max:
+                        for j in range(1, k):
+                            refolded_pts.append(b0 + j * d / k)
+                refolded_pts.append(b1)
+            folded_beats = np.asarray(refolded_pts, dtype=np.float64)
+    beats = native_beats if has_neural_downbeats else folded_beats
+    if 0.95 * lo_bpm <= bpm <= 1.05 * hi_bpm:
+        bpm = float(np.clip(bpm, lo_bpm, hi_bpm))
+    else:
+        bpm = float(bpm)
     accent = np.zeros(len(beats), dtype=np.float64)
     for i, time in enumerate(beats):
         frame = int(round((time * sr + n_fft) / hop))
@@ -408,21 +473,17 @@ def track_beats_and_downbeats(
             m_num, m_den = map(int, str(meter_hint).strip().split("/"))
         except (ValueError, TypeError) as exc:
             raise ValueError(f"Invalid meter_hint: {meter_hint!r}") from exc
-        if m_num <= 0 or m_den not in (1, 2, 4, 8, 16):
+        if m_num < 2 or m_den not in (2, 4, 8):
             raise ValueError(f"Invalid meter_hint: {meter_hint!r}")
         measure_beats, meter_den = m_num, m_den
-        if backend == "beat_this" and downbeats is not None and len(downbeats) >= 2:
-            phase = int(np.argmin(np.abs(beats - downbeats[0]))) % measure_beats
-        else:
-            for p in range(measure_beats):
-                indicator = (np.arange(len(beats)) % measure_beats == p).astype(np.float64)
-                a, t = accent - accent.mean(), indicator - indicator.mean()
-                denominator = np.linalg.norm(a) * np.linalg.norm(t)
-                corr = float(a @ t / denominator) if denominator > 0 else 0.0
-                if corr > peak_corr:
-                    phase, peak_corr = p, corr
+    elif has_neural_downbeats:
+        indices = np.asarray([np.argmin(np.abs(beats - t)) for t in downbeats])
+        diff_idx = np.diff(indices)
+        valid_diffs = diff_idx[diff_idx >= 2]
+        intervals = float(np.median(valid_diffs if len(valid_diffs) else diff_idx))
+        measure_beats = max(2, min(12, int(math.floor(intervals + 0.5))))
     else:
-        for m in (4, 3):
+        for m in range(2, 8):
             for p in range(m):
                 indicator = (np.arange(len(beats)) % m == p).astype(np.float64)
                 a, t = accent - accent.mean(), indicator - indicator.mean()
@@ -430,22 +491,29 @@ def track_beats_and_downbeats(
                 corr = float(a @ t / denominator) if denominator > 0 else 0.0
                 if corr > peak_corr:
                     measure_beats, phase, peak_corr = m, p, corr
-    if backend == "beat_this" and downbeats is not None and len(downbeats) >= 2:
-        if not has_meter_hint:
-            indices = np.asarray([np.argmin(np.abs(beats - t)) for t in downbeats])
-            intervals = float(np.median(np.diff(indices)))
-            measure_beats = min((4, 3), key=lambda m: abs(intervals - m))
-    else:
-        downbeats = beats[phase::measure_beats]
 
-    # Neural downbeat sequence cleaning & half-bar pairing
-    spb = 60.0 / bpm
-    syl_arr = np.asarray(sorted(vocal_onsets_sec), dtype=np.float64) if vocal_onsets_sec else np.empty(0, dtype=np.float64)
+    beat_scale = 4.0 / meter_den
+    bar_q_beats = measure_beats * beat_scale
+    is_int_bar_q = bar_q_beats >= 1.0 and abs(bar_q_beats - round(bar_q_beats)) < 1e-6
+    bar_grid_beats = max(1, int(round(bar_q_beats)))
+    spb_q = 60.0 / bpm
+    if not has_neural_downbeats:
+        if has_meter_hint and is_int_bar_q:
+            for p in range(bar_grid_beats):
+                indicator = (np.arange(len(beats)) % bar_grid_beats == p).astype(np.float64)
+                a, t = accent - accent.mean(), indicator - indicator.mean()
+                denominator = np.linalg.norm(a) * np.linalg.norm(t)
+                corr = float(a @ t / denominator) if denominator > 0 else 0.0
+                if corr > peak_corr:
+                    phase, peak_corr = p, corr
+        downbeats = np.asarray([float(beats[min(phase, len(beats) - 1)])], dtype=np.float64)
+
+    # Neural downbeat sequence cleaning & parity disambiguation
     beat_arr = np.asarray(beats, dtype=np.float64)
 
     db = np.asarray(downbeats, dtype=np.float64) if downbeats is not None else np.empty(0, dtype=np.float64)
-    median_bar = float(np.median(np.diff(db))) if len(db) >= 2 else float(measure_beats * spb)
-    use_neural_grid = backend == "beat_this" and len(db) >= 3
+    median_bar = float(np.median(np.diff(db))) if len(db) >= 2 else float(bar_q_beats * spb_q)
+    use_neural_grid = has_neural_downbeats and len(db) >= 3
 
     if use_neural_grid:
         median_bar = float(np.median(np.diff(db)))
@@ -471,24 +539,42 @@ def track_beats_and_downbeats(
         if len(db) >= 2:
             median_bar = float(np.median(np.diff(db)))
 
-        # Onset-autocorrelation & vocal-IOI log-likelihood meter/tactus disambiguator.
-        # Hypothesis m in {1, 2}: the neural "bar" is one bar (m=1) or half a bar (m=2).
+        # Onset-autocorrelation & vocal-IOI heuristic meter/tactus disambiguator.
+        # Hypothesis m in {0.5, 1.0, 2.0}: the neural "bar" is two bars (m=0.5), one bar (m=1.0), or half a bar (m=2.0).
         acf = _onset_autocorrelation(onset_env)
-        log_post_by_m: dict[int, float] = {}
-        for m in (1, 2):
-            if m == 2 and len(db) < 6:
-                continue
-            log_post_by_m[m] = _metrical_level_log_posterior(
-                acf, frames_per_sec, m * median_bar, measure_beats, syl_arr, lo_bpm, hi_bpm
+        score_by_m: dict[float, float] = {}
+        for m in (0.5, 1.0, 2.0):
+            base_sc = _metrical_level_score(
+                acf, frames_per_sec, m * median_bar, bar_q_beats, syl_arr, lo_bpm, hi_bpm
             )
-        chosen_m = max(log_post_by_m, key=lambda m: log_post_by_m[m]) if log_post_by_m else 1
-        if chosen_m == 2 and np.isfinite(log_post_by_m[2]):
+            cand_spb_q = (m * median_bar) / max(1e-6, bar_q_beats)
+            tempo_match_pen = -0.5 * (math.log2(max(1e-6, cand_spb_q) / max(1e-6, spb_q)) / 0.35) ** 2
+            score_by_m[m] = base_sc + tempo_match_pen
+        chosen_m = max(score_by_m, key=lambda m: score_by_m[m]) if score_by_m else 1.0
+        if chosen_m == 0.5 and np.isfinite(score_by_m[0.5]):
+            subdivided: list[float] = [float(db[0])]
+            for i in range(len(db) - 1):
+                db_s, db_e = float(db[i]), float(db[i + 1])
+                mid_exp = 0.5 * (db_s + db_e)
+                tol_mid = 0.25 * (db_e - db_s)
+                inside_mid = beat_arr[(beat_arr > db_s + 1e-4) & (beat_arr < db_e - 1e-4)]
+                mid_t = mid_exp
+                if len(inside_mid):
+                    j_m = int(np.argmin(np.abs(inside_mid - mid_exp)))
+                    if abs(float(inside_mid[j_m]) - mid_exp) <= tol_mid:
+                        mid_t = float(inside_mid[j_m])
+                subdivided.append(mid_t)
+                subdivided.append(db_e)
+            db = np.asarray(subdivided, dtype=np.float64)
+            if len(db) >= 2:
+                median_bar = float(np.median(np.diff(db)))
+        elif chosen_m == 2.0 and np.isfinite(score_by_m[2.0]):
             # Downbeat phase parity: minimise the median syllable-to-downbeat distance, or, without
             # vocal onsets, maximise the summed onset accent on the retained downbeats.
             chosen_parity, min_parity_loss = 0, np.inf
             for par in (0, 1):
                 db_cand = db[par::2]
-                if len(db_cand) < 2:
+                if len(db_cand) < 1:
                     continue
                 if len(syl_arr):
                     dists = np.array([float(np.min(np.abs(db_cand - s))) for s in syl_arr])
@@ -504,14 +590,16 @@ def track_beats_and_downbeats(
                     chosen_parity, min_parity_loss = par, loss
             beat_arr = np.unique(np.sort(np.concatenate([beat_arr, db[1 - chosen_parity::2]])))
             db = db[chosen_parity::2]
+            if len(db) == 1:
+                db = np.array([float(db[0]), float(db[0]) + 2.0 * median_bar], dtype=np.float64)
             if len(db) >= 2:
                 median_bar = float(np.median(np.diff(db)))
 
-    use_neural_grid = backend == "beat_this" and len(db) >= 3
+    use_neural_grid = has_neural_downbeats and len(db) >= 2
 
-    # 1-Bar Pre-Vocal Pickup Origin
+    # 1-Bar Pre-Vocal Pickup Origin (preserving detected downbeat phase)
     first_downbeat = float(db[0]) if len(db) else float(downbeats[0] if len(downbeats) else beats[0])
-    bar_dur_init = measure_beats * spb
+    bar_dur_init = bar_q_beats * spb_q
 
     if use_neural_grid:
         while float(db[0]) - median_bar >= 0.0:
@@ -521,9 +609,10 @@ def track_beats_and_downbeats(
         if len(syl_arr) >= 1:
             first_vocal = float(syl_arr[0])
             if first_vocal > float(db[0]) + 1.2 * median_bar:
+                anticipation_tol = min(0.5 * spb_q, 0.2 * median_bar)
                 vocal_bar_idx = 0
                 for idx in range(len(db)):
-                    if float(db[idx]) <= first_vocal + 0.38:
+                    if float(db[idx]) <= first_vocal + anticipation_tol:
                         vocal_bar_idx = idx
                     else:
                         break
@@ -535,59 +624,134 @@ def track_beats_and_downbeats(
         db[0] = beat_origin
         if len(db) >= 2:
             median_bar = float(np.median(np.diff(db)))
-    elif len(syl_arr) >= 1:
-        first_vocal = float(syl_arr[0])
-        beat_origin = round(max(0.0, first_vocal - bar_dur_init), 6)
-    elif first_downbeat >= bar_dur_init:
-        n_pre_bars = int(first_downbeat // bar_dur_init)
-        beat_origin = round(max(0.0, first_downbeat - n_pre_bars * bar_dur_init), 6)
     else:
-        beat_origin = first_downbeat
+        n_pre_bars = int(first_downbeat // bar_dur_init) if bar_dur_init > 1e-6 else 0
+        phase_origin = max(0.0, first_downbeat - n_pre_bars * bar_dur_init)
+        if len(syl_arr) >= 1 and bar_dur_init > 1e-6:
+            first_vocal = float(syl_arr[0])
+            if first_vocal > phase_origin + 1.2 * bar_dur_init:
+                anticipation_tol = min(0.5 * spb_q, 0.2 * bar_dur_init)
+                vocal_bar_idx = int(math.floor((first_vocal + anticipation_tol - phase_origin) / bar_dur_init))
+                start_bar_idx = max(0, vocal_bar_idx - 1)
+                beat_origin = round(phase_origin + start_bar_idx * bar_dur_init, 6)
+            else:
+                beat_origin = round(phase_origin, 6)
+        else:
+            beat_origin = round(phase_origin, 6)
 
-    use_neural_grid = backend == "beat_this" and len(db) >= 3
+    use_neural_grid = has_neural_downbeats and len(db) >= 3
 
-    # Downbeat-Locked beat_times & bar_start_seconds Construction
+    # Downbeat-Locked quarter-note beat_times & bar_start_seconds Construction
     if use_neural_grid:
         # Extrapolate db forward until db[-1] >= duration
         while float(db[-1]) < duration:
             db = np.append(db, float(db[-1]) + median_bar)
 
-        bpm = float(np.clip(60.0 * measure_beats / float(np.median(np.diff(db))), lo_bpm, hi_bpm))
-        spb = 60.0 / bpm
+        bpm = float(60.0 * bar_q_beats / float(np.median(np.diff(db))))
+        spb_q = 60.0 / bpm
 
-        beat_times_list: list[float] = []
-        for b in range(len(db) - 1):
-            for t in _bar_beat_positions(beat_arr, float(db[b]), float(db[b + 1]), measure_beats):
-                if beat_times_list and t <= beat_times_list[-1] + 1e-4:
-                    t = beat_times_list[-1] + 1e-4
-                beat_times_list.append(float(t))
-        beat_times_list.append(max(beat_times_list[-1] + 1e-4, float(db[-1])) if beat_times_list else float(db[-1]))
-
-        max_bar_idx = (len(beat_times_list) - 1) // measure_beats
-        bar_start_seconds = [float(beat_times_list[b * measure_beats]) for b in range(max_bar_idx + 1)]
+        if is_int_bar_q:
+            beat_times_list: list[float] = []
+            for b in range(len(db) - 1):
+                for t in _bar_beat_positions(beat_arr, float(db[b]), float(db[b + 1]), bar_grid_beats):
+                    if beat_times_list and t <= beat_times_list[-1] + 1e-4:
+                        t = beat_times_list[-1] + 1e-4
+                    beat_times_list.append(float(t))
+            beat_times_list.append(max(beat_times_list[-1] + 1e-4, float(db[-1])) if beat_times_list else float(db[-1]))
+            max_bar_idx = (len(beat_times_list) - 1) // bar_grid_beats
+            bar_start_seconds = [float(beat_times_list[b * bar_grid_beats]) for b in range(max_bar_idx + 1)]
+        else:
+            n_bars_db = len(db) - 1
+            total_q_beats = n_bars_db * bar_q_beats
+            n_q_grid = max(1, int(math.ceil(total_q_beats)))
+            anchor_q: list[float] = [0.0]
+            anchor_t: list[float] = [float(db[0])]
+            for b in range(n_bars_db):
+                b_q_start = b * bar_q_beats
+                b_q_end = (b + 1) * bar_q_beats
+                db_s, db_e = float(db[b]), float(db[b + 1])
+                local_spb_q = (db_e - db_s) / max(1e-6, bar_q_beats)
+                tol_q = 0.25 * local_spb_q
+                inside_q = beat_arr[(beat_arr > db_s + 1e-4) & (beat_arr < db_e - 1e-4)]
+                k_lo = int(math.floor(b_q_start)) + 1
+                k_hi = int(math.ceil(b_q_end))
+                for k_q in range(k_lo, k_hi):
+                    expected_t = db_s + (k_q - b_q_start) * local_spb_q
+                    if len(inside_q):
+                        j_q = int(np.argmin(np.abs(inside_q - expected_t)))
+                        cand_t = float(inside_q[j_q])
+                        if abs(cand_t - expected_t) <= tol_q and cand_t > anchor_t[-1] + 1e-4 and cand_t < db_e - 1e-4:
+                            anchor_q.append(float(k_q))
+                            anchor_t.append(cand_t)
+                if db_e > anchor_t[-1] + 1e-4:
+                    anchor_q.append(float(b_q_end))
+                    anchor_t.append(db_e)
+            if n_q_grid > anchor_q[-1]:
+                ext_q = float(n_q_grid) - anchor_q[-1]
+                anchor_q.append(float(n_q_grid))
+                anchor_t.append(anchor_t[-1] + ext_q * spb_q)
+            bt_arr = np.interp(np.arange(n_q_grid + 1, dtype=np.float64), anchor_q, anchor_t)
+            for b in range(1, n_bars_db + 1):
+                b_q = b * bar_q_beats
+                k = int(math.floor(b_q))
+                alpha = b_q - k
+                if 1e-4 < alpha < 1.0 - 1e-4 and k + 1 <= n_q_grid:
+                    target_t = float(db[b])
+                    lo_bound = float(bt_arr[k - 1]) if k >= 1 else (float(db[0]) - spb_q)
+                    hi_bound = float(bt_arr[k + 2]) if (k + 2) <= n_q_grid else (float(bt_arr[-1]) + spb_q)
+                    h_init = max(1e-3, float(bt_arr[k + 1] - bt_arr[k]))
+                    h_max_lo = max(1e-4, 0.9 * (target_t - lo_bound) / alpha)
+                    h_max_hi = max(1e-4, 0.9 * (hi_bound - target_t) / (1.0 - alpha))
+                    h = min(h_init, h_max_lo, h_max_hi)
+                    bt_arr[k] = target_t - alpha * h
+                    bt_arr[k + 1] = target_t + (1.0 - alpha) * h
+            beat_times_list = [float(t) for t in bt_arr]
+            bar_start_seconds = [
+                beats_to_seconds_piecewise(b * bar_q_beats, beat_times_list, bpm, beat_origin)
+                for b in range(n_bars_db + 1)
+            ]
+        db = np.asarray([t for t in db if 0.0 <= float(t) < duration], dtype=np.float64)
+        downbeats = db
     else:
-        # Fallback: Kalman tempo-phase filter + RTS smoother (librosa backend or sparse downbeats)
-        downbeat_arr = np.asarray(downbeats, dtype=np.float64)
-        beat_times_list, cur_spb = _kalman_rts_beat_grid(
-            beat_origin, spb, duration, measure_beats, downbeat_arr, beat_arr, syl_arr, lo_bpm, hi_bpm
+        # Fallback: Kalman tempo-phase filter + RTS smoother in quarter-note beat units
+        if has_neural_downbeats:
+            beats = folded_beats
+            beat_arr = folded_beats
+        downbeat_arr = db if has_neural_downbeats else np.empty(0, dtype=np.float64)
+        eff_lo_bpm = min(lo_bpm, bpm * 0.95)
+        eff_hi_bpm = max(hi_bpm, bpm * 1.05)
+        beat_times_list, cur_spb_q = _kalman_rts_beat_grid(
+            beat_origin, spb_q, duration, bar_q_beats, downbeat_arr, beat_arr, syl_arr,
+            eff_lo_bpm, eff_hi_bpm,
         )
-        if cur_spb > 0:
-            bpm = float(np.clip(60.0 / cur_spb, lo_bpm, hi_bpm))
+        if cur_spb_q > 0:
+            bpm = float(60.0 / cur_spb_q)
 
-        # Build bar_start_seconds for fallback path
+        # Build bar_start_seconds for fallback path (extending beat_times_list to cover duration)
+        while beat_times_list[-1] < duration:
+            beat_times_list.append(beat_times_list[-1] + cur_spb_q)
         n_beat_times = len(beat_times_list)
-        n_bars = max(1, math.ceil((n_beat_times - 1) / measure_beats))
-        needed = n_bars * measure_beats + 1
+        n_bars = max(1, math.ceil((n_beat_times - 1) / max(1e-6, bar_q_beats)))
+        needed = int(math.ceil(n_bars * bar_q_beats)) + 1
         while len(beat_times_list) < needed:
-            beat_times_list.append(beat_times_list[-1] + cur_spb)
-        bar_start_seconds = [beat_times_list[b * measure_beats] for b in range(n_bars + 1)]
+            beat_times_list.append(beat_times_list[-1] + cur_spb_q)
+        if is_int_bar_q:
+            bar_start_seconds = [beat_times_list[b * bar_grid_beats] for b in range(n_bars + 1)]
+        else:
+            bar_start_seconds = [
+                beats_to_seconds_piecewise(b * bar_q_beats, beat_times_list, bpm, beat_origin)
+                for b in range(n_bars + 1)
+            ]
+        db = np.asarray([t for t in bar_start_seconds if 0.0 <= t < duration], dtype=np.float64)
+        downbeats = db
 
     return {
         "bpm": float(bpm),
+        "bpm_in_range": bool(lo_bpm <= bpm <= hi_bpm),
         "beat_origin": beat_origin,
         "meter": f"{measure_beats}/{meter_den}",
         "beats": [float(t) for t in beats],
-        "downbeats": [float(t) for t in downbeats],
+        "downbeats": [float(t) for t in downbeats if 0.0 <= float(t) < duration],
         "backend": backend,
         "beat_times": beat_times_list,
         "bar_start_seconds": bar_start_seconds,

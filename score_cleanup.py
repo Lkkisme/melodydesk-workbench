@@ -58,15 +58,17 @@ def organize(notes,bpm,origin=0,mode='auto'):
     result=[]
     for phrase in phrases:
         options=[]
-        for division in ([2,4,3] if mode=='auto' else [2,4] if mode=='binary' else [3,6]):
+        last_exc=None
+        for division in ([2,3,4,6] if mode=='auto' else [2,4] if mode=='binary' else [3,6]):
             try:
                 arranged,cost=_phrase(phrase,bpm,origin,division)
                 # Prefer simple binary rhythm unless finer/triplet fit is better.
                 options.append((cost+{2:0,4:.006,3:.009,6:.015}[division],arranged))
-            except ValueError:
-                pass
+            except ValueError as exc:
+                # Candidate grid division is too coarse for this phrase density; try finer divisions.
+                last_exc=exc
         if not options:
-            raise ValueError('此乐句音符太密，请先合并误切音符再整理。')
+            raise ValueError('此乐句音符太密，请先合并误切音符再整理。') from last_exc
         result.extend(min(options,key=lambda p:p[0])[1])
     for a,b in zip(result,result[1:]):
         if a.start+a.duration>b.start+1e-6:

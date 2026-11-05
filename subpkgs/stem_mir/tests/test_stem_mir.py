@@ -90,7 +90,7 @@ class StemMirTests(unittest.TestCase):
         self.assertEqual(res_maj["chords"][1], "E")
         self.assertEqual(len(res_maj["bar_dynamics"]), 4)
 
-        # Dorian / Natural Minor key (E minor, tonic="G", minor=True):
+        # Dorian / Natural Minor key (E minor, tonic="E", minor=True):
         # Bar 0 sings E4 + G4 + B4 -> Em; Bar 1 sings D4 + F#4 + A4 -> D (bVII, not B major V!)
         vocal_notes_min = [
             types.SimpleNamespace(pitch=64, start=0.0, duration=1.5),
@@ -103,7 +103,7 @@ class StemMirTests(unittest.TestCase):
             bpm=90.0,
             beat_origin=0.0,
             meter="3/4",
-            tonic="G",
+            tonic="E",
             clip_duration=4.0,
             minor=True,
         )

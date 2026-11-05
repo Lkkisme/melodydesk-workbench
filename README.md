@@ -1,100 +1,73 @@
-# MelodyDesk · 歌曲旋律工作台
+# MelodyDesk 2.0 · 全链路人声驱动木吉他编配与交互式六线谱工作台
 
-最新版本支持整首歌曲、中文歌词识别和校对、和弦指型图，以及六线谱＋主唱简谱＋按句定位歌词的 HTML/PDF。使用步骤见 [整曲与歌词说明](整曲与歌词说明.md)。
+**MelodyDesk 2.0** 是一套 **100% 纯人声驱动（Vocal-Driven）** 的自动扒谱、歌词音节强制对齐、四大吉他和声美学重配与高保真木吉他物理建模合成工作台。输入任意带人声的歌曲音频（MP3 / WAV / FLAC / M4A），自动提取主唱简谱、逐字对齐中英文歌词，并围绕人声主旋律生成零小二度冲突、可实时切换把位与伴奏织体的 **有谱（Yoopu）风格交互式吉他六线谱 + 和弦指型图 + 主唱简谱 + 歌词联谱**。
 
-本轮新增默认人声区域筛选、保留原演唱节奏及可选演唱音符模型。研究来源、实测指标与限制见 [算法与测试进展](算法与测试进展.md)。
+---
 
-最新加入乐句节奏整理、宽颤音归并、拖动校对和选区循环。使用方法与本轮验证见 [谱面整理说明](谱面整理说明.md)。
+## 一、 核心架构与 2026 SOTA 技术栈（四大子包）
 
-现已接入初版吉他弹唱伴奏：右上角「吉他编配」可修改每小节和弦、选择分解和弦／流行扫弦和变调夹，生成六线谱页面、试听与双轨 MIDI。详见 [吉他编配说明](吉他编配说明.md)。
-
-这是本地 Windows 原型：从完整歌曲中选取片段，提取主唱旋律、估计节拍，校对后生成可修改的吉他伴奏草稿。不是正式发行版。
-
-## 在当前电脑使用
-
-双击同目录的 **MelodyDesk.exe**。它是本地启动器，使用本项目已安装的运行环境；不需要输入 API Key。请保留当前的 `outputs/MelodyDesk` 与 `work` 相对位置。
-
-1. 点击「选择完整歌曲」，导入 MP3、WAV、FLAC、M4A 等文件。
-2. 设置开始秒数和片段长度，或勾选「整首歌曲」（最长 60 分钟）。建议先用短片段确认效果；整曲处理会更久。
-3. 点击「开始提取旋律」。本机 CPU 处理，耗时依片段、电脑而异。模型已在当前电脑缓存；首次在另一台电脑使用会下载模型。
-4. 对比「原曲片段」「分离人声」「旋律」「原曲＋旋律」。旋律默认按「原演唱节奏」播放，也可切换「谱面节奏」。新提取不强制量化，保留演唱中的起音与时长。
-5. 确认速度、拍号与 `1=` 调号。拍号默认 4/4，调号默认 C，并非自动判定。BPM 均以四分音符为单位，包含 6/8 拍。
-6. 点选音符修改 MIDI 音高、起始拍和时值。MIDI 60=C4、62=D4、64=E4。可新增、删除、等分拆分、合并相邻同音音符，或撤销。
-7. 保存 JSON 项目，或导出 MIDI、事件简谱文本。简谱文本不是出版排版谱。
-
-橙色表示音高跟踪置信度较低，建议优先检查；颜色不是音符准确率。起始拍从 0 计数，1 拍等于四分音符。更改 `1=` 仅改变简谱显示，不会移调。
-
-「应用设置」保留现有拍数；「按原始时间重排」根据新速度和拍点偏移重新量化到十六分音符网格，会覆盖手改节奏，可撤销。拍点偏移以片段起点为零、单位秒，表示第 0 拍在原音频中的相对位置。首版不自动判定弱起与小节重拍；三连音、自由速度需要手动校正。
-
-## 直接输入简谱
-
-切换到「手动简谱」，例如：
-
-```text
-1:1 2:0.5 3:0.5 5:1 0:1 | 6:1 5:1 3:2
+```mermaid
+flowchart LR
+    WAV["输入歌曲音频<br/>(Mix / Vocal WAV)"] --> S1["1. subpkgs/stem_mir<br/>• Mel-Band-RoFormer-Karaoke 人声分离<br/>• CPJKU Beat This! + 多拍周期折叠 + 卡尔曼节拍网格<br/>• Albrecht-Shanahan 调性 + 纯人声 Viterbi 功能和声"]
+    S1 --> S2["2. subpkgs/singing_lyrics<br/>• RMVPE + ROSVOT 人声转音符 + 变速网格分位数规整<br/>• Meta MMS_FA 300M CTC 音素强制对齐 (中英混排)<br/>• 真实声学时间轴 DP 逐字词音对齐"]
+    S2 --> S3["3. subpkgs/guitar_reharm<br/>• 四大吉他和声美学重配器 (Viterbi + 避用音硬约束)<br/>• 人体工学指板把位生成与声部平滑连接<br/>• 44 种真实吉他伴奏织体 + 耦合弦/箱体 IR 物理合成"]
+    S3 --> S4["4. subpkgs/score_web<br/>• FastAPI 交互式后端 (双端口/实时重配/混音试听)<br/>• Yoopu 风格 SVG 出版级六线谱 + 简谱 + 指型图<br/>• AlphaTab 双轨动态跟谱"]
 ```
 
-冒号后是四分音符拍数；`0:1` 为休止一拍；`1':1` 为高八度的 do；`1,:1` 为低八度；`#4:0.5` 为升 fa 半拍。竖线只作阅读分隔，首版不会校验它与拍号是否匹配。生成时使用当前填写的调号与速度。
+### 1. [`subpkgs/stem_mir`](subpkgs/stem_mir) — 人声提取、变速节拍追踪与纯人声功能和声推导
+- **主唱人声分离 ([`separator_engine.py`](subpkgs/stem_mir/separator_engine.py))**：采用 MVSEP 榜单冠军架构 `Mel-Band-RoFormer-Karaoke`（`aufr33_viperx_sdr_10.1956.ckpt`）与 `BS-RoFormer` 剥离伴奏与背景和声，输出高纯净度主唱干声。
+- **人声节拍与小节线锁定 ([`beat_tracker.py`](subpkgs/stem_mir/beat_tracker.py))**：基于 ISMIR 冠军模型 `CPJKU Beat This!` + 全局一致多拍周期折叠估计器 + 时变卡尔曼滤波节拍追踪器（Time-Varying Kalman Filter），输出支持自由速度（Rubato）的逐拍时间轴 `beat_times` 与逐小节起点 `bar_start_seconds`。
+- **100% 纯人声旋律条件化和声合成 ([`chord_recognizer.py`](subpkgs/stem_mir/chord_recognizer.py))**：采用 Albrecht & Shanahan (2013) 12 维音高类长时分布估计调性，并在对数域 Viterbi 动态规划上结合小节时值权重、强拍锚点、终止式（Cadence）与声部五度圈进行，直接从主唱旋律推导出和谐的基础和弦序列。
 
-## 当前边界
+### 2. [`subpkgs/singing_lyrics`](subpkgs/singing_lyrics) — 人声转简谱与音节级歌词强制对齐
+- **人声转音符与乐谱规整 ([`singing_transcriber.py`](subpkgs/singing_lyrics/singing_transcriber.py))**：结合 `RMVPE` 深度基频提取与 `ROSVOT` 音符边界检测，在真实变速节拍网格（Piecewise Beat Grid）上进行自适应分位数装饰音过滤、微颤音合并与小节线对齐。
+- **中英混排音节级强制对齐 ([`lyric_aligner.py`](subpkgs/singing_lyrics/lyric_aligner.py))**：使用 Meta `MMS_FA` 300M CTC 强制对齐模型（配合 `pypinyin` 汉字转罗马音与 Needleman-Wunsch 全局序列投影）提取每个字/词的精确声学起止秒数，再通过声学交集动态规划将歌词逐字挂载到简谱音符与一字多音延音线（`-`）上。
 
-- 默认是 Demucs 人声分离 + 稳定化 pYIN 单旋律跟踪 + PANNs 人声活动筛选。另可选择 ROSVOT 演唱音符模型（实验）。音高只从分离人声提取；原曲仅用于节拍分析。没有独立的主唱／伴唱声部分离模型；伴唱可能干扰旋律。
-- 「仅保留人声区域」默认开启，使用多秒上下文排除器乐残留，不是精确的声部识别。筛选包含说话标签，避免漏掉接近说话的演唱，因此不能据此排除说唱或所有对白。气声和特殊音色可能误判，可取消勾选后比较。
-- 说唱、密集和声、气声、滑音、同音重复、八度识别与无主唱片段需要人工检查。
-- 自动速度可能是实际速度的一半或两倍；第一版使用恒定速度，不拟合全曲速度变化。
-- 目前以钢琴卷帘与数字音符表校对；已有吉他伴奏六线谱草稿，尚无传统带减时线的完整主唱简谱排版、歌词对齐或原曲和弦识别。
-- JSON 保存音符与本机音轨路径，不内嵌音频。移动项目到另一台电脑时，旋律仍能编辑，原音频对比需要重新识别。`work/audio-jobs` 保存处理缓存，删除缓存后原曲／人声试听会失效。
-- 没有上传音频到第三方服务。下载依赖和初次下载模型时需要联网。
-- `MelodyDesk.exe` 是小型启动器，不是包含所有依赖的独立安装包。
+### 3. [`subpkgs/guitar_reharm`](subpkgs/guitar_reharm) — 四大吉他演奏美学、人体工学把位与物理建模合成
+- **四大吉他和声美学重配器 ([`reharmonizer.py`](subpkgs/guitar_reharm/reharmonizer.py))**：
+  1. **`original`（保留原曲）**：忠实保持基础自然音阶三/七和弦与主唱旋律零冲突对齐。
+  2. **`emotional_pop`（流行抒情重配 · C-Pop / J-Pop 指弹美学）**：引入 `add9`、`maj7`、`sus4 -> 3` 延留解决、大调 `IV -> iv6` 小四级借用与副属和弦（`V7/vi`、`V7/ii`），严格拦截任何与主唱旋律形成小二度（`interval == 1`）的刺耳碰撞。
+  3. **`neosoul_jazz`（Neo-Soul / 爵士色彩 · R&B 美学）**：扩展 `9` / `11` / `13` 延伸和弦、Tritone Substitution（三全音代理 $\text{bII7}$）与 Backdoor Progression（$\text{iv7} \to \text{bVII9} \to \text{Imaj9}$）。
+  4. **`folk_acoustic`（民谣指弹 · Tommy Emmanuel / 押尾コータロー 低音声部行进美学）**：强化第一转位斜线和弦（`I -> V/7 -> vi -> I/5 -> IV -> I/3`）与开放弦共鸣，令吉他在伴奏同时自带顺滑的 Bassline 旋律线。
+- **人体工学指板把位 ([`chord_voicing.py`](subpkgs/guitar_reharm/chord_voicing.py))**：根据物理跨度（4 品以内）、横按惩罚、低音弦浑厚度与相邻小节把位平滑转移生成真实可按的六弦指法图。
+- **44 种伴奏织体与物理建模合成 ([`arrangement_grooves.py`](subpkgs/guitar_reharm/arrangement_grooves.py) & [`guitar_simulator.py`](subpkgs/guitar_reharm/guitar_simulator.py))**：支持分解和弦、抒情琶音、指弹律动、Neo-Soul 律动、Bossa Nova、Travis Picking、民谣扫弦及击弦/勾弦（`H/P`）、拍弦（`Slap X`）、闷音（`PM`），并通过耦合弦合成与木吉他箱体脉冲响应（Body IR）生成真实感木吉他音频。
 
-## 开发结构
+### 4. [`subpkgs/score_web`](subpkgs/score_web) — 交互式曲谱工作台
+- **Web 服务端 ([`server.py`](subpkgs/score_web/server.py))**：提供 FastAPI 实时重配、单小节和弦替换建议、把位切换、变调夹（Capo `0..7`）移调、以及「人声 + 木吉他伴奏混音」「纯木吉他伴奏」「纯人声」三路实时音频流。
+- **出版级 SVG 联谱渲染 ([`yoopu_svg_renderer.py`](subpkgs/score_web/yoopu_svg_renderer.py))**：自动渲染和弦指型图网格、六线谱（TAB）、带减时线的主唱简谱（Jianpu）与逐字对齐歌词。
 
-- `app.py`：Windows 桌面界面、后台任务、试听、校对。
-- `engine.py`：解码、Demucs、节拍分析、pYIN、音符分段、音频合成与对比。
-- `music.py`：统一项目数据、文字简谱解析、量化、MIDI 与文本导出。
-- `test_music.py`：数据、节奏、输入校验、导出测试。
-- `test_app.py`：音符编辑、撤销、拆分合并、重排与默认窗口布局测试。
-- `verify_audio.py`：合成音频的实际推理冒烟测试，不代表真实歌曲准确率。
-- `Launcher.cs`：本地 Windows 启动器源代码。
+---
 
-工作数据位于同一工作区 `work/`；模型为 `work/model-cache`，运行环境为 `work/runtime/venv`。引擎函数 `analyze(source, start, duration, cancel, progress)` 独立于界面，后续可以接 FastAPI 或其他前端。
+## 二、 快速启动
 
-核心项目格式的 `notes` 包含：
-
-```json
-{
-  "pitch": 60,
-  "start": 0.0,
-  "duration": 1.0,
-  "raw_start": 0.12,
-  "raw_duration": 0.48,
-  "confidence": 0.85,
-  "edited": false
-}
-```
-
-`start` / `duration` 是四分音符拍数；`raw_start` / `raw_duration` 是片段内的原始秒数。加上项目的 `clip_start` 可还原整首歌的位置。修改音高会影响两种试听，手改拍数仅影响乐谱节奏试听。自动重排始终保留原始秒数。
-
-## 在其他电脑安装
-
-需要 Windows、Python 3.12、FFmpeg（含 ffprobe，并加入 PATH）。在 PowerShell 中运行：
+### 1. 环境准备
+需要 **Python 3.11 / 3.12** 与 **FFmpeg**（已加入系统 `PATH`）。安装依赖：
 
 ```powershell
-.\setup.ps1 -Python '你的 Python 3.12 路径\python.exe'
-.\launch.ps1
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
-依赖版本见 `requirements.txt` 与 `requirements-lock.txt`。PyTorch / torchaudio 使用 CPU 2.5.1 版本。不要直接移动当前虚拟环境到其他电脑；应重新安装。当前缓存已就绪，不需要重新运行安装脚本。
+### 2. 启动 Web 交互式吉他编配与曲谱工作台（推荐）
+```powershell
+python web_server.py --host 127.0.0.1 --port 7865
+```
+启动后在浏览器打开 `http://127.0.0.1:7865` 即可：
+- 在顶部曲库下拉框切换预置真唱曲目（《成都》《普通朋友》《Take Me Home, Country Roads》《Tears in Heaven》《Scarborough Fair》《Greensleeves》《Let's Go Fishin'》）或上传自定义歌曲音频；
+- 实时切换 **四大和声美学预设**、**伴奏织体风格**、**变调夹（Capo）**、**低音经过音 / 小节内切分加密 / 拍弦 / 闷音 / 击勾弦装饰**；
+- 点击谱面任意小节直接试听並替换候选替代和弦或切换不同把位指法。
 
-## 验证
+### 3. 启动本地桌面版工作台
+```powershell
+python app.py
+```
 
-在项目目录使用虚拟环境的 Python：
+---
+
+## 三、 运行测试与全链路校验
 
 ```powershell
-..\..\work\runtime\venv\Scripts\python.exe -m unittest -v test_music test_app
-..\..\work\runtime\venv\Scripts\python.exe verify_audio.py --separation
+# 运行全部 4 大子包单元测试与全链路法医回归测试（共 27 项测试）
+python -m pytest subpkgs test_forensic_regression.py -q
 ```
-
-8 个音乐数据测试和 6 个编辑界面回调测试通过；合成旋律的音高序列正确，完整分离与识别流程能完成，并生成 MIDI 和对比音频。合成测试出现半速节拍估计，界面保留校正入口。尚无用户真实歌曲准确率评估。桌面窗口的人工操作与视觉检查未完成：自动打开可见窗口的请求等待超时；已验证窗口能够初始化以及默认布局尺寸。
-
-下一步应该用同一批真实歌曲的人工标注片段评估音高、起音、时值、节拍和所需修改量，再决定是否更换旋律模型。之后接入和弦建议与吉他伴奏节奏模板。

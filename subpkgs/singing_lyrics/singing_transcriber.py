@@ -23,8 +23,7 @@ def estimate_key_albrecht_shanahan(notes: list) -> dict:
                 'confidence': 0.0, 'profile': list(AS_MAJOR)}
 
     chroma = [0.0] * 12
-    n_notes = len(notes)
-    for idx, n in enumerate(notes):
+    for n in notes:
         conf = max(0.35, float(getattr(n, 'confidence', 1.0)))
         dur = float(getattr(n, 'duration', 1.0))
         w = dur * conf
@@ -33,7 +32,7 @@ def estimate_key_albrecht_shanahan(notes: list) -> dict:
     last_pc = int(notes[-1].pitch) % 12
     first_pc = int(notes[0].pitch) % 12
 
-    top_k, top_minor, max_corr = 0, False, -2.0
+    top_k, top_minor, best_score, top_corr = 0, False, -2.0, 0.0
     top_profile = list(AS_MAJOR)
     for k in range(12):
         for is_minor, profile in ((False, AS_MAJOR), (True, AS_MINOR)):
@@ -48,22 +47,25 @@ def estimate_key_albrecht_shanahan(notes: list) -> dict:
                 var_r += dr * dr
                 var_p += dp * dp
             denom = math.sqrt(var_r * var_p) if var_r > 0 and var_p > 0 else 1e-12
-            corr = cov / denom
+            raw_corr = cov / denom
+            score = raw_corr
 
             if last_pc == k:
-                corr += 0.12
+                score += 0.12
             if first_pc == k:
-                corr += 0.06
+                score += 0.06
 
-            if corr > max_corr:
-                max_corr = corr
+            if score > best_score:
+                best_score = score
+                top_corr = raw_corr
                 top_k = k
                 top_minor = is_minor
                 top_profile = list(profile)
 
     rel_major_pc = (top_k + 3) % 12 if top_minor else top_k
+    conf_clamped = round(min(1.0, max(0.0, float(top_corr))), 4)
     return {'tonic_pc': top_k, 'is_minor': top_minor, 'rel_major_pc': rel_major_pc,
-            'confidence': max_corr, 'profile': top_profile}
+            'confidence': conf_clamped, 'profile': top_profile}
 
 
 def transcribe_vocal_notes(
@@ -143,9 +145,11 @@ def transcribe_vocal_notes(
                 for j in range(len(valid_cuts) - 1):
                     seg_s = valid_cuts[j]
                     seg_d = valid_cuts[j + 1] - seg_s
-                    if seg_d >= min_wb_seg:
-                        b_s = max(0.0, (seg_s - beat_origin) / spb_local)
-                        b_e = max(b_s + 1e-4, (seg_s + seg_d - beat_origin) / spb_local)
+                    if seg_d >= min_wb_seg and seg_s + seg_d > beat_origin + 1e-6:
+                        eff_s = max(beat_origin, seg_s)
+                        eff_d = (seg_s + seg_d) - eff_s
+                        b_s = max(0.0, (eff_s - beat_origin) / spb_local)
+                        b_e = max(b_s + 1e-4, (eff_s + eff_d - beat_origin) / spb_local)
                         split_raw.append(Note(n.pitch, b_s, b_e - b_s, seg_s, seg_d, n.confidence, n.edited))
             raw_notes = split_raw
 
@@ -181,8 +185,8 @@ def _pitch_candidates(n, profile: list, tonic_k: int) -> list[int]:
     p0 = int(n.pitch)
     conf_i = max(0.35, float(getattr(n, 'confidence', 1.0)))
     rel0 = (p0 % 12 - tonic_k) % 12
-    if (getattr(n, 'edited', False) or float(n.duration) > 0.8 or conf_i > 0.85
-            or profile[rel0] > 0.05):
+    if (getattr(n, 'edited', False) or profile[rel0] > 0.05
+            or float(n.duration) > 1.25 or conf_i > 0.92):
         return [p0]
     return [p0] + [p for p in (p0 - 1, p0 + 1) if 21 <= p <= 108]
 
@@ -191,14 +195,14 @@ def _pitch_node_potential(n, p: int, profile: list, tonic_k: int) -> float:
     """Log-potential of state p: observation fidelity + key-profile prior weighted by lambda_i."""
     p0 = int(n.pitch)
     conf_i = max(0.35, float(getattr(n, 'confidence', 1.0)))
-    lam = max(0.3, min(1.5, 1.0 - 0.8 * conf_i + 0.5 * (1.0 - float(n.duration))))
-    obs = -abs(p - p0) * (0.5 + 0.5 * conf_i)
+    lam = max(0.15, min(1.2, (1.0 - conf_i) * 1.1 + 0.35 * max(0.0, 1.0 - float(n.duration))))
+    obs = -abs(p - p0) * (0.4 + 1.6 * conf_i)
     log_prior = math.log(max(1e-6, profile[(p - tonic_k) % 12]))
     return obs + lam * log_prior
 
 
 def _viterbi_decode_phrase(phrase: list, profile: list, tonic_k: int) -> list[int]:
-    """First-order HMM Viterbi over one phrase: dp[i][s] / back[i][s] with -w*|p_i - p_{i-1}| transitions."""
+    """First-order chain-score Viterbi decoder over one phrase: dp[i][s] / back[i][s] with -w*|p_i - p_{i-1}| transitions."""
     states = [_pitch_candidates(n, profile, tonic_k) for n in phrase]
     if all(len(s) == 1 for s in states):
         return [s[0] for s in states]
@@ -226,18 +230,46 @@ def _viterbi_decode_phrase(phrase: list, profile: list, tonic_k: int) -> list[in
     return decoded
 
 
-def _viterbi_regularize_pitch_phrases(result: list, profile: list, tonic_k: int, spb: float) -> None:
+def _viterbi_regularize_pitch_phrases(
+    result: list,
+    profile: list,
+    tonic_k: int,
+    spb: float,
+    beat_times: list[float] | None = None,
+    beat_origin: float = 0.0,
+) -> None:
     """Phrase-level Viterbi pitch-sequence regularizer (in place).
 
-    Notes are split into phrases at rests longer than VITERBI_PHRASE_GAP_SEC; within each
-    phrase the pitch sequence is decoded jointly, with candidates {p0-1, p0, p0+1} for
-    uncertain out-of-key notes and {p0} for edited/long/confident/in-key notes.
+    Notes are split into phrases at rests longer than VITERBI_PHRASE_GAP_SEC (evaluated
+    in wall-clock seconds via ``beats_to_seconds_piecewise`` when ``beat_times`` is supplied,
+    or via ``spb`` otherwise); within each phrase the pitch sequence is decoded jointly, with
+    candidates {p0-1, p0, p0+1} for uncertain out-of-key notes and {p0} for
+    edited/long/confident/in-key notes.
     """
     if not result:
         return
+    use_bt = False
+    origin_beat = 0.0
+    bpm_eff = 60.0 / max(1e-6, float(spb))
+    bt_floats: list[float] = []
+    if beat_times is not None and len(beat_times) >= 2:
+        bt_floats = [float(t) for t in beat_times]
+        if all(math.isfinite(t) for t in bt_floats) and all(
+            bt_floats[i + 1] > bt_floats[i] for i in range(len(bt_floats) - 1)
+        ):
+            from subpkgs.stem_mir.beat_tracker import beats_to_seconds_piecewise, seconds_to_beats_piecewise
+            use_bt = True
+            origin_beat = float(seconds_to_beats_piecewise(beat_origin, bt_floats, bpm_eff, beat_origin))
     phrases: list[list] = [[result[0]]]
     for prev, cur in zip(result, result[1:]):
-        rest_sec = (float(cur.start) - (float(prev.start) + float(prev.duration))) * spb
+        prev_end_b = float(prev.start) + float(prev.duration)
+        cur_start_b = float(cur.start)
+        if use_bt:
+            prev_end_s = float(beats_to_seconds_piecewise(origin_beat + prev_end_b, bt_floats, bpm_eff, beat_origin))
+            cur_start_s = float(beats_to_seconds_piecewise(origin_beat + cur_start_b, bt_floats, bpm_eff, beat_origin))
+            rest_sec = cur_start_s - prev_end_s
+        else:
+            rest_sec = (cur_start_b - prev_end_b) * spb
         if rest_sec > VITERBI_PHRASE_GAP_SEC:
             phrases.append([])
         phrases[-1].append(cur)
@@ -257,7 +289,8 @@ def regulate_singing_notes_for_score(
     beat_times: list[float] | None = None,
 ) -> list:
     """Clean raw Note objects for score layout: merge micro-glitches, snap to
-    grid, organize phrases, and synchronize raw timing.
+    grid, organize phrases via ``score_cleanup.organize`` when ``eff_grid == 0.25``
+    (or sequential grid placement at finer grids), and synchronize raw timing.
 
     When `beat_times` has >= 2 monotonically increasing timestamps and notes have
     valid raw timing, uses piecewise beat mapping for tempo-varying scores.
@@ -270,12 +303,18 @@ def regulate_singing_notes_for_score(
     bpm = float(bpm)
     beat_origin = float(beat_origin)
     clip_duration = float(clip_duration)
+    grid = float(min_grid_beat)
+    if not math.isfinite(bpm) or bpm <= 0.0:
+        raise ValueError("bpm must be finite and positive")
+    if not math.isfinite(beat_origin):
+        raise ValueError("beat_origin must be finite")
+    if not math.isfinite(grid) or grid <= 0.0:
+        raise ValueError("min_grid_beat must be finite and positive")
     if not math.isfinite(clip_duration) or clip_duration < 0.0:
         raise ValueError("clip_duration must be finite and non-negative")
     if 0.0 < clip_duration <= beat_origin:
         return []
     spb = 60.0 / bpm
-    grid = float(min_grid_beat)
 
     use_piecewise = False
     origin_beat = 0.0
@@ -285,7 +324,14 @@ def regulate_singing_notes_for_score(
             use_piecewise = True
             origin_beat = float(seconds_to_beats_piecewise(beat_origin, beat_times, bpm, beat_origin))
 
-    ordered = sorted(copy.deepcopy(notes), key=lambda n: n.raw_start)
+    copied_notes = copy.deepcopy(notes)
+    for n in copied_notes:
+        if getattr(n, 'edited', False) and math.isfinite(float(n.start)) and math.isfinite(float(n.duration)) and float(n.start) >= 0.0 and float(n.duration) > 0.0:
+            s_ed = float(beats_to_seconds_piecewise(float(n.start) + origin_beat, beat_times, bpm, beat_origin)) if use_piecewise else (beat_origin + float(n.start) * spb)
+            e_ed = float(beats_to_seconds_piecewise(float(n.start + n.duration) + origin_beat, beat_times, bpm, beat_origin)) if use_piecewise else (s_ed + float(n.duration) * spb)
+            n.raw_start = max(0.0, s_ed)
+            n.raw_duration = max(1e-4, e_ed - n.raw_start)
+    ordered = sorted(copied_notes, key=lambda n: n.raw_start)
 
     for n in ordered:
         is_ed = bool(getattr(n, 'edited', False))
@@ -306,10 +352,8 @@ def regulate_singing_notes_for_score(
 
     wb_set = sorted(set(float(w) for w in (word_boundaries_sec or []) if math.isfinite(w))) if word_boundaries_sec else []
 
-    # Robust articulation-tempo statistics of the singer (medians are insensitive
-    # to the very micro-glitches we are about to merge). Inside the reference
-    # band the scales are exactly 1.0, so standard inputs keep the original
-    # time constants; only unusually fast/slow articulation rescales them.
+    # Median-based articulation scaling: dur_scale in [0.6, 1.5] (1.0 inside
+    # [0.15, 0.60] s) and gap_scale in [1.0, 1.4] (1.0 when median_gap <= 0.25 s).
     durs_sorted = sorted(float(n.raw_duration) for n in filtered)
     median_dur = durs_sorted[len(durs_sorted) // 2] if len(durs_sorted) % 2 else \
         0.5 * (durs_sorted[len(durs_sorted) // 2 - 1] + durs_sorted[len(durs_sorted) // 2])
@@ -355,7 +399,7 @@ def regulate_singing_notes_for_score(
                     and not has_wb and dp <= 1 and merge_affinity > 0.0
                     and prev.raw_duration < merge_max_prev_dur):
                 prev_dur = prev.raw_duration
-                prev.raw_duration = (n.raw_start + n.raw_duration) - prev.raw_start
+                prev.raw_duration = max(prev_dur, (n.raw_start + n.raw_duration) - prev.raw_start)
                 if n.raw_duration > prev_dur:
                     prev.pitch = n.pitch
                 continue
@@ -386,7 +430,7 @@ def regulate_singing_notes_for_score(
                     and prev.raw_duration < scoop_max_prev_dur and gap_t < scoop_gap_tau
                     and cur.raw_duration >= prev.raw_duration * 1.35
                     and scoop_affinity > 0.0):
-                old_end = cur.raw_start + cur.raw_duration
+                old_end = max(prev.raw_start + prev.raw_duration, cur.raw_start + cur.raw_duration)
                 cur.raw_start = prev.raw_start
                 cur.raw_duration = old_end - cur.raw_start
                 scooped.append(cur)
@@ -431,36 +475,36 @@ def regulate_singing_notes_for_score(
             merged = split_merged
 
     for n in merged:
-        if use_piecewise and n.raw_start >= 0 and n.raw_duration > 0:
+        if getattr(n, 'edited', False) and math.isfinite(float(n.start)) and math.isfinite(float(n.duration)) and float(n.start) >= 0.0 and float(n.duration) > 0.0:
+            cont_start = float(n.start)
+            cont_end = float(n.start + n.duration)
+        elif use_piecewise and n.raw_start >= 0 and n.raw_duration > 0:
             cont_start = float(seconds_to_beats_piecewise(n.raw_start, beat_times, bpm, beat_origin)) - origin_beat
             cont_end = float(seconds_to_beats_piecewise(n.raw_start + n.raw_duration, beat_times, bpm, beat_origin)) - origin_beat
         else:
             cont_start = (n.raw_start - beat_origin) / spb
             cont_end = (n.raw_start + n.raw_duration - beat_origin) / spb
         n.start = max(0.0, cont_start)
-        n.duration = max(0.12, cont_end - n.start)
+        n.duration = max(min(0.12, grid), cont_end - n.start)
 
     deduped: list = []
     for n in merged:
-        if deduped and abs(deduped[-1].start - n.start) < 0.08:
+        if deduped and abs(deduped[-1].start - n.start) < min(0.08, grid) and not (getattr(deduped[-1], 'edited', False) and getattr(n, 'edited', False) and n.raw_start >= deduped[-1].raw_start + deduped[-1].raw_duration - 1e-6):
             prev_ed = bool(getattr(deduped[-1], 'edited', False))
             cur_ed = bool(getattr(n, 'edited', False))
             if (cur_ed and not prev_ed) or (cur_ed == prev_ed and n.raw_duration > deduped[-1].raw_duration):
                 deduped[-1] = n
+            else:
+                deduped[-1].duration = max(deduped[-1].duration, (n.start + n.duration) - deduped[-1].start)
+                deduped[-1].raw_duration = max(deduped[-1].raw_duration, (n.raw_start + n.raw_duration) - deduped[-1].raw_start)
         else:
             deduped.append(n)
 
     for i, n in enumerate(deduped):
         if i + 1 < len(deduped):
             gap_beats = deduped[i + 1].start - n.start
-            if gap_beats > 0.08:
-                n.duration = max(0.12, min(n.duration if gap_beats - n.duration > 0.25 else gap_beats, gap_beats))
-
-    phrases: list[list] = []
-    for n in deduped:
-        if not phrases or (n.raw_start - (phrases[-1][-1].raw_start + phrases[-1][-1].raw_duration)) > 0.45:
-            phrases.append([])
-        phrases[-1].append(n)
+            if not getattr(n, 'edited', False) and gap_beats > min(0.08, grid):
+                n.duration = max(min(0.12, grid), min(n.duration if gap_beats - n.duration > 0.25 else gap_beats, gap_beats))
 
     max_beats_early = None
     if clip_duration > 0.0 and clip_duration > beat_origin:
@@ -471,14 +515,24 @@ def regulate_singing_notes_for_score(
 
     eff_grid = grid
     if len(deduped) >= 2:
-        min_sep = min((b.start - a.start for a, b in zip(deduped, deduped[1:]) if b.start > a.start), default=grid)
-        while eff_grid > min_sep * 0.9 and eff_grid > 0.03125:
-            eff_grid *= 0.5
+        seps = sorted(b.start - a.start for a, b in zip(deduped, deduped[1:]) if b.start > a.start)
+        if seps:
+            ref_sep = seps[len(seps) // 6] if len(deduped) > 16 else seps[0]
+            while eff_grid > ref_sep * 0.9 and eff_grid > 0.03125:
+                eff_grid *= 0.5
     if max_beats_early is not None and eff_grid > max_beats_early * 0.5:
         while eff_grid > max_beats_early * 0.5 and eff_grid > 0.03125:
             eff_grid *= 0.5
 
+    phrases: list[list] = []
+    prev_end_sec = 0.0
     for n in deduped:
+        s_sec = float(beats_to_seconds_piecewise(n.start + origin_beat, beat_times, bpm, beat_origin)) if use_piecewise else (beat_origin + n.start * spb)
+        e_sec = float(beats_to_seconds_piecewise(n.start + n.duration + origin_beat, beat_times, bpm, beat_origin)) if use_piecewise else (s_sec + n.duration * spb)
+        if not phrases or (s_sec - prev_end_sec) > 0.45:
+            phrases.append([])
+        phrases[-1].append(n)
+        prev_end_sec = max(s_sec, e_sec)
         n.raw_start = max(0.0, n.start * spb)
         n.raw_duration = max(0.065, n.duration * spb)
         n.start = max(0.0, round(round(n.start / eff_grid) * eff_grid, 10))
@@ -486,21 +540,29 @@ def regulate_singing_notes_for_score(
 
     raw_result: list = []
     for phrase in phrases:
-        try:
-            if abs(eff_grid - 0.25) > 1e-6 or any(getattr(x, 'edited', False) for x in phrase):
-                raise ValueError("Custom grid or edited note preservation required")
-            organized = score_cleanup.organize(phrase, bpm, 0.0, 'auto')
-            if any(abs(round(x.start / eff_grid) * eff_grid - x.start) > 1e-6
-                   or abs(round(x.duration / eff_grid) * eff_grid - x.duration) > 1e-6
-                   for x in organized):
-                raise ValueError("Organizer violated eff_grid")
+        organized = None
+        can_organize = (
+            abs(eff_grid - 0.25) <= 1e-6
+            and not any(getattr(x, 'edited', False) for x in phrase)
+            and all((b.raw_start - a.raw_start) >= 0.25 * spb - 1e-6 for a, b in zip(phrase, phrase[1:]))
+        )
+        if can_organize:
+            cand_org = score_cleanup.organize(phrase, bpm, 0.0, 'auto')
+            grid_ok = not any(
+                abs(round(x.start / eff_grid) * eff_grid - x.start) > 1e-6
+                or abs(round(x.duration / eff_grid) * eff_grid - x.duration) > 1e-6
+                for x in cand_org
+            )
+            clip_ok = True
             if max_beats_early is not None:
                 in_before = sum(1 for x in phrase if x.start < max_beats_early - 1e-6)
-                in_after = sum(1 for x in organized if x.start < max_beats_early - 1e-6)
-                if in_after < in_before:
-                    raise ValueError("Organizer pushed note past clip boundary")
+                in_after = sum(1 for x in cand_org if x.start < max_beats_early - 1e-6)
+                clip_ok = in_after >= in_before
+            if grid_ok and clip_ok:
+                organized = cand_org
+        if organized is not None:
             raw_result.extend(organized)
-        except ValueError:
+        else:
             cur_s = 0.0
             for idx_p, np_item in enumerate(phrase):
                 if idx_p > 0 and np_item.start < cur_s + eff_grid - 1e-6:
@@ -517,13 +579,22 @@ def regulate_singing_notes_for_score(
             if (cur_ed and not prev_ed) or (cur_ed == prev_ed and n.duration > result[-1].duration):
                 n.start = result[-1].start
                 result[-1] = n
+            else:
+                result[-1].duration = max(result[-1].duration, (n.start + n.duration) - result[-1].start)
             continue
         result.append(n)
 
     if len(result) >= 4:
         key_info = estimate_key_albrecht_shanahan(result)
         if key_info['confidence'] >= 0.45:
-            _viterbi_regularize_pitch_phrases(result, key_info['profile'], key_info['tonic_pc'], spb)
+            _viterbi_regularize_pitch_phrases(
+                result,
+                key_info['profile'],
+                key_info['tonic_pc'],
+                spb,
+                beat_times=beat_times if use_piecewise else None,
+                beat_origin=beat_origin,
+            )
 
     max_beats = None
     if clip_duration > 0.0 and clip_duration > beat_origin:

@@ -8,3 +8,6 @@ subpkgs/*/verification/
 .lkktest_runs/
 .sotareview_runs/
 scratch_vm/
+guitar_samples/
+guitar_samples
+
