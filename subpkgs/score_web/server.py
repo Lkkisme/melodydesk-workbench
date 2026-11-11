@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Literal
+import hashlib
 import inspect
 import io
 import logging
@@ -31,17 +32,20 @@ STATIC_ROOT = APP_ROOT / 'static'
 EXAMPLE_PROJECT = INSTALL_ROOT / 'examples' / 'demo-project.json'
 SIMULATION_ROOT = INSTALL_ROOT / 'work' / 'simulation_demo'
 REPERTOIRE_AUDIO_ROOT = INSTALL_ROOT / 'work' / 'repertoire_audio'
-REPERTOIRE_MANIFEST = REPERTOIRE_AUDIO_ROOT / 'repertoire_manifest.json'
-_STEM_AUDIO_CACHE: dict[tuple[str, int, int], np.ndarray] = {}
+_DEFAULT_REPERTOIRE_MANIFEST = REPERTOIRE_AUDIO_ROOT / 'repertoire_manifest.json'
+REPERTOIRE_MANIFEST = _DEFAULT_REPERTOIRE_MANIFEST
+PORTABLE_REPERTOIRE_MANIFEST = APP_ROOT / 'data' / 'repertoire_manifest.json'
+_STEM_AUDIO_CACHE: dict[tuple, np.ndarray] = {}
+_VOCAL_CAL_CACHE: dict[tuple, np.ndarray] = {}
 
 try:
     from subpkgs.guitar_reharm import (reharmonize_progression, arrange_advanced,
         roman_numeral, check_melody_clash, generate_voicings, suggest_bar_substitutions,
-        REHARMONIZE_PRESETS, ADVANCED_STYLES, synthesize_realistic_guitar)
+        REHARMONIZE_PRESETS, ADVANCED_STYLES, synthesize_realistic_guitar, recommend_artistry)
 except ModuleNotFoundError as exc:
     if not (exc.name == 'subpkgs.guitar_reharm' or (exc.name and exc.name.startswith('subpkgs.guitar_reharm.'))):
         raise
-    reharmonize_progression = arrange_advanced = synthesize_realistic_guitar = suggest_bar_substitutions = None
+    reharmonize_progression = arrange_advanced = synthesize_realistic_guitar = suggest_bar_substitutions = recommend_artistry = None
     REHARMONIZE_PRESETS, ADVANCED_STYLES = {}, ()
 try:
     from subpkgs.singing_lyrics import align_lyrics_to_notes, estimate_key_albrecht_shanahan
@@ -50,6 +54,12 @@ except ModuleNotFoundError as exc:
         raise
     align_lyrics_to_notes = None
     estimate_key_albrecht_shanahan = None
+try:
+    from subpkgs.stem_mir.beat_tracker import beats_to_seconds_piecewise, seconds_to_beats_piecewise
+except ModuleNotFoundError as exc:
+    if not (exc.name == 'subpkgs.stem_mir' or (exc.name and exc.name.startswith('subpkgs.stem_mir.'))):
+        raise
+    beats_to_seconds_piecewise = seconds_to_beats_piecewise = None
 
 
 _PROBE_CACHE: dict[tuple, bool] = {}
@@ -86,7 +96,8 @@ def _implemented(function) -> bool:
 
 def _refresh_backends():
     global reharmonize_progression, arrange_advanced, roman_numeral, check_melody_clash, generate_voicings, suggest_bar_substitutions
-    global REHARMONIZE_PRESETS, ADVANCED_STYLES, synthesize_realistic_guitar, align_lyrics_to_notes, estimate_key_albrecht_shanahan
+    global REHARMONIZE_PRESETS, ADVANCED_STYLES, synthesize_realistic_guitar, recommend_artistry, align_lyrics_to_notes, estimate_key_albrecht_shanahan
+    global beats_to_seconds_piecewise, seconds_to_beats_piecewise
     global NATIVE, PRESETS, STYLES
     import importlib
     try:
@@ -96,6 +107,7 @@ def _refresh_backends():
         generate_voicings, suggest_bar_substitutions = getattr(gr, 'generate_voicings', None), getattr(gr, 'suggest_bar_substitutions', None)
         REHARMONIZE_PRESETS, ADVANCED_STYLES = getattr(gr, 'REHARMONIZE_PRESETS', {}), getattr(gr, 'ADVANCED_STYLES', ())
         synthesize_realistic_guitar = getattr(gr, 'synthesize_realistic_guitar', None)
+        recommend_artistry = getattr(gr, 'recommend_artistry', None)
     except ModuleNotFoundError as exc:
         logger.debug("guitar_reharm optional module absent: %s", exc)
     except Exception as exc:
@@ -107,12 +119,50 @@ def _refresh_backends():
         logger.debug("singing_lyrics optional module absent: %s", exc)
     except Exception as exc:
         logger.warning("singing_lyrics import failed: %s", exc)
+    try:
+        bt_mod = importlib.import_module('subpkgs.stem_mir.beat_tracker')
+        beats_to_seconds_piecewise = getattr(bt_mod, 'beats_to_seconds_piecewise', None)
+        seconds_to_beats_piecewise = getattr(bt_mod, 'seconds_to_beats_piecewise', None)
+    except ModuleNotFoundError as exc:
+        logger.debug("stem_mir.beat_tracker optional module absent: %s", exc)
+    except Exception as exc:
+        logger.warning("stem_mir.beat_tracker import failed: %s", exc)
     NATIVE = _implemented(reharmonize_progression) and _implemented(arrange_advanced) and bool(REHARMONIZE_PRESETS)
     PRESETS = REHARMONIZE_PRESETS if NATIVE else {'original': {'name': '原版和弦', 'description': 'Basic triad accompaniment'}}
     STYLES = list(ADVANCED_STYLES) if NATIVE else ['分解和弦', '流行扫弦']
 
 
 _refresh_backends()
+
+
+def _has_audible_accompaniment(acc_path: str | Path | None) -> bool:
+    """Return True when the separated accompaniment stem exists and has multi-channel RMS >= 0.004 overall and >= 0.008 at the 90th-percentile 50ms frame."""
+    if not acc_path:
+        return False
+    p = Path(acc_path)
+    if not p.is_file():
+        return False
+    try:
+        import soundfile as sf
+        audio, sr = sf.read(str(p), dtype='float32', always_2d=True)
+    except Exception as exc:
+        logger.debug("Accompaniment stem read failed for %s: %s", p, exc)
+        return False
+    if audio.size == 0 or sr <= 0 or not np.isfinite(audio).all():
+        return False
+    ms = np.mean(audio.astype(np.float64) ** 2, axis=1)
+    overall_rms = float(np.sqrt(np.mean(ms)))
+    if overall_rms < 0.004:
+        return False
+    win = max(1, round(0.050 * sr))
+    if len(ms) < win:
+        trimmed = ms.reshape(1, -1)
+    else:
+        n_frames = len(ms) // win
+        trimmed = ms[: n_frames * win].reshape(n_frames, win)
+    f_rms = np.sqrt(np.mean(trimmed, axis=1))
+    p90_rms = float(np.percentile(f_rms, 90.0)) if f_rms.size else overall_rms
+    return p90_rms >= 0.008
 
 
 @dataclass
@@ -142,6 +192,8 @@ class Session:
     bar_start_seconds: list[float] = field(default_factory=list)
     beat_times: list[float] = field(default_factory=list)
     bar_dynamics: list[float] = field(default_factory=list)
+    detected_split_chords: dict = field(default_factory=dict)
+    use_detected_splits: bool = True
     word_timestamps: list = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     lyric_extraction_failed: bool = False
@@ -185,6 +237,7 @@ def _rebuild(candidate):
     _refresh_backends()
     candidate._cached_guitar_samples = None
     candidate.project.bar_start_seconds = list(candidate.bar_start_seconds)
+    candidate.project.beat_times = list(candidate.beat_times)
     if len(candidate.note_ref_indices) != len(candidate.project.notes):
         candidate.note_ref_indices = list(range(len(candidate.project.notes)))
     if not candidate.reference_note_lyrics and len(candidate.project.reference_notes) == len(candidate.note_lyrics):
@@ -206,22 +259,45 @@ def _rebuild(candidate):
         count = max(count, math.ceil((candidate.project.clip_duration-candidate.project.beat_origin)*candidate.project.bpm/60/measure))
     voicings_explicit, voicings_reset = bool(candidate.__dict__.pop('_voicings_explicit', False)), bool(candidate.__dict__.pop('_voicings_reset', False))
     chords_explicit = bool(candidate.__dict__.pop('_chords_explicit', False))
-    if voicings_reset: candidate.custom_voicings = [None]*count
-    if len(candidate.base_chords) != count:
-        candidate.base_chords = guitar.suggest(candidate.project, NAMES.index(candidate.project.tonic))
-        if not voicings_explicit and len(candidate.custom_voicings) != count: candidate.custom_voicings = [None]*count
+    if voicings_reset:
+        candidate.custom_voicings = [None] * count
+    old_c_len = len(candidate.base_chords)
+    if old_c_len != count:
+        if old_c_len > count:
+            candidate.base_chords = list(candidate.base_chords[:count])
+        else:
+            suggested = guitar.suggest(candidate.project, NAMES.index(candidate.project.tonic))
+            fallback_chord = candidate.base_chords[-1] if candidate.base_chords else candidate.project.tonic
+            tail = [suggested[b] if b < len(suggested) else fallback_chord for b in range(old_c_len, count)]
+            candidate.base_chords = list(candidate.base_chords) + tail
+        if not voicings_explicit and not voicings_reset and len(candidate.custom_voicings) != count:
+            old_v_len = len(candidate.custom_voicings)
+            if old_v_len > count:
+                candidate.custom_voicings = list(candidate.custom_voicings[:count])
+            else:
+                candidate.custom_voicings = list(candidate.custom_voicings) + [None] * (count - old_v_len)
     if not chords_explicit and candidate.custom_chords:
         candidate.custom_chords = {k: v for k, v in candidate.custom_chords.items() if 0 <= int(k.split(':')[0]) < count}
     if candidate.custom_segment_voicings:
         candidate.custom_segment_voicings = {k: v for k, v in candidate.custom_segment_voicings.items() if 0 <= int(k.split(':')[0]) < count}
+    if candidate.detected_split_chords:
+        candidate.detected_split_chords = {k: v for k, v in candidate.detected_split_chords.items() if str(k).isdigit() and 0 <= int(k) < count}
     if candidate.preset not in PRESETS or candidate.style not in STYLES:
         raise ValueError('Unsupported preset or style for the active backend')
     if len(candidate.custom_voicings) != count:
         raise ValueError('Custom voicings must match bar count')
     if NATIVE:
-        analysis = reharmonize_progression(candidate.base_chords, candidate.project,
+        _reharm_kwargs = dict(
             preset=candidate.preset, tonic=candidate.project.tonic, split_bar=candidate.split_bar,
-            capo=candidate.capo)
+            capo=candidate.capo,
+        )
+        if (
+            candidate.use_detected_splits
+            and candidate.detected_split_chords
+            and 'detected_split_chords' in inspect.signature(reharmonize_progression).parameters
+        ):
+            _reharm_kwargs['detected_split_chords'] = candidate.detected_split_chords
+        analysis = reharmonize_progression(candidate.base_chords, candidate.project, **_reharm_kwargs)
         for identity, chord in candidate.custom_chords.items():
             pieces = identity.split(':')
             bar = int(pieces[0])
@@ -231,6 +307,8 @@ def _rebuild(candidate):
             targets = range(len(segments)) if len(pieces) == 1 else [int(pieces[1])]
             for part in targets:
                 if not 0 <= part < len(segments):
+                    if not chords_explicit:
+                        continue
                     raise ValueError('Chord override segment is out of range')
                 segment = segments[part]
                 choices = generate_voicings(chord, candidate.capo)
@@ -324,19 +402,42 @@ def _rebuild(candidate):
     candidate.bar_analysis, candidate.arrangement = analysis, arrangement
 
 
-_MANIFEST_CACHE: tuple[int, int, dict] | None = None
+_MANIFEST_CACHE: tuple[str, int, int, dict] | None = None
+
+
+def _resolve_repertoire_path(raw: str | Path | None) -> Path | None:
+    """Resolve a portable relative or local absolute repertoire audio path if present on disk."""
+    if not raw:
+        return None
+    norm = str(raw).replace('\\', '/')
+    direct = Path(norm)
+    if direct.is_file():
+        return direct.resolve()
+    if not direct.is_absolute():
+        rel = Path(norm.lstrip('/'))
+        for base in (INSTALL_ROOT, APP_ROOT, REPERTOIRE_AUDIO_ROOT):
+            cand = base / rel
+            if cand.is_file():
+                return cand.resolve()
+    return None
 
 
 def _get_repertoire_manifest() -> dict:
     global _MANIFEST_CACHE
-    if REPERTOIRE_MANIFEST.is_file():
+    manifest_path = REPERTOIRE_MANIFEST
+    if (not manifest_path.is_file()
+            and manifest_path == _DEFAULT_REPERTOIRE_MANIFEST
+            and PORTABLE_REPERTOIRE_MANIFEST.is_file()):
+        manifest_path = PORTABLE_REPERTOIRE_MANIFEST
+    if manifest_path.is_file():
         try:
-            st = REPERTOIRE_MANIFEST.stat()
-            if _MANIFEST_CACHE is None or _MANIFEST_CACHE[:2] != (st.st_mtime_ns, st.st_size):
-                _MANIFEST_CACHE = (st.st_mtime_ns, st.st_size, json.loads(REPERTOIRE_MANIFEST.read_text(encoding='utf-8')))
-            return _MANIFEST_CACHE[2]
+            st = manifest_path.stat()
+            cache_sig = (str(manifest_path), st.st_mtime_ns, st.st_size)
+            if _MANIFEST_CACHE is None or _MANIFEST_CACHE[:3] != cache_sig:
+                _MANIFEST_CACHE = (*cache_sig, json.loads(manifest_path.read_text(encoding='utf-8')))
+            return _MANIFEST_CACHE[3]
         except Exception as exc:
-            logger.warning("Failed to parse repertoire manifest %s: %s", REPERTOIRE_MANIFEST, exc)
+            logger.warning("Failed to parse repertoire manifest %s: %s", manifest_path, exc)
     return {}
 
 
@@ -393,7 +494,7 @@ def _initial_session(demo_mode: str = 'mandarin_pop'):
     init_warnings: list[str] = []
     if demo_mode in manifest:
         entry = manifest[demo_mode]
-        vocals_wav = Path(entry['vocals_wav']) if isinstance(entry, dict) and entry.get('vocals_wav') else None
+        vocals_wav = _resolve_repertoire_path(entry.get('vocals_wav')) if isinstance(entry, dict) else None
         if vocals_wav is not None and vocals_wav.is_file():
             notes = [Note(**n) for n in entry['notes']]
             req_style = entry.get('style')
@@ -431,8 +532,11 @@ def _initial_session(demo_mode: str = 'mandarin_pop'):
                 embellish_hp = False
             else:
                 embellish_hp = req_embellish_hp
+            req_split_bar = bool(entry.get('split_bar', False))
+            split_bar = bool(req_split_bar and NATIVE)
             for w in init_warnings:
                 logger.warning("%s", w)
+            resolved_source = _resolve_repertoire_path(entry.get('source'))
             project = Project(
                 title=entry['title'],
                 tonic=entry['tonic'],
@@ -440,11 +544,12 @@ def _initial_session(demo_mode: str = 'mandarin_pop'):
                 bpm=float(entry['bpm']),
                 beat_origin=float(entry['beat_origin']),
                 clip_duration=float(entry['clip_duration']),
-                source=entry['source'],
+                source=str(resolved_source) if resolved_source is not None else str(entry.get('source', '')),
                 audio={'vocals': str(vocals_wav)},
                 notes=notes,
                 reference_notes=deepcopy(notes),
                 bar_start_seconds=list(entry.get('bar_start_seconds', [])),
+                beat_times=list(entry.get('beat_times', [])),
                 warnings=list(init_warnings),
             )
             chords = list(entry['base_chords'])
@@ -459,6 +564,7 @@ def _initial_session(demo_mode: str = 'mandarin_pop'):
                 style=style_name,
                 capo=int(entry.get('capo', 0)),
                 passing_bass=passing_bass,
+                split_bar=split_bar,
                 embellish_hp=embellish_hp,
                 intro_mode=intro_mode,
                 raw_lyrics=entry['raw_lyrics'],
@@ -468,6 +574,8 @@ def _initial_session(demo_mode: str = 'mandarin_pop'):
                 bar_start_seconds=list(entry.get('bar_start_seconds', [])),
                 beat_times=list(entry.get('beat_times', [])),
                 bar_dynamics=list(entry.get('bar_dynamics', [])),
+                detected_split_chords=dict(entry.get('detected_split_chords') or {}),
+                use_detected_splits=True,
                 word_timestamps=list(entry.get('word_timestamps', [])),
                 warnings=list(init_warnings),
                 demo_mode=demo_mode,
@@ -534,7 +642,7 @@ def _active_repertoire_catalog() -> dict[str, dict]:
     all_keys = list(dict.fromkeys(list(manifest.keys()) + list(_DEMO_PIECES.keys())))
     for key in all_keys:
         entry = manifest.get(key)
-        vocals_wav = Path(entry['vocals_wav']) if isinstance(entry, dict) and entry.get('vocals_wav') else None
+        vocals_wav = _resolve_repertoire_path(entry.get('vocals_wav')) if isinstance(entry, dict) else None
         if vocals_wav is not None and vocals_wav.is_file():
             title = str(entry.get('title') or key)
             dur_val = entry.get('clip_duration')
@@ -588,11 +696,22 @@ def get_state_payload(session):
     _refresh_backends()
     project = session.project
     sim_info = _simulation_demos()
+    if NATIVE and callable(recommend_artistry):
+        rec = dict(recommend_artistry(project, session.base_chords, session.bar_dynamics))
+        if rec.get('preset') not in PRESETS:
+            rec = dict(preset=session.preset if session.preset in PRESETS else 'original', secondary_preset=None, style=session.style if session.style in STYLES else (STYLES[0] if STYLES else '分解和弦'), reason='', scores={})
+        elif rec.get('style') not in STYLES:
+            rec['style'] = session.style if session.style in STYLES else (STYLES[0] if STYLES else '分解和弦')
+    else:
+        rec = dict(preset=session.preset if session.preset in PRESETS else 'original', secondary_preset=None, style=session.style if session.style in STYLES else (STYLES[0] if STYLES else '分解和弦'), reason='', scores={})
     payload = {key: getattr(session, key) for key in ('preset', 'style', 'capo', 'passing_bass', 'split_bar',
-        'slap_x', 'palm_mute', 'embellish_hp', 'intro_mode', 'raw_lyrics', 'bar_analysis', 'arrangement',
+        'use_detected_splits', 'slap_x', 'palm_mute', 'embellish_hp', 'intro_mode', 'raw_lyrics', 'bar_analysis', 'arrangement',
         'warnings', 'lyric_extraction_failed', 'harmony_synthesis_failed')}
     payload.update(title=project.title, tonic=project.tonic, meter=project.meter, bpm=float(project.bpm),
         presets=PRESETS, styles=STYLES, chords=session.arrangement['chords'],
+        recommended_preset=rec['preset'], recommended_secondary_preset=rec['secondary_preset'],
+        recommended_style=rec['style'], recommended_reason=rec['reason'],
+        recommendation_scores=rec.get('scores', {}),
         bar_start_seconds=session.arrangement.get('bar_start_seconds', session.bar_start_seconds),
         beat_times=session.arrangement.get('beat_times', session.beat_times),
         alphatex=to_alphatex(project, session.arrangement, session.note_lyrics),
@@ -636,6 +755,15 @@ class ReharmonizeRequest(RequestModel):
     tonic: str | None = None
     bpm: float | None = Field(default=None, ge=30, le=300)
     meter: str | None = None
+
+    @field_validator('custom_voicings')
+    @classmethod
+    def _check_custom_voicings(cls, value):
+        if value is not None:
+            for item in value:
+                if item is not None:
+                    _validate_frets(item)
+        return value
 
 
 class BarChordRequest(RequestModel):
@@ -830,6 +958,55 @@ def _load_stem_audio(path: str | Path, sr: int, origin_sec: float) -> np.ndarray
     return audio
 
 
+def _calibrate_lead_vocal_stem(vocal: np.ndarray, sr: int) -> np.ndarray:
+    """Shape real singing stems (>= 20 active 50ms post-HPF frames) with an 80 Hz rumble cut, bounded makeup gain (<= 4.0x toward -16.2 dBFS active RMS), subtle early room air, and soft-knee peak limiting within [-0.94, 0.94]; scale shorter clips linearly by 0.85x."""
+    vocal_contig = np.ascontiguousarray(vocal, dtype=np.float32)
+    key = (vocal_contig.shape, int(sr), hashlib.blake2b(vocal_contig.tobytes(), digest_size=16).digest())
+    cached = _VOCAL_CAL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    win = max(1, round(0.050 * sr))
+    n_frames = len(vocal) // win
+    if n_frames >= 20:
+        from scipy.signal import butter, sosfilt
+        hp = butter(2, min(0.45 * sr, 80.0), btype='highpass', fs=sr, output='sos')
+        shaped = np.empty_like(vocal, dtype=np.float64)
+        shaped[:, 0] = sosfilt(hp, vocal[:, 0].astype(np.float64))
+        shaped[:, 1] = sosfilt(hp, vocal[:, 1].astype(np.float64))
+        ms_frames = np.mean(shaped[: n_frames * win] ** 2, axis=1).reshape(n_frames, win)
+        f_rms = np.sqrt(np.mean(ms_frames, axis=1))
+        max_r = float(np.max(f_rms)) if f_rms.size else 0.0
+        thresh = max(10.0 ** (-48.0 / 20.0), 0.10 * max_r)
+        active = f_rms[f_rms >= thresh]
+        if active.size >= 20:
+            act_rms = float(np.sqrt(np.mean(active ** 2)))
+            target_rms = 10.0 ** (-16.2 / 20.0)
+            gain = min(4.0, target_rms / max(1e-6, act_rms))
+            shaped *= gain
+            # Subtle studio vocal room air (-27 dB at 21ms L / 34ms R) so separated vocals sit naturally with the wooden guitar
+            d_l, d_r = round(0.021 * sr), round(0.034 * sr)
+            air_gain = 10.0 ** (-27.0 / 20.0)
+            mono_wet = shaped.mean(axis=1)
+            if d_l < len(shaped):
+                shaped[d_l:, 0] += air_gain * mono_wet[: len(shaped) - d_l]
+            if d_r < len(shaped):
+                shaped[d_r:, 1] += air_gain * mono_wet[: len(shaped) - d_r]
+            # Smooth soft-knee peak ceiling above 0.70 preventing hard clipping within [-0.94, 0.94]
+            abs_v = np.abs(shaped)
+            over = abs_v > 0.70
+            if np.any(over):
+                shaped[over] = np.sign(shaped[over]) * (0.70 + 0.22 * np.tanh((abs_v[over] - 0.70) / 0.22))
+            out = np.clip(shaped, -0.94, 0.94).astype(np.float32)
+            out.flags.writeable = False
+            if len(_VOCAL_CAL_CACHE) >= 24:
+                _VOCAL_CAL_CACHE.pop(next(iter(_VOCAL_CAL_CACHE)), None)
+            _VOCAL_CAL_CACHE[key] = out
+            return out
+    out = (vocal * np.float32(0.85)).astype(np.float32)
+    out.flags.writeable = False
+    return out
+
+
 def _build_lead_events(session) -> list[dict]:
     notes = session.project.notes
     if not notes:
@@ -882,10 +1059,11 @@ def _vocal_only_samples(session, sr=44100):
         lead_arr = dict(session.arrangement, bars=[], chords=[])
         lead_samples = _synthesize_event_list(session.project, lead_arr, lead_events, sr=sr)
         length = max(len(lead_samples), guitar_len)
-        return np.pad(lead_samples, ((0, length - len(lead_samples)), (0, 0))) * 0.58
+        return np.pad(lead_samples, ((0, length - len(lead_samples)), (0, 0))) * 0.65
     vocal = _load_stem_audio(path, sr, _stem_origin_sec(session))
-    length = max(len(vocal), guitar_len)
-    return np.pad(vocal[:length], ((0, max(0, length - len(vocal))), (0, 0))) * 0.85
+    v_cal = _calibrate_lead_vocal_stem(vocal, sr)
+    length = max(len(v_cal), guitar_len)
+    return np.pad(v_cal[:length], ((0, max(0, length - len(v_cal))), (0, 0)))
 
 
 def _vocal_mix_samples(session, sr=44100):
@@ -898,12 +1076,12 @@ def _vocal_mix_samples(session, sr=44100):
         lead_arr = dict(session.arrangement, bars=[], chords=[])
         lead_samples = _synthesize_event_list(session.project, lead_arr, lead_events, sr=sr)
         length = max(len(lead_samples), len(guitar_samples))
-        return (np.pad(lead_samples, ((0, length - len(lead_samples)), (0, 0))) * 0.58 +
+        return (np.pad(lead_samples, ((0, length - len(lead_samples)), (0, 0))) * 0.65 +
                 np.pad(guitar_samples, ((0, length - len(guitar_samples)), (0, 0))) * 0.82)
-    vocal = _load_stem_audio(path, sr, _stem_origin_sec(session))
-    length = max(len(vocal), len(guitar_samples))
-    return (np.pad(vocal[:length], ((0, max(0, length - len(vocal))), (0, 0))) * 0.7 +
-            np.pad(guitar_samples[:length], ((0, max(0, length - len(guitar_samples))), (0, 0))) * 0.85)
+    v_only = _vocal_only_samples(session, sr=sr)
+    length = max(len(v_only), len(guitar_samples))
+    return (np.pad(v_only[:length], ((0, max(0, length - len(v_only))), (0, 0))) * np.float32(0.7 / 0.85) +
+            np.pad(guitar_samples[:length], ((0, max(0, length - len(guitar_samples))), (0, 0))) * np.float32(0.85))
 
 
 def create_app() -> FastAPI:
@@ -957,14 +1135,23 @@ def create_app() -> FastAPI:
             split_changed = 'split_bar' in request.model_fields_set and request.split_bar != candidate.split_bar
             bpm_changed = 'bpm' in request.model_fields_set and request.bpm != candidate.project.bpm
             meter_changed = 'meter' in request.model_fields_set and request.meter != candidate.project.meter
-            if (preset_changed or capo_changed or tonic_changed or split_changed or bpm_changed or meter_changed) and 'custom_voicings' not in request.model_fields_set:
+            prev_use_det = bool(candidate.use_detected_splits)
+            if request.model_fields_set == {'split_bar'}:
+                new_use_det = bool(request.split_bar)
+            elif ('split_bar' in request.model_fields_set and bool(request.split_bar)) or preset_changed:
+                new_use_det = True
+            else:
+                new_use_det = prev_use_det
+            det_split_changed = (new_use_det != prev_use_det)
+            prior_bt = list(candidate.beat_times)
+            if (preset_changed or capo_changed or tonic_changed or split_changed or det_split_changed or bpm_changed or meter_changed) and 'custom_voicings' not in request.model_fields_set:
                 candidate.custom_voicings = [None]*len(candidate.base_chords)
                 candidate.custom_segment_voicings.clear()
-            if (preset_changed or tonic_changed or split_changed or bpm_changed or meter_changed) and 'custom_chords' not in request.model_fields_set:
+            if (preset_changed or tonic_changed or split_changed or det_split_changed or bpm_changed or meter_changed) and 'custom_chords' not in request.model_fields_set:
                 candidate.custom_chords.clear()
+            candidate.use_detected_splits = new_use_det
             if bpm_changed or meter_changed:
-                candidate.bar_start_seconds = []
-                candidate.beat_times = []
+                candidate.detected_split_chords = {}
             for key in request.model_fields_set:
                 value = getattr(request, key)
                 if value is None:
@@ -987,6 +1174,129 @@ def create_app() -> FastAPI:
                             for seg_key in [k for k in candidate.custom_segment_voicings if k == str(b_idx) or k.startswith(f'{b_idx}:')]:
                                 candidate.custom_segment_voicings.pop(seg_key, None)
                 setattr(candidate.project if key in ('title', 'tonic', 'bpm', 'meter') else candidate, key, value)
+
+            if bpm_changed:
+                candidate.bar_start_seconds = []
+                candidate.beat_times = []
+                has_recording = bool(candidate.project.source) or bool(candidate.project.audio.get('vocals'))
+                if has_recording and (candidate.project.notes or candidate.project.reference_notes):
+                    new_bpm = float(candidate.project.bpm)
+                    origin = float(candidate.project.beat_origin)
+                    tick = 1.0 / 48.0
+
+                    def _resync_run(indexed_run, min_b: float, max_b: float | None):
+                        if not indexed_run:
+                            return [], []
+                        ordered_pairs = sorted(indexed_run, key=lambda pair: float(pair[1].raw_start))
+                        perm_indices = [pair[0] for pair in ordered_pairs]
+                        run_notes = [pair[1] for pair in ordered_pairs]
+                        try:
+                            return organize(
+                                run_notes, new_bpm, origin, 'auto',
+                                beat_times=None, min_beat=min_b, max_beat=max_b,
+                            ), perm_indices
+                        except ValueError:
+                            out_run = deepcopy(run_notes)
+                            cur_min = max(0.0, float(min_b))
+                            n_r = len(out_run)
+                            for r_i, rn in enumerate(out_run):
+                                rem = n_r - 1 - r_i
+                                raw_b = max(cur_min, (float(rn.raw_start) - origin) * new_bpm / 60.0)
+                                q_b = round(raw_b * 4.0) / 4.0
+                                if q_b < cur_min - 1e-9 or (max_b is not None and q_b + (rem + 1) * 0.25 > max_b + 1e-9):
+                                    q_b = max(cur_min, round(raw_b / tick) * tick)
+                                if max_b is not None:
+                                    q_b = min(q_b, max(cur_min, max_b - (rem + 1) * tick))
+                                rn.start = round(q_b, 6)
+                                cur_min = rn.start + tick
+                            for r_i, rn in enumerate(out_run):
+                                lim = (out_run[r_i + 1].start - rn.start) if r_i + 1 < n_r else (
+                                    (max_b - rn.start) if max_b is not None else max(0.25, float(rn.raw_duration) * new_bpm / 60.0)
+                                )
+                                raw_d = max(tick, float(rn.raw_duration) * new_bpm / 60.0)
+                                q_d = round(raw_d * 4.0) / 4.0
+                                if q_d <= 0 or q_d > lim + 1e-9:
+                                    q_d = min(lim, max(tick, round(raw_d / tick) * tick))
+                                rn.duration = round(max(tick, min(lim, q_d)), 6)
+                            return out_run, perm_indices
+
+                    if candidate.project.reference_notes:
+                        ref_resynced, ref_perm = _resync_run(
+                            [(i_r, deepcopy(rn)) for i_r, rn in enumerate(candidate.project.reference_notes)],
+                            0.0, None,
+                        )
+                        for rn_item in ref_resynced:
+                            rn_item.edited = False
+                        candidate.project.reference_notes = ref_resynced
+                        if ref_perm != list(range(len(ref_perm))):
+                            if len(candidate.reference_note_lyrics) == len(ref_perm):
+                                candidate.reference_note_lyrics = [candidate.reference_note_lyrics[i] for i in ref_perm]
+                            inv_ref = {old_r: new_r for new_r, old_r in enumerate(ref_perm)}
+                            if candidate.custom_note_lyrics:
+                                candidate.custom_note_lyrics = {
+                                    inv_ref[k]: v for k, v in candidate.custom_note_lyrics.items() if k in inv_ref
+                                }
+                            if candidate.note_ref_indices:
+                                candidate.note_ref_indices = [inv_ref.get(r_i, r_i) for r_i in candidate.note_ref_indices]
+
+                    if candidate.project.notes:
+                        resynced, resync_perm, run_buf, min_bound = [], [], [], 0.0
+                        for idx_cur, n_cur in enumerate(candidate.project.notes):
+                            if n_cur.edited:
+                                r_notes, r_perm = _resync_run(run_buf, min_bound, float(n_cur.start))
+                                resynced.extend(r_notes)
+                                resync_perm.extend(r_perm)
+                                run_buf = []
+                                resynced.append(n_cur)
+                                resync_perm.append(idx_cur)
+                                min_bound = float(n_cur.start + n_cur.duration)
+                            else:
+                                run_buf.append((idx_cur, n_cur))
+                        r_notes, r_perm = _resync_run(run_buf, min_bound, None)
+                        resynced.extend(r_notes)
+                        resync_perm.extend(r_perm)
+                        if len(candidate.note_lyrics) == len(resync_perm):
+                            candidate.note_lyrics = [candidate.note_lyrics[i] for i in resync_perm]
+                        if len(candidate.note_ref_indices) == len(resync_perm):
+                            candidate.note_ref_indices = [candidate.note_ref_indices[i] for i in resync_perm]
+                        candidate.project.notes = resynced
+                        if (candidate.raw_lyrics.strip() or candidate.word_timestamps) and any(n.edited for n in resynced):
+                            _align(candidate)
+                        elif candidate.custom_note_lyrics and len(candidate.note_ref_indices) == len(candidate.note_lyrics):
+                            for i_c, ref_idx in enumerate(candidate.note_ref_indices):
+                                if ref_idx in candidate.custom_note_lyrics:
+                                    candidate.note_lyrics[i_c] = candidate.custom_note_lyrics[ref_idx]
+            elif meter_changed:
+                m_parts = str(candidate.project.meter).strip().split('/')
+                valid_m = (
+                    len(m_parts) == 2
+                    and m_parts[0].isdigit()
+                    and m_parts[1].isdigit()
+                    and int(m_parts[0]) > 0
+                    and int(m_parts[1]) in (2, 4, 8)
+                )
+                if valid_m and len(prior_bt) >= 2 and callable(beats_to_seconds_piecewise):
+                    new_meas = int(m_parts[0]) * 4.0 / int(m_parts[1])
+                    origin = float(candidate.project.beat_origin)
+                    cur_bpm = float(candidate.project.bpm)
+                    o_b = float(seconds_to_beats_piecewise(origin, prior_bt, cur_bpm, origin)) if callable(seconds_to_beats_piecewise) else 0.0
+                    max_end_b = max((n.start + n.duration for n in candidate.project.notes), default=0.0)
+                    if candidate.project.source and candidate.project.clip_duration > origin and callable(seconds_to_beats_piecewise):
+                        c_b = float(seconds_to_beats_piecewise(candidate.project.clip_duration, prior_bt, cur_bpm, origin)) - o_b
+                        max_end_b = max(max_end_b, c_b)
+                    n_bars_m = max(1, math.ceil(max_end_b / new_meas))
+                    candidate.beat_times = prior_bt
+                    raw_bars = [
+                        round(float(beats_to_seconds_piecewise(o_b + b * new_meas, prior_bt, cur_bpm, origin)), 4)
+                        for b in range(n_bars_m + 1)
+                    ]
+                    for b_i in range(1, len(raw_bars)):
+                        if raw_bars[b_i] <= raw_bars[b_i - 1]:
+                            raw_bars[b_i] = round(raw_bars[b_i - 1] + 1e-4, 4)
+                    candidate.bar_start_seconds = raw_bars
+                else:
+                    candidate.bar_start_seconds = []
+                    candidate.beat_times = []
         return mutate(operation)
 
     @application.post('/api/bar_chord')
@@ -1145,15 +1455,26 @@ def create_app() -> FastAPI:
                 )
                 for i, n in enumerate(candidate.project.notes)
             ]
+            bt_map = candidate.beat_times if len(candidate.beat_times) >= 2 else None
             notes, run = [], []
+            min_b = 0.0
             for note in candidate.project.notes:
                 if note.edited:
-                    notes.extend(organize(run, candidate.project.bpm, candidate.project.beat_origin, request.mode))
-                    run = []
+                    if run:
+                        notes.extend(organize(
+                            run, candidate.project.bpm, candidate.project.beat_origin,
+                            request.mode, beat_times=bt_map, min_beat=min_b, max_beat=float(note.start),
+                        ))
+                        run = []
                     notes.append(note)
+                    min_b = float(note.start + note.duration)
                 else:
                     run.append(note)
-            notes.extend(organize(run, candidate.project.bpm, candidate.project.beat_origin, request.mode))
+            if run:
+                notes.extend(organize(
+                    run, candidate.project.bpm, candidate.project.beat_origin,
+                    request.mode, beat_times=bt_map, min_beat=min_b, max_beat=None,
+                ))
             candidate.project.notes = notes
             candidate.project.validate()
             max_match_sec = max(0.25, 60.0 / float(candidate.project.bpm))
@@ -1264,7 +1585,12 @@ def create_app() -> FastAPI:
 
         def _worker():
             try:
-                from subpkgs.stem_mir import separate_stems, track_beats_and_downbeats, synthesize_melody_conditioned_harmony
+                from subpkgs.stem_mir import (
+                    separate_stems,
+                    track_beats_and_downbeats,
+                    recognize_accompaniment_chords,
+                    synthesize_melody_conditioned_harmony,
+                )
                 from subpkgs.singing_lyrics import transcribe_vocal_notes, regulate_singing_notes_for_score
                 import soundfile as sf
 
@@ -1286,27 +1612,32 @@ def create_app() -> FastAPI:
                     word_ts = aligned.get('word_timestamps') or []
                     if not inferred_lyrics.strip() and aligned.get('raw_lyrics'):
                         inferred_lyrics = str(aligned['raw_lyrics']).strip()
-                    measured_ts = [w for w in word_ts if not w.get('interpolated') and not w.get('subdivided')]
-                    subdiv_ts = [w for w in word_ts if not w.get('interpolated') and w.get('subdivided')]
+                    measured_ts = [w for w in word_ts if not w.get('interpolated') and not w.get('unsung') and not w.get('subdivided')]
+                    subdiv_ts = [w for w in word_ts if not w.get('interpolated') and not w.get('unsung') and w.get('subdivided')]
                     vocal_onsets = sorted(
                         {float(w['start']) for w in measured_ts if 'start' in w and float(w['start']) >= 0}
                         | {float(w['group_start']) for w in subdiv_ts if 'group_start' in w and float(w['group_start']) >= 0}
                     )
-                    word_boundaries = sorted(
-                        set(vocal_onsets)
-                        | {float(w['end']) for w in measured_ts if 'end' in w and float(w['end']) >= 0}
-                        | {float(w['group_end']) for w in subdiv_ts if 'group_end' in w and float(w['group_end']) >= 0}
-                    )
+                    word_boundaries = list(vocal_onsets)
                 except Exception as exc:
                     lyric_extraction_failed = True
                     warn_msg = f"lyric_extraction_failed: {exc}"
                     stage_warnings.append(warn_msg)
                     logger.warning("Word timestamp extraction failed: %s", exc)
 
-                application.state.jobs[job_id] = {'status': 'running', 'progress': 0.4, 'message': '正在提取人声节奏、主旋律与生成吉他和弦...'}
+                application.state.jobs[job_id] = {'status': 'running', 'progress': 0.4, 'message': '正在提取节拍、原曲和声基底与主旋律...'}
 
-                # Step 3 — Vocal Beat & Downbeat Tracking
-                beat_info = track_beats_and_downbeats(stems['vocals'], prefer_cuda=True, vocal_onsets_sec=vocal_onsets or None)
+                # Step 3 — Hybrid Beat & Downbeat Tracking:
+                # Lock onto full mix when real accompaniment exists; fall back to vocals on pure a-cappella uploads.
+                acc_wav = stems.get('accompaniment')
+                has_accompaniment = _has_audible_accompaniment(acc_wav)
+                beat_source = audio_path if has_accompaniment else stems['vocals']
+                beat_info = track_beats_and_downbeats(
+                    beat_source,
+                    prefer_cuda=True,
+                    vocal_onsets_sec=vocal_onsets or None,
+                    pre_vocal_bars=4 if has_accompaniment else 1,
+                )
                 bpm = float(beat_info['bpm'])
                 beat_origin = float(beat_info['beat_origin'])
                 meter = str(beat_info['meter'])
@@ -1334,12 +1665,17 @@ def create_app() -> FastAPI:
                     stage_warnings.append(warn_msg)
                     logger.warning("regulate_singing_notes_for_score degraded to fallback: %s", exc)
                     try:
-                        notes = organize(raw_notes, bpm, beat_origin, 'auto') if raw_notes else []
+                        notes = organize(
+                            raw_notes, bpm, beat_origin, 'auto',
+                            beat_times=beat_times_secs or None,
+                        ) if raw_notes else []
                     except Exception as org_exc:
                         logger.warning("organize fallback to raw_notes: %s", org_exc)
                         notes = raw_notes
 
-                # Step 5 — Key Estimation (Albrecht-Shanahan 2013 when available, else guitar.key_candidates)
+                # Step 5 — Hybrid Key & Base Harmony Extraction:
+                # Extract true accompaniment chords & concert key when accompaniment is audible;
+                # fall back automatically to vocal key + melody-conditioned harmony on pure a-cappella.
                 tonic_pc, is_minor = 0, False
                 if notes and _implemented(estimate_key_albrecht_shanahan):
                     key_info = estimate_key_albrecht_shanahan(notes)
@@ -1354,6 +1690,46 @@ def create_app() -> FastAPI:
                         warn_msg = f"key_estimation_unresolved: no key candidates found; defaulted tonic to {NAMES[tonic_pc]} major from final note"
                         stage_warnings.append(warn_msg)
                         logger.warning("%s", warn_msg)
+
+                base_chords: list[str] = []
+                bar_dyn: list[float] = []
+                det_splits: dict = {}
+                used_acc_harmony = False
+                if has_accompaniment and callable(recognize_accompaniment_chords):
+                    try:
+                        acc_res = recognize_accompaniment_chords(
+                            acc_wav,
+                            bpm=bpm,
+                            beat_origin=beat_origin,
+                            meter=meter,
+                            tonic=None,
+                            minor=None,
+                            clip_duration=clip_duration,
+                            bar_start_seconds=bar_start_secs or None,
+                            beat_times=beat_times_secs or None,
+                            notes=notes,
+                            vocal_audio_path=stems['vocals'],
+                        )
+                        if isinstance(acc_res, dict) and acc_res.get('available') and acc_res.get('chords'):
+                            used_acc_harmony = True
+                            raw_tpc = acc_res.get('tonic_pc')
+                            if isinstance(raw_tpc, int) and not isinstance(raw_tpc, bool) and 0 <= raw_tpc < 12:
+                                tonic_pc = int(raw_tpc)
+                                is_minor = bool(acc_res.get('is_minor', False))
+                            elif acc_res.get('tonic') in NAMES:
+                                tonic_pc = NAMES.index(acc_res['tonic'])
+                                is_minor = bool(acc_res.get('is_minor', False))
+                            base_chords = list(acc_res['chords'])
+                            if isinstance(acc_res.get('split_chords'), dict):
+                                det_splits = {str(k): list(v) for k, v in acc_res['split_chords'].items()}
+                            if acc_res.get('bar_start_seconds'):
+                                bar_start_secs = [float(t) for t in acc_res['bar_start_seconds']]
+                            if acc_res.get('bar_dynamics'):
+                                bar_dyn = [float(d) for d in acc_res['bar_dynamics']]
+                    except Exception as exc:
+                        stage_warnings.append(f"accompaniment_harmony_degraded: {exc}")
+                        logger.warning("Accompaniment chord recognition degraded to vocal harmony fallback: %s", exc)
+
                 rel_major_pc = (tonic_pc + 3) % 12 if is_minor else tonic_pc
                 rel_tonic = NAMES[rel_major_pc]
                 project = Project(
@@ -1362,41 +1738,50 @@ def create_app() -> FastAPI:
                     audio={'vocals': stems['vocals']},
                     notes=notes, reference_notes=deepcopy(notes),
                     bar_start_seconds=list(bar_start_secs),
+                    beat_times=list(beat_times_secs),
                     warnings=list(stage_warnings),
                 )
-                vocal_chords = guitar.suggest(project, tonic_pc, minor=is_minor) if notes else []
-                if vocal_chords:
-                    base_chords = [ch if ch else 'N.C.' for ch in vocal_chords]
-                else:
-                    bar_count = max(1, len(bar_start_secs) - 1) if len(bar_start_secs) >= 2 else 1
-                    base_chords = ['N.C.'] * bar_count
-                bar_dyn: list[float] = []
-                try:
-                    if callable(synthesize_melody_conditioned_harmony) and notes:
-                        harmony = synthesize_melody_conditioned_harmony(
-                            notes, bpm=bpm, beat_origin=beat_origin, meter=meter, tonic=NAMES[tonic_pc], minor=is_minor,
-                            clip_duration=clip_duration, bar_start_seconds=bar_start_secs or None,
-                            beat_times=beat_times_secs or None)
-                        if isinstance(harmony, dict):
-                            if harmony.get('chords'):
-                                base_chords = list(harmony['chords'])
-                            if harmony.get('bar_start_seconds'):
-                                bar_start_secs = [float(t) for t in harmony['bar_start_seconds']]
-                            if harmony.get('bar_dynamics'):
-                                bar_dyn = [float(d) for d in harmony['bar_dynamics']]
-                except Exception as exc:
-                    harmony_synthesis_failed = True
-                    warn_msg = f"harmony_synthesis_failed: {exc}"
-                    stage_warnings.append(warn_msg)
-                    logger.warning("Harmony synthesis failed: %s", exc)
+
+                if not used_acc_harmony:
+                    vocal_chords = guitar.suggest(project, tonic_pc, minor=is_minor) if notes else []
+                    if vocal_chords:
+                        base_chords = [ch if ch else 'N.C.' for ch in vocal_chords]
+                    else:
+                        bar_count = max(1, len(bar_start_secs) - 1) if len(bar_start_secs) >= 2 else 1
+                        base_chords = ['N.C.'] * bar_count
+                    try:
+                        if callable(synthesize_melody_conditioned_harmony) and notes:
+                            harmony = synthesize_melody_conditioned_harmony(
+                                notes, bpm=bpm, beat_origin=beat_origin, meter=meter, tonic=NAMES[tonic_pc], minor=is_minor,
+                                clip_duration=clip_duration, bar_start_seconds=bar_start_secs or None,
+                                beat_times=beat_times_secs or None)
+                            if isinstance(harmony, dict):
+                                if harmony.get('chords'):
+                                    base_chords = list(harmony['chords'])
+                                if harmony.get('bar_start_seconds'):
+                                    bar_start_secs = [float(t) for t in harmony['bar_start_seconds']]
+                                if harmony.get('bar_dynamics'):
+                                    bar_dyn = [float(d) for d in harmony['bar_dynamics']]
+                    except Exception as exc:
+                        harmony_synthesis_failed = True
+                        warn_msg = f"harmony_synthesis_failed: {exc}"
+                        stage_warnings.append(warn_msg)
+                        logger.warning("Harmony synthesis failed: %s", exc)
+
                 if not bar_start_secs and beat_info.get('downbeats'):
                     bar_start_secs = [float(t) for t in beat_info['downbeats']]
                 if not bar_dyn and bar_start_secs:
-                    bar_dyn = [1.0] * len(bar_start_secs)
+                    bar_dyn = [1.0] * (max(1, len(bar_start_secs) - 1) if len(bar_start_secs) >= 2 else 1)
                 project.bar_start_seconds = list(bar_start_secs)
                 project.warnings = list(stage_warnings)
 
                 # Step 6 — Apply session state and align lyrics when raw_lyrics or word_timestamps are available
+                rec_init = (
+                    recommend_artistry(project, base_chords, bar_dyn)
+                    if callable(recommend_artistry)
+                    else None
+                )
+
                 def _apply(candidate):
                     candidate.demo_mode = 'upload'
                     candidate.project = project
@@ -1404,9 +1789,17 @@ def create_app() -> FastAPI:
                     candidate.custom_chords = {}
                     candidate.custom_segment_voicings = {}
                     candidate.custom_voicings = [None] * len(base_chords)
+                    if rec_init is not None:
+                        if rec_init.get('preset') in PRESETS:
+                            candidate.preset = rec_init['preset']
+                        if rec_init.get('style') in STYLES:
+                            candidate.style = rec_init['style']
+                    candidate.intro_mode = 'chord_melody' if NATIVE else 'none'
                     candidate.bar_start_seconds = bar_start_secs
                     candidate.beat_times = beat_times_secs
                     candidate.bar_dynamics = bar_dyn
+                    candidate.detected_split_chords = det_splits
+                    candidate.use_detected_splits = True
                     candidate.raw_lyrics = inferred_lyrics
                     candidate.note_lyrics = [''] * len(notes)
                     candidate.note_ref_indices = list(range(len(notes)))

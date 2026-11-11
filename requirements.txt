@@ -12,5 +12,6 @@ torchlibrosa==0.1.0
 PyYAML>=6,<7
 requests>=2.31,<3
 faster-whisper==1.2.1
+pypinyin>=0.50,<1
 reportlab>=4,<6
 svglib>=1.5,<3

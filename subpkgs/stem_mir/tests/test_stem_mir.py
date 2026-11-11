@@ -1,5 +1,4 @@
-"""Locked unit tests for subpkgs/stem_mir (100% Pure Vocal-Driven Pipeline)."""
-import inspect
+"""Unit tests for subpkgs/stem_mir (Plan A Hybrid Accompaniment-First + Pure-Vocal Fallback Pipeline)."""
 import tempfile
 import types
 import unittest
@@ -15,12 +14,12 @@ if str(MELODY_ROOT) not in sys.path:
     sys.path.insert(0, str(MELODY_ROOT))
 
 from subpkgs.stem_mir import (
+    recognize_accompaniment_chords,
     resolve_device,
     separate_stems,
-    track_beats_and_downbeats,
     synthesize_melody_conditioned_harmony,
+    track_beats_and_downbeats,
 )
-import subpkgs.stem_mir.chord_recognizer as cr_mod
 
 
 def _write_wav(path: Path, samples: np.ndarray, sr: int = 22050) -> None:
@@ -63,7 +62,7 @@ class StemMirTests(unittest.TestCase):
             self.assertGreaterEqual(res["bpm"], 60.0)
             self.assertLessEqual(res["bpm"], 180.0)
             self.assertGreaterEqual(res["beat_origin"], 0.0)
-            self.assertIn(res["meter"], ("4/4", "3/4"))
+            self.assertIn(res["meter"], ("4/4", "3/4", "6/8"))
             self.assertIsInstance(res["beats"], list)
             self.assertIsInstance(res["downbeats"], list)
 
@@ -110,14 +109,59 @@ class StemMirTests(unittest.TestCase):
         self.assertEqual(res_min["chords"][0], "Em")
         self.assertEqual(res_min["chords"][1], "D")
 
-    def test_zero_accompaniment_pollution_in_chord_recognizer(self):
-        """Ensure chord_recognizer contains zero accompaniment audio / CQT parameters or functions."""
-        sig = inspect.signature(synthesize_melody_conditioned_harmony)
-        self.assertNotIn("accompaniment_path", sig.parameters)
-        src = inspect.getsource(cr_mod)
-        self.assertNotIn("recognize_accompaniment_chords", src)
-        self.assertNotIn("extract_instrumental_melody", src)
-        self.assertNotIn("librosa.cqt", src)
+    def test_hybrid_accompaniment_chord_recognition_and_acappella_fallback(self):
+        """Accompaniment chord recognizer extracts true C -> Am -> F -> G from audio and returns available=False on silence."""
+        sr = 22050
+        bar_sec = 2.0  # 120 BPM in 4/4
+        chord_midis = [
+            [48, 60, 64, 67],  # C:  C3, C4, E4, G4
+            [45, 57, 60, 64],  # Am: A2, A3, C4, E4
+            [41, 53, 57, 60],  # F:  F2, F3, A3, C4
+            [43, 55, 59, 62],  # G:  G2, G3, B3, D4
+        ]
+        t_bar = np.arange(int(sr * bar_sec), dtype=np.float64) / sr
+        bars_audio = []
+        for midis in chord_midis:
+            sig = np.zeros_like(t_bar)
+            for m in midis:
+                f0 = 440.0 * (2.0 ** ((m - 69) / 12.0))
+                sig += 0.35 * np.sin(2 * np.pi * f0 * t_bar) + 0.14 * np.sin(4 * np.pi * f0 * t_bar)
+            bars_audio.append(sig.astype(np.float32))
+        full_acc = np.concatenate(bars_audio)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            acc_path = Path(tmp) / "acc.wav"
+            silent_path = Path(tmp) / "silent.wav"
+            _write_wav(acc_path, full_acc, sr=sr)
+            pcm_zero = np.zeros(int(sr * 4.0), dtype="<i2")
+            with wave.open(str(silent_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(pcm_zero.tobytes())
+
+            res = recognize_accompaniment_chords(
+                accompaniment_path=acc_path,
+                bpm=120.0,
+                beat_origin=0.0,
+                meter="4/4",
+                clip_duration=8.0,
+                bar_start_seconds=[0.0, 2.0, 4.0, 6.0, 8.0],
+            )
+            self.assertTrue(res["available"])
+            self.assertEqual(res["tonic"], "C")
+            self.assertFalse(res["minor"])
+            self.assertEqual([c.split("/")[0] for c in res["chords"]], ["C", "Am", "F", "G"])
+            self.assertEqual(len(res["bar_dynamics"]), 4)
+
+            res_silent = recognize_accompaniment_chords(
+                accompaniment_path=silent_path,
+                bpm=120.0,
+                beat_origin=0.0,
+                meter="4/4",
+                clip_duration=4.0,
+            )
+            self.assertFalse(res_silent["available"])
 
 
 if __name__ == "__main__":

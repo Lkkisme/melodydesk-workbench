@@ -11,6 +11,7 @@ from .reharmonizer import (
     check_melody_clash,
     reharmonize_progression,
     suggest_bar_substitutions,
+    recommend_artistry,
 )
 from .arrangement_grooves import (
     ADVANCED_STYLES,
@@ -32,6 +33,7 @@ __all__ = [
     "check_melody_clash",
     "reharmonize_progression",
     "suggest_bar_substitutions",
+    "recommend_artistry",
     "ADVANCED_STYLES",
     "arrange_advanced",
     "synthesize_realistic_guitar",

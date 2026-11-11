@@ -6,8 +6,11 @@ from ._score_timing import build_score_timeline, duration_parts, TICKS
 
 
 def _svg_text(x, y, text, size=16, **attributes):
-    attrs = ' '.join(f'{escape(k.replace("_", "-"), quote=True)}="{escape(str(v), quote=True)}"' for k, v in attributes.items())
-    return f'<text x="{x:g}" y="{y:g}" font-size="{size}" text-anchor="middle" {attrs}>{escape(str(text), quote=True)}</text>'
+    merged = {"text-anchor": "middle"}
+    for k, v in attributes.items():
+        merged[k.replace("_", "-")] = v
+    attrs = ' '.join(f'{escape(k, quote=True)}="{escape(str(v), quote=True)}"' for k, v in merged.items())
+    return f'<text x="{x:g}" y="{y:g}" font-size="{size}" {attrs}>{escape(str(text), quote=True)}</text>'
 
 
 def _line(x1, y1, x2, y2, width=1, color="#0f172a"):
@@ -62,10 +65,15 @@ def _render_tab_bar(arrangement, index, x_at, bar_width, left, string_y_base):
         y = string_y_base + (string - 1) * 15
         result.append(_line(left, y, tab_right, y, 1, "#64748b"))
     result.append(_line(tab_right, string_y_base, tab_right, string_y_base + 75, 1.5, "#0f172a"))
+    measure_beats = float(arrangement['measure_beats'])
+    meter_str = str(arrangement.get('meter', '4/4')).strip()
+    is_compound = meter_str.endswith('/8') and round(measure_beats * 2) >= 6 and round(measure_beats * 2) % 3 == 0
+    group_span = 1.5 if is_compound else 1.0
     beat_xs = set()
+    grouped_xs: dict[int, set[float]] = {}
     for event in arrangement['events']:
-        relative = event['start'] - index * arrangement['measure_beats']
-        if not 0 <= relative < arrangement['measure_beats']:
+        relative = event['start'] - index * measure_beats
+        if not 0 <= relative < measure_beats:
             continue
         x = x_at(relative * TICKS)
         y = string_y_base + (event['string'] - 1) * 15
@@ -82,14 +90,24 @@ def _render_tab_bar(arrangement, index, x_at, bar_width, left, string_y_base):
             tc = "#2563eb"
             result.append(_svg_text(x + 14, y - 6, technique, 9, fill=tc, font_weight="600"))
             result.append(f'<path d="M{x + 2:g},{y - 12:g} Q{x + 10:g},{y - 20:g} {x + 18:g},{y - 12:g}" fill="none" stroke="{tc}" stroke-width="1"/>')
+        slide_from = event.get('slide_from_fret')
+        if technique == 'SL' or (slide_from is not None and int(slide_from) != int(event['fret'])):
+            sc = "#0f766e"
+            up_slide = True if slide_from is None else (int(slide_from) < int(event['fret']))
+            y0, y1 = (y + 5, y - 4) if up_slide else (y - 4, y + 5)
+            result.append(_line(x - 16, y0, x - 7, y1, 1.4, sc))
+            result.append(_svg_text(x - 12, y - 7, 'S', 8.5, fill=sc, font_weight="700"))
         beat_xs.add(x)
+        g_idx = int((relative + 1e-6) // group_span)
+        grouped_xs.setdefault(g_idx, set()).add(x)
     stem_top = string_y_base + 80
     stem_bottom = stem_top + 14
-    sorted_xs = sorted(beat_xs)
-    for bx in sorted_xs:
+    for bx in sorted(beat_xs):
         result.append(_line(bx, stem_top, bx, stem_bottom, 1, "#475569"))
-    for i in range(0, len(sorted_xs) - 1, 2):
-        result.append(_line(sorted_xs[i], stem_bottom, sorted_xs[i + 1], stem_bottom, 1.5, "#475569"))
+    for g_idx in sorted(grouped_xs):
+        g_sorted = sorted(grouped_xs[g_idx])
+        if len(g_sorted) >= 2:
+            result.append(_line(g_sorted[0], stem_bottom, g_sorted[-1], stem_bottom, 1.5, "#475569"))
     return ''.join(result)
 
 
@@ -202,6 +220,7 @@ def render_publication_score_html(
         content.append(_line(clef_margin, TAB_Y_BASE, clef_margin, TAB_Y_BASE + 75, 1.6, "#1E1612"))
 
         left = float(clef_margin)
+        arr_for_tab = dict(arrangement, meter=project.meter)
         for index in range(first, end):
             width = widths[index]
             spans = timeline['bars'][index]
@@ -234,7 +253,7 @@ def render_publication_score_html(
                         div_x = left + (part_idx + 1) * width / len(segments)
                         content.append(f'<line x1="{div_x:g}" y1="{ZONE1_TOP:g}" x2="{div_x:g}" y2="{DIAGRAM_Y_BOTTOM + 8:g}" stroke="#D6C7B2" stroke-width="1" stroke-dasharray="4,3"/>')
 
-            content.append(_render_tab_bar(arrangement, index, x_at, width, left, TAB_Y_BASE))
+            content.append(_render_tab_bar(arr_for_tab, index, x_at, width, left, TAB_Y_BASE))
             content.append(_render_jianpu_bar(project, spans, note_lyrics, x_at, lyric_y, baseline))
             content.append('</g>')
             left += width
@@ -266,7 +285,7 @@ def render_publication_score_html(
     )
 
     legend = (
-        '依据人声主旋律生成 · 上方：左手和弦按法图 · 中间：艺术木吉他六线谱 · 下方：人声主唱简谱与唱词'
+        '原曲和声基底与人声主旋律联合编配 · 上方：左手和弦按法图 · 中间：艺术木吉他六线谱 · 下方：人声主唱简谱与唱词'
     )
 
     css = (

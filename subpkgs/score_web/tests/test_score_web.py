@@ -1,7 +1,11 @@
-"""Locked unit tests for subpkgs/score_web."""
+"""Unit tests for subpkgs/score_web."""
+import inspect
+import tempfile
 import unittest
+import wave
 from pathlib import Path
 import sys
+import numpy as np
 from fastapi.testclient import TestClient
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -12,6 +16,7 @@ if str(MELODY_ROOT) not in sys.path:
 
 from music import Note, Project, parse_jianpu
 from subpkgs.score_web import to_alphatex, render_publication_score_html, app
+import subpkgs.score_web.server as srv
 
 
 class ScoreWebTests(unittest.TestCase):
@@ -85,13 +90,44 @@ class ScoreWebTests(unittest.TestCase):
         self.assertIn("{pm}", tex)
         self.assertIn("{h}", tex)
 
-    def test_render_publication_score_html_includes_split_bar_and_lyrics(self):
+    def test_render_publication_score_html_includes_split_bar_and_lyrics_and_6_8_meter(self):
         html_doc = render_publication_score_html(self.project, self.dummy_arrangement, self.note_lyrics)
         self.assertIn("<svg", html_doc)
         self.assertIn("Cmaj7", html_doc)
         self.assertIn("Am7/G", html_doc)
         self.assertIn("Fm6", html_doc)
         self.assertIn("今", html_doc)
+
+        # Verify compound 6/8 rendering produces valid SVG without cross-beat beam failures
+        notes_68 = [Note(pitch=62, start=0.0, duration=1.5), Note(pitch=66, start=1.5, duration=1.5)]
+        proj_68 = Project(title="成都6/8测试", tonic="D", meter="6/8", bpm=90.0, notes=notes_68)
+        arr_68 = {
+            "title": "成都6/8测试",
+            "tonic": "D",
+            "meter": "6/8",
+            "bpm": 90.0,
+            "style": "抒情琶音",
+            "capo": 2,
+            "bar_count": 1,
+            "measure_beats": 3.0,
+            "chords": ["D"],
+            "bars": [
+                {
+                    "bar": 0,
+                    "chord": "D",
+                    "roman": "I",
+                    "frets": [-1, 3, 2, 0, 1, 0],
+                    "split_segments": [{"beat": 0.0, "duration": 3.0, "chord": "D", "roman": "I", "frets": [-1, 3, 2, 0, 1, 0]}],
+                }
+            ],
+            "events": [
+                {"bar": 0, "start": 0.5 * i, "duration": 0.5, "string": s, "fret": f, "pitch": p, "velocity": 80, "technique": ""}
+                for i, (s, f, p) in enumerate([(5, 3, 50), (3, 0, 57), (2, 1, 62), (1, 0, 66), (2, 1, 62), (3, 0, 57)])
+            ],
+        }
+        html_68 = render_publication_score_html(proj_68, arr_68, ["成", "都"])
+        self.assertIn("<svg", html_68)
+        self.assertIn("6/8", html_68)
 
     def test_fastapi_reharmonize_with_all_three_options_and_audio_stream(self):
         client = TestClient(app)
@@ -125,15 +161,29 @@ class ScoreWebTests(unittest.TestCase):
         self.assertEqual(r_wav.status_code, 200)
         self.assertGreater(len(r_wav.content), 20000)
 
-    def test_architectural_invariant_100_percent_vocal_driven_pipeline(self):
-        """Hard architectural lock: server.py must track beats from stems['vocals'] and contain zero accompaniment chord recognition."""
-        import inspect
-        import subpkgs.score_web.server as srv
+    def test_hybrid_accompaniment_first_with_acappella_fallback_pipeline(self):
+        """Verify Plan A hybrid architecture: accompaniment-first beat/chord extraction + automatic pure-vocal fallback."""
         src = inspect.getsource(srv)
-        self.assertIn("track_beats_and_downbeats(stems['vocals']", src)
-        self.assertNotIn("track_beats_and_downbeats(audio_path", src)
-        self.assertNotIn("recognize_accompaniment_chords", src)
-        self.assertNotIn("accompaniment_path", src)
+        self.assertIn("_has_audible_accompaniment", src)
+        self.assertIn("recognize_accompaniment_chords", src)
+        self.assertIn("synthesize_melody_conditioned_harmony", src)
+
+        sr = 22050
+        t = np.arange(sr, dtype=np.float64) / sr
+        audible = (0.3 * np.sin(2 * np.pi * 220.0 * t) * 32767.0).astype("<i2")
+        silent = np.zeros(sr, dtype="<i2")
+        with tempfile.TemporaryDirectory() as tmp:
+            aud_path = Path(tmp) / "audible.wav"
+            sil_path = Path(tmp) / "silent.wav"
+            for p, arr in ((aud_path, audible), (sil_path, silent)):
+                with wave.open(str(p), "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sr)
+                    wf.writeframes(arr.tobytes())
+            self.assertTrue(srv._has_audible_accompaniment(aud_path))
+            self.assertFalse(srv._has_audible_accompaniment(sil_path))
+            self.assertFalse(srv._has_audible_accompaniment(None))
 
 
 if __name__ == "__main__":

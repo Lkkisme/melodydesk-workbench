@@ -171,16 +171,115 @@ def _metrical_level_score(
     return log_acf + _syllable_ioi_penalty(syl_arr, spb) + range_pen
 
 
+def _harmonic_change_median_sec(
+    pulse_times: np.ndarray,
+    pulse_chroma: np.ndarray | None,
+) -> float | None:
+    """Estimate median harmonic-change interval D_hc (seconds) from 2-pulse cosine novelty on body chroma."""
+    if pulse_chroma is None or pulse_chroma.ndim != 2 or pulse_chroma.shape[0] != 12:
+        return None
+    n_p = min(len(pulse_times), pulse_chroma.shape[1])
+    if n_p < 6:
+        return None
+    nov = np.zeros(n_p, dtype=np.float64)
+    for k in range(2, n_p - 1):
+        left = np.mean(pulse_chroma[:, k - 2 : k], axis=1)
+        right = np.mean(pulse_chroma[:, k : min(n_p, k + 2)], axis=1)
+        nl = float(np.linalg.norm(left))
+        nr = float(np.linalg.norm(right))
+        if nl > 1e-9 and nr > 1e-9:
+            cos_sim = float(np.clip(np.dot(left, right) / (nl * nr), -1.0, 1.0))
+            nov[k] = 1.0 - cos_sim
+    interior = nov[2 : n_p - 1]
+    if interior.size < 3:
+        return None
+    med = float(np.median(interior))
+    mad = float(np.median(np.abs(interior - med)))
+    thresh = max(med + 3.0 * 1.4826 * mad, med + 0.04)
+    peaks: list[float] = []
+    for k in range(2, n_p - 1):
+        if nov[k] > thresh and nov[k] >= nov[k - 1] and nov[k] > nov[k + 1]:
+            peaks.append(float(pulse_times[k]))
+    if len(peaks) < 2:
+        return None
+    diffs = np.diff(np.asarray(peaks, dtype=np.float64))
+    pos = diffs[diffs > 0.25]
+    if pos.size < 1:
+        return None
+    return float(np.median(pos))
+
+
+def _tactus_octave_log_posterior(
+    acf_sub: np.ndarray,
+    frames_per_sec: float,
+    median_bar: float,
+    bar_q_beats: float,
+    beat_arr: np.ndarray,
+    cleaned_db: np.ndarray,
+    syl_arr: np.ndarray,
+    lo_bpm: float,
+    hi_bpm: float,
+    is_compound_meter: bool = False,
+    d_hc_sec: float | None = None,
+    sigma_trk: float = 0.50,
+    sigma_hc: float = 1.00,
+) -> dict[float, float]:
+    """Compute log posterior across metrical octave hypotheses m in H ({1.0} if compound else {0.5, 1.0, 2.0})."""
+    hypotheses = (1.0,) if is_compound_meter else (0.5, 1.0, 2.0)
+    phi_2 = 1.0
+    if len(cleaned_db) >= 2 and len(beat_arr) >= 2:
+        db_p_idx = np.asarray([int(np.argmin(np.abs(beat_arr - t))) for t in cleaned_db], dtype=np.int64)
+        p_diffs = np.diff(db_p_idx)
+        valid_p = p_diffs[p_diffs >= 1]
+        if valid_p.size >= 1:
+            phi_2 = float(np.mean((valid_p % 2) == 0))
+    scores: dict[float, float] = {}
+    for m in hypotheses:
+        t_m = (m * median_bar) / max(1e-6, bar_q_beats)
+        bpm_m = 60.0 / max(1e-6, t_m)
+        prior_pen = _tempo_range_penalty(bpm_m, lo_bpm, hi_bpm)
+        if not np.isfinite(prior_pen):
+            scores[m] = -np.inf
+            continue
+        phi_m = phi_2 if m == 2.0 else 1.0
+        lam_lat = math.log(max(phi_m, 1e-3))
+        a_1 = max(0.0, _acf_at(acf_sub, t_m * frames_per_sec))
+        a_2 = max(0.0, _acf_at(acf_sub, 0.5 * t_m * frames_per_sec))
+        a_3 = max(0.0, _acf_at(acf_sub, (t_m / 3.0) * frames_per_sec))
+        max_a = max(a_1, a_2, a_3)
+        r_m = max(a_2, a_3) / max_a if max_a > 1e-6 else 1.0
+        lam_sub = math.log(max(r_m, 0.1))
+        lam_hc = 0.0
+        if d_hc_sec is not None and math.isfinite(d_hc_sec) and d_hc_sec > 0.0:
+            lam_hc = -((math.log2(d_hc_sec / max(1e-6, m * median_bar)) + 0.5) ** 2) / (2.0 * sigma_hc ** 2)
+        lam_v = _syllable_ioi_penalty(syl_arr, t_m)
+        trust_pen = -((math.log2(m)) ** 2) / (2.0 * sigma_trk ** 2)
+        scores[m] = prior_pen + lam_lat + lam_sub + lam_hc + lam_v + trust_pen
+    return scores
+
+
 # ---------------------------------------------------------------------------
 # Neural-tier interior beat placement
 # ---------------------------------------------------------------------------
 
 def _bar_beat_positions(
-    beat_arr: np.ndarray, db_start: float, db_end: float, measure_beats: int
+    beat_arr: np.ndarray,
+    db_start: float,
+    db_end: float,
+    measure_beats: int,
+    is_compound: bool = False,
 ) -> list[float]:
     """Beat positions k = 0..measure_beats-1 for one bar spanning [db_start, db_end).
 
-    * Exactly ``measure_beats - 1`` strictly increasing neural interior beats -> keep them verbatim.
+    * Exactly ``measure_beats - 1`` strictly increasing neural interior beats -> keep them verbatim
+      (unless ``is_compound`` with a single half-bar dotted-quarter anchor).
+    * Exactly ``2 * measure_beats - 1`` eighth-note neural interior beats (e.g. compound 6/8 where
+      ``beat_this`` tracks all 6 eighth-note pulses while ``bar_grid_beats == 3`` quarter-note units)
+      -> keep every second subdivision verbatim (``interior_sub[1::2]``).
+    * In compound meters (``is_compound=True``), match interior neural beats onto the half-integer
+      eighth-note / dotted-quarter lattice ``k = 0.5 * m`` (``m = 1 .. 2*measure_beats - 1``) so a
+      half-bar dotted-quarter pulse at ``k = 1.5`` or partial eighth-note subdivisions interpolate
+      cleanly onto integer quarter-note grid points ``0 .. measure_beats - 1``.
     * Otherwise snap each expected subdivision to the nearest neural beat within 0.25 of a local
       beat period, and fill unmatched subdivisions by monotonic piecewise-linear interpolation
       between the matched anchors (bar boundaries included).
@@ -190,9 +289,32 @@ def _bar_beat_positions(
     interior = beat_arr[(beat_arr > db_start + 0.3 * local_spb) & (beat_arr < db_end - 0.3 * local_spb)]
     if measure_beats == 1:
         return [db_start]
-    if len(interior) == measure_beats - 1 and np.all(np.diff(interior) > 0):
+    if not is_compound and len(interior) == measure_beats - 1 and np.all(np.diff(interior) > 0):
         return [db_start] + [float(t) for t in interior]
+    sub_spb = bar_span / (2 * measure_beats)
+    interior_sub = beat_arr[(beat_arr > db_start + 0.3 * sub_spb) & (beat_arr < db_end - 0.3 * sub_spb)]
+    if len(interior_sub) == 2 * measure_beats - 1 and np.all(np.diff(interior_sub) > 0):
+        return [db_start] + [float(t) for t in interior_sub[1::2]]
     inside = beat_arr[(beat_arr > db_start + 1e-4) & (beat_arr < db_end - 1e-4)]
+    if is_compound and len(inside):
+        anchor_k_c: list[float] = [0.0]
+        anchor_t_c: list[float] = [db_start]
+        if len(inside) == 1 and abs(float(inside[0]) - (db_start + 0.5 * bar_span)) <= 0.22 * bar_span:
+            anchor_k_c.append(0.5 * measure_beats)
+            anchor_t_c.append(float(inside[0]))
+        else:
+            tol_sub = 0.35 * sub_spb
+            for m in range(1, 2 * measure_beats):
+                k_half = 0.5 * m
+                expected = db_start + k_half * local_spb
+                j = int(np.argmin(np.abs(inside - expected)))
+                cand = float(inside[j])
+                if abs(cand - expected) <= tol_sub and cand > anchor_t_c[-1] + 1e-4:
+                    anchor_k_c.append(k_half)
+                    anchor_t_c.append(cand)
+        anchor_k_c.append(float(measure_beats))
+        anchor_t_c.append(db_end)
+        return [float(t) for t in np.interp(np.arange(measure_beats, dtype=np.float64), anchor_k_c, anchor_t_c)]
     tol = 0.25 * local_spb
     anchor_k: list[float] = [0.0]
     anchor_t: list[float] = [db_start]
@@ -332,13 +454,14 @@ def track_beats_and_downbeats(
     bpm_range: tuple[float, float] = (60.0, 180.0),
     meter_hint: str | None = None,
     vocal_onsets_sec: list[float] | None = None,
+    pre_vocal_bars: int = 1,
 ) -> dict:
     """Track beats, downbeats, meter, bpm, and beat_origin from audio.
 
     Returns dict:
         - `bpm`: float (octave-folded into bpm_range when compatible; otherwise physical grid tempo)
         - `bpm_in_range`: bool (whether bpm lies within bpm_range)
-        - `beat_origin`: float (1-bar pre-vocal pickup origin or first downbeat/beat in seconds >= 0.0)
+        - `beat_origin`: float (`pre_vocal_bars`-bar pre-vocal pickup origin or first downbeat/beat in seconds >= 0.0)
         - `meter`: str (inferred 'num/den' or validated meter_hint 'num/den')
         - `beats`: list[float]
         - `downbeats`: list[float]
@@ -392,7 +515,8 @@ def track_beats_and_downbeats(
             raise ValueError("Insufficient periodic onsets to estimate tempo")
     native_beats = np.asarray(beats, dtype=np.float64)
     raw_diffs = np.diff(native_beats)
-    bpm = 60.0 / float(np.median(raw_diffs))
+    native_bpm = 60.0 / float(np.median(raw_diffs))
+    bpm = native_bpm
     folded_beats = native_beats.copy()
     while bpm < lo_bpm and bpm * 2.0 <= hi_bpm:
         folded_beats = np.sort(np.concatenate((folded_beats, (folded_beats[:-1] + folded_beats[1:]) / 2)))
@@ -411,10 +535,21 @@ def track_beats_and_downbeats(
                 folded_beats = np.asarray(decimated, dtype=np.float64)
         bpm /= 2.0
     has_neural_downbeats = backend == "beat_this" and downbeats is not None and len(downbeats) >= 2
-    syl_arr = np.asarray(sorted(vocal_onsets_sec), dtype=np.float64) if vocal_onsets_sec else np.empty(0, dtype=np.float64)
+    syl_arr = (
+        np.asarray(
+            sorted(
+                float(t)
+                for t in vocal_onsets_sec
+                if t is not None and math.isfinite(float(t)) and 0.0 <= float(t) < duration
+            ),
+            dtype=np.float64,
+        )
+        if vocal_onsets_sec
+        else np.empty(0, dtype=np.float64)
+    )
     # When tracking a vocal stem (vocal_onsets_sec supplied) with held vowels/pauses or out-of-range BPM, fold multi-beat IOIs (k=1..4) using a globally consistent base period in [60/hi_bpm, 60/lo_bpm]
     high_cv = len(raw_diffs) >= 4 and float(np.std(raw_diffs) / max(1e-6, np.mean(raw_diffs))) > 0.25
-    if len(syl_arr) >= 2 and (bpm < lo_bpm or bpm > hi_bpm or high_cv):
+    if (not has_neural_downbeats) and len(syl_arr) >= 2 and (bpm < lo_bpm or bpm > hi_bpm or high_cv):
         t_min, t_max = 60.0 / hi_bpm, 60.0 / lo_bpm
         pos_diffs = [float(d) for d in raw_diffs if d > 0]
         cand_periods: list[float] = []
@@ -467,6 +602,13 @@ def track_beats_and_downbeats(
         window = onset_env[max(0, frame - 1):min(len(onset_env), frame + 2)]
         accent[i] = float(np.max(window)) if window.size else 0.0
     measure_beats, meter_den, phase, peak_corr = 4, 4, 0, -np.inf
+    neural_pulses_per_bar: float | None = None
+    if has_neural_downbeats:
+        indices = np.asarray([np.argmin(np.abs(beats - t)) for t in downbeats])
+        diff_idx = np.diff(indices)
+        valid_diffs = diff_idx[diff_idx >= 2]
+        if len(diff_idx):
+            neural_pulses_per_bar = float(np.median(valid_diffs if len(valid_diffs) else diff_idx))
     has_meter_hint = meter_hint is not None and str(meter_hint).strip() != ""
     if has_meter_hint:
         try:
@@ -476,12 +618,21 @@ def track_beats_and_downbeats(
         if m_num < 2 or m_den not in (2, 4, 8):
             raise ValueError(f"Invalid meter_hint: {meter_hint!r}")
         measure_beats, meter_den = m_num, m_den
-    elif has_neural_downbeats:
-        indices = np.asarray([np.argmin(np.abs(beats - t)) for t in downbeats])
-        diff_idx = np.diff(indices)
-        valid_diffs = diff_idx[diff_idx >= 2]
-        intervals = float(np.median(valid_diffs if len(valid_diffs) else diff_idx))
-        measure_beats = max(2, min(12, int(math.floor(intervals + 0.5))))
+    elif has_neural_downbeats and neural_pulses_per_bar is not None:
+        measure_beats = max(2, min(12, int(math.floor(neural_pulses_per_bar + 0.5))))
+        if measure_beats in (6, 9, 12) and native_bpm >= 120.0:
+            meter_den = 8
+        elif measure_beats == 2 and native_bpm <= 90.0:
+            # Distinguish compound 6/8 tracked at 2 dotted-quarter beats/bar from simple 2/4 via ternary subdivision ACF
+            acf_pre = _onset_autocorrelation(onset_env)
+            t_beat = 60.0 / max(1e-6, native_bpm)
+            c_tern = 0.5 * (
+                _acf_at(acf_pre, frames_per_sec * (t_beat / 3.0))
+                + _acf_at(acf_pre, frames_per_sec * (2.0 * t_beat / 3.0))
+            )
+            c_duple = _acf_at(acf_pre, frames_per_sec * (0.5 * t_beat))
+            if c_tern > max(0.08, 1.15 * c_duple):
+                measure_beats, meter_den = 6, 8
     else:
         for m in range(2, 8):
             for p in range(m):
@@ -494,6 +645,20 @@ def track_beats_and_downbeats(
 
     beat_scale = 4.0 / meter_den
     bar_q_beats = measure_beats * beat_scale
+    is_compound_meter = meter_den == 8 and measure_beats in (6, 9, 12)
+    # Express bpm / spb_q in quarter-note units when neural pulses tracked eighth-notes or dotted-quarters in compound /8
+    if is_compound_meter and has_neural_downbeats and neural_pulses_per_bar is not None:
+        if abs(neural_pulses_per_bar - measure_beats) <= 1.5:
+            q_bpm = native_bpm * beat_scale
+        elif abs(neural_pulses_per_bar - (measure_beats / 3.0)) <= 0.6:
+            q_bpm = native_bpm * 1.5
+        else:
+            q_bpm = bpm
+        while q_bpm < lo_bpm and q_bpm * 2.0 <= hi_bpm:
+            q_bpm *= 2.0
+        while q_bpm > hi_bpm and q_bpm * 0.5 >= lo_bpm:
+            q_bpm *= 0.5
+        bpm = float(np.clip(q_bpm, lo_bpm, hi_bpm)) if (0.95 * lo_bpm <= q_bpm <= 1.05 * hi_bpm) else float(q_bpm)
     is_int_bar_q = bar_q_beats >= 1.0 and abs(bar_q_beats - round(bar_q_beats)) < 1e-6
     bar_grid_beats = max(1, int(round(bar_q_beats)))
     spb_q = 60.0 / bpm
@@ -520,7 +685,7 @@ def track_beats_and_downbeats(
         # Clean spurious duplicate downbeats
         cleaned = [float(db[0])]
         for i in range(1, len(db)):
-            if float(db[i]) - cleaned[-1] >= 0.55 * median_bar:
+            if float(db[i]) - cleaned[-1] >= 0.62 * median_bar:
                 cleaned.append(float(db[i]))
         db = np.asarray(cleaned, dtype=np.float64)
         if len(db) >= 2:
@@ -539,17 +704,52 @@ def track_beats_and_downbeats(
         if len(db) >= 2:
             median_bar = float(np.median(np.diff(db)))
 
-        # Onset-autocorrelation & vocal-IOI heuristic meter/tactus disambiguator.
-        # Hypothesis m in {0.5, 1.0, 2.0}: the neural "bar" is two bars (m=0.5), one bar (m=1.0), or half a bar (m=2.0).
-        acf = _onset_autocorrelation(onset_env)
-        score_by_m: dict[float, float] = {}
-        for m in (0.5, 1.0, 2.0):
-            base_sc = _metrical_level_score(
-                acf, frames_per_sec, m * median_bar, bar_q_beats, syl_arr, lo_bpm, hi_bpm
+        # Multi-cue metrical tactus octave posterior over m in {0.5, 1.0, 2.0} ({1.0} for compound /8):
+        # combines tempo prior, downbeat pulse-index parity lattice, 1024-win subdivision ACF,
+        # 2-pulse harmonic-change novelty, vocal syllable IOI, and relaxed tracker trust (sigma_trk = 0.5).
+        n_fft_sub = 1024
+        padded_sub = np.pad(y, (n_fft_sub, 0))
+        onset_env_sub = librosa.onset.onset_strength(y=padded_sub, sr=sr, hop_length=hop, n_fft=n_fft_sub)
+        acf_sub = _onset_autocorrelation(onset_env_sub)
+        d_hc_sec: float | None = None
+        if not is_compound_meter and len(beat_arr) >= 6:
+            hop_chr = 512
+            chr_fps = sr / hop_chr
+            body_chr = librosa.feature.chroma_cqt(
+                y=y,
+                sr=sr,
+                hop_length=hop_chr,
+                fmin=float(librosa.note_to_hz("G2")),
+                n_octaves=4,
             )
-            cand_spb_q = (m * median_bar) / max(1e-6, bar_q_beats)
-            tempo_match_pen = -0.5 * (math.log2(max(1e-6, cand_spb_q) / max(1e-6, spb_q)) / 0.35) ** 2
-            score_by_m[m] = base_sc + tempo_match_pen
+            n_chr = body_chr.shape[1]
+            pulse_chr = np.zeros((12, len(beat_arr)), dtype=np.float64)
+            med_p = float(np.median(np.diff(beat_arr)))
+            for pk, pt in enumerate(beat_arr):
+                pt_next = float(beat_arr[pk + 1]) if pk + 1 < len(beat_arr) else float(pt + med_p)
+                c0 = max(0, min(n_chr - 1, int(round(float(pt) * chr_fps))))
+                c1 = max(c0 + 1, min(n_chr, int(round(pt_next * chr_fps))))
+                pulse_chr[:, pk] = np.mean(body_chr[:, c0:c1], axis=1)
+            d_hc_sec = _harmonic_change_median_sec(beat_arr, pulse_chr)
+        score_by_m = _tactus_octave_log_posterior(
+            acf_sub=acf_sub,
+            frames_per_sec=frames_per_sec,
+            median_bar=median_bar,
+            bar_q_beats=bar_q_beats,
+            beat_arr=beat_arr,
+            cleaned_db=db,
+            syl_arr=syl_arr,
+            lo_bpm=lo_bpm,
+            hi_bpm=hi_bpm,
+            is_compound_meter=is_compound_meter,
+            d_hc_sec=d_hc_sec,
+        )
+        if not any(np.isfinite(v) for v in score_by_m.values()):
+            centre_bpm = math.sqrt(lo_bpm * hi_bpm)
+            for m in ((1.0,) if is_compound_meter else (0.5, 1.0, 2.0)):
+                cand_bpm = 60.0 * bar_q_beats / max(1e-6, m * median_bar)
+                if 0.85 * lo_bpm <= cand_bpm <= 1.15 * hi_bpm:
+                    score_by_m[m] = -abs(math.log2(max(1e-6, cand_bpm) / centre_bpm))
         chosen_m = max(score_by_m, key=lambda m: score_by_m[m]) if score_by_m else 1.0
         if chosen_m == 0.5 and np.isfinite(score_by_m[0.5]):
             subdivided: list[float] = [float(db[0])]
@@ -569,23 +769,33 @@ def track_beats_and_downbeats(
             if len(db) >= 2:
                 median_bar = float(np.median(np.diff(db)))
         elif chosen_m == 2.0 and np.isfinite(score_by_m[2.0]):
-            # Downbeat phase parity: minimise the median syllable-to-downbeat distance, or, without
-            # vocal onsets, maximise the summed onset accent on the retained downbeats.
+            # Downbeat phase parity: combine low-band (< 240 Hz) bass/kick downbeat accent with
+            # vocal syllable-to-downbeat alignment when vocal onsets are available.
+            from scipy.signal import butter, sosfilt
+            y_low = sosfilt(butter(2, 240.0, fs=sr, output="sos"), padded)
+            low_env = librosa.onset.onset_strength(y=y_low, sr=sr, hop_length=hop, n_fft=n_fft)
+            env_scale = max(1e-6, float(np.percentile(onset_env, 90)))
+            low_scale = max(1e-6, float(np.percentile(low_env, 90)))
             chosen_parity, min_parity_loss = 0, np.inf
             for par in (0, 1):
                 db_cand = db[par::2]
                 if len(db_cand) < 1:
                     continue
+                db_accent = np.zeros(len(db_cand))
+                for ai, t in enumerate(db_cand):
+                    frame = int(round((t * sr + n_fft) / hop))
+                    w_full = onset_env[max(0, frame - 1):min(len(onset_env), frame + 2)]
+                    w_low = low_env[max(0, frame - 1):min(len(low_env), frame + 2)]
+                    a_full = (float(np.max(w_full)) / env_scale) if w_full.size else 0.0
+                    a_low = (float(np.max(w_low)) / low_scale) if w_low.size else 0.0
+                    db_accent[ai] = 0.45 * a_full + 0.55 * a_low
+                acoustic_loss = -float(np.mean(db_accent))
                 if len(syl_arr):
                     dists = np.array([float(np.min(np.abs(db_cand - s))) for s in syl_arr])
-                    loss = float(np.median(dists))
+                    vocal_loss = float(np.median(dists)) / max(1e-3, 2.0 * median_bar)
+                    loss = vocal_loss + 0.35 * acoustic_loss
                 else:
-                    db_accent = np.zeros(len(db_cand))
-                    for ai, t in enumerate(db_cand):
-                        frame = int(round((t * sr + n_fft) / hop))
-                        window = onset_env[max(0, frame - 1):min(len(onset_env), frame + 2)]
-                        db_accent[ai] = float(np.max(window)) if window.size else 0.0
-                    loss = -float(np.sum(db_accent))
+                    loss = acoustic_loss
                 if loss < min_parity_loss:
                     chosen_parity, min_parity_loss = par, loss
             beat_arr = np.unique(np.sort(np.concatenate([beat_arr, db[1 - chosen_parity::2]])))
@@ -597,9 +807,25 @@ def track_beats_and_downbeats(
 
     use_neural_grid = has_neural_downbeats and len(db) >= 2
 
-    # 1-Bar Pre-Vocal Pickup Origin (preserving detected downbeat phase)
+    # Pre-Vocal Pickup Origin (retaining `pre_bars` audible intro bars while preserving detected downbeat phase)
+    pre_bars = max(0, int(pre_vocal_bars))
     first_downbeat = float(db[0]) if len(db) else float(downbeats[0] if len(downbeats) else beats[0])
     bar_dur_init = bar_q_beats * spb_q
+    win_rms = max(1, int(round(0.050 * sr)))
+    if len(y) >= win_rms:
+        n_w = len(y) // win_rms
+        frame_rms_arr = np.sqrt(np.mean(y[: n_w * win_rms].astype(np.float64).reshape(n_w, win_rms) ** 2, axis=1))
+        audible_bar_floor = max(1e-4, 0.04 * float(np.percentile(frame_rms_arr, 85.0)))
+    else:
+        audible_bar_floor = 1e-4
+
+    def _bar_is_audible(t_s: float, t_e: float) -> bool:
+        i0 = max(0, min(len(y), int(round(t_s * sr))))
+        i1 = max(i0 + 1, min(len(y), int(round(t_e * sr))))
+        if i0 >= len(y):
+            return False
+        seg = y[i0:i1].astype(np.float64)
+        return float(np.sqrt(np.mean(seg * seg))) >= audible_bar_floor
 
     if use_neural_grid:
         while float(db[0]) - median_bar >= 0.0:
@@ -608,32 +834,43 @@ def track_beats_and_downbeats(
             db = np.append(db, float(db[-1]) + median_bar)
         if len(syl_arr) >= 1:
             first_vocal = float(syl_arr[0])
-            if first_vocal > float(db[0]) + 1.2 * median_bar:
+            if first_vocal > float(db[0]) + (pre_bars + 0.2) * median_bar:
                 anticipation_tol = min(0.5 * spb_q, 0.2 * median_bar)
                 vocal_bar_idx = 0
                 for idx in range(len(db)):
-                    if float(db[idx]) <= first_vocal + anticipation_tol:
+                    if float(db[idx]) <= first_vocal + anticipation_tol and float(db[idx]) < duration - 1e-3:
                         vocal_bar_idx = idx
                     else:
                         break
-                start_bar_idx = max(0, vocal_bar_idx - 1)
+                start_bar_idx = max(0, vocal_bar_idx - pre_bars)
+                while start_bar_idx < max(0, vocal_bar_idx - 1) and not _bar_is_audible(float(db[start_bar_idx]), float(db[start_bar_idx + 1])):
+                    start_bar_idx += 1
                 db = db[start_bar_idx:]
         while len(db) < 3 or float(db[-1]) < duration:
             db = np.append(db, float(db[-1]) + median_bar)
-        beat_origin = round(float(db[0]), 6)
+        beat_origin = round(min(float(db[0]), max(0.0, duration - 1e-3)), 6)
         db[0] = beat_origin
         if len(db) >= 2:
             median_bar = float(np.median(np.diff(db)))
     else:
         n_pre_bars = int(first_downbeat // bar_dur_init) if bar_dur_init > 1e-6 else 0
-        phase_origin = max(0.0, first_downbeat - n_pre_bars * bar_dur_init)
+        phase_origin = min(max(0.0, first_downbeat - n_pre_bars * bar_dur_init), max(0.0, duration - 1e-3))
         if len(syl_arr) >= 1 and bar_dur_init > 1e-6:
             first_vocal = float(syl_arr[0])
-            if first_vocal > phase_origin + 1.2 * bar_dur_init:
+            if first_vocal > phase_origin + (pre_bars + 0.2) * bar_dur_init:
                 anticipation_tol = min(0.5 * spb_q, 0.2 * bar_dur_init)
-                vocal_bar_idx = int(math.floor((first_vocal + anticipation_tol - phase_origin) / bar_dur_init))
-                start_bar_idx = max(0, vocal_bar_idx - 1)
-                beat_origin = round(phase_origin + start_bar_idx * bar_dur_init, 6)
+                max_valid_bar_idx = max(0, int(math.ceil((duration - 1e-3 - phase_origin) / bar_dur_init)) - 1)
+                vocal_bar_idx = min(
+                    max_valid_bar_idx,
+                    int(math.floor((first_vocal + anticipation_tol - phase_origin) / bar_dur_init)),
+                )
+                start_bar_idx = max(0, vocal_bar_idx - pre_bars)
+                while start_bar_idx < max(0, vocal_bar_idx - 1) and not _bar_is_audible(
+                    phase_origin + start_bar_idx * bar_dur_init,
+                    phase_origin + (start_bar_idx + 1) * bar_dur_init,
+                ):
+                    start_bar_idx += 1
+                beat_origin = round(min(phase_origin + start_bar_idx * bar_dur_init, max(0.0, duration - 1e-3)), 6)
             else:
                 beat_origin = round(phase_origin, 6)
         else:
@@ -653,7 +890,9 @@ def track_beats_and_downbeats(
         if is_int_bar_q:
             beat_times_list: list[float] = []
             for b in range(len(db) - 1):
-                for t in _bar_beat_positions(beat_arr, float(db[b]), float(db[b + 1]), bar_grid_beats):
+                for t in _bar_beat_positions(
+                    beat_arr, float(db[b]), float(db[b + 1]), bar_grid_beats, is_compound=is_compound_meter
+                ):
                     if beat_times_list and t <= beat_times_list[-1] + 1e-4:
                         t = beat_times_list[-1] + 1e-4
                     beat_times_list.append(float(t))

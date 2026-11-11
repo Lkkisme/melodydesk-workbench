@@ -77,7 +77,8 @@ def _expand_word_timestamps(records):
                 next_s = float(next_raw)
                 if math.isfinite(next_s) and next_s >= start:
                     eff_end = min(end, next_s)
-        is_interp = bool(record.get("interpolated", False))
+        is_unsung = bool(record.get("unsung", False))
+        is_interp = bool(record.get("interpolated", False)) or is_unsung
         is_subdiv = (not is_interp) and (len(pieces) > 1 or bool(record.get("subdivided", False)))
         g_start = float(record.get("group_start", start)) if record.get("subdivided") else start
         g_end = float(record.get("group_end", eff_end)) if record.get("subdivided") else eff_end
@@ -89,6 +90,8 @@ def _expand_word_timestamps(records):
                     "probability": piece_prob}
             if is_interp:
                 item["interpolated"] = True
+                if is_unsung:
+                    item["unsung"] = True
             elif is_subdiv:
                 item["subdivided"] = True
                 item["group_start"] = g_start
@@ -105,19 +108,94 @@ def _is_faster_whisper_real():
     return getattr(fw, "WhisperModel", None) is not None
 
 
-def _token_to_mms_chars(token_text: str, dict_chars: set[str]) -> str:
-    text = token_text.lower()
+_HANZI_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002fa1f\U00030000-\U000323af]")
+_MMS_DEFAULT_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz'")
+
+
+def _token_to_mms_chars(token_text: str, dict_chars: set[str] | frozenset[str]) -> str:
     if re.search(_CJK_PATTERN, token_text):
+        if not _HANZI_RE.search(token_text):
+            return ""
         try:
             from pypinyin import Style, lazy_pinyin
-            text = "".join(lazy_pinyin(token_text, style=Style.NORMAL)).lower()
+            # uroman maps Mandarin ü (pypinyin 'v' in lv/nv/lve/nve) to ASCII 'u'.
+            text = "".join(lazy_pinyin(token_text, style=Style.NORMAL)).lower().replace("v", "u")
         except ImportError:
             return ""
+    else:
+        nfkd = unicodedata.normalize("NFKD", token_text)
+        text = "".join(c for c in nfkd if not unicodedata.category(c).startswith("M")).lower()
     return "".join(c for c in text if c in dict_chars)
 
 
+def _can_mms_align(ground_truth_text: str) -> bool:
+    gt_tokens = tokenize_lyrics(ground_truth_text)
+    if not gt_tokens:
+        return False
+    valid = sum(1 for tok in gt_tokens if bool(_token_to_mms_chars(tok["text"], _MMS_DEFAULT_CHARS)))
+    return (valid / len(gt_tokens)) >= 0.90
+
+
+def _free_end_ctc_prefix_len(
+    emission_2d,
+    transcript_tokens: list[list[int]],
+    blank_id: int = 0,
+    char_prior_beta: float = 4.5,
+) -> int:
+    """Forward-only CTC Viterbi over blank-interleaved transcript tokens to select sung prefix k* in 0..m."""
+    import numpy as np
+    import torch
+
+    m = len(transcript_tokens)
+    if m == 0:
+        return 0
+    log_probs = torch.log_softmax(emission_2d.float(), dim=-1).cpu().numpy()
+    n_frames = int(log_probs.shape[0])
+    flat_chars: list[int] = []
+    cum_chars = [0]
+    for tok_ids in transcript_tokens:
+        ids = tok_ids if tok_ids else [blank_id]
+        flat_chars.extend(int(c) for c in ids)
+        cum_chars.append(len(flat_chars))
+    n_chars = len(flat_chars)
+    if n_frames == 0 or n_chars == 0:
+        return 0
+    s_len = 2 * n_chars + 1
+    z = np.full(s_len, int(blank_id), dtype=np.int64)
+    z[1::2] = np.asarray(flat_chars, dtype=np.int64)
+    skip2_idx = np.asarray(
+        [s for s in range(3, s_len, 2) if z[s] != z[s - 2]],
+        dtype=np.int64,
+    )
+    alpha = np.full(s_len, -np.inf, dtype=np.float64)
+    alpha[0] = float(log_probs[0, z[0]])
+    if s_len > 1:
+        alpha[1] = float(log_probs[0, z[1]])
+    step1 = np.empty(s_len, dtype=np.float64)
+    step2 = np.empty(s_len, dtype=np.float64)
+    for t in range(1, n_frames):
+        step1[0] = -np.inf
+        step1[1:] = alpha[:-1]
+        best_prev = np.maximum(alpha, step1)
+        if skip2_idx.size:
+            step2.fill(-np.inf)
+            step2[skip2_idx] = alpha[skip2_idx - 2]
+            best_prev = np.maximum(best_prev, step2)
+        alpha = best_prev + log_probs[t, z]
+
+    best_k = 0
+    best_sc = float(alpha[0])
+    for k in range(1, m + 1):
+        r_end = cum_chars[k] - 1
+        f_k = max(float(alpha[2 * r_end + 1]), float(alpha[2 * r_end + 2])) + char_prior_beta * cum_chars[k]
+        if f_k >= best_sc:
+            best_sc = f_k
+            best_k = k
+    return best_k
+
+
 def _try_mms_fa(audio_path: Path, ground_truth_text: str, prefer_cuda: bool) -> dict | None:
-    """Tier 2: Meta MMS_FA CTC forced alignment for Latin/English and CJK text."""
+    """Tier 2: Meta MMS_FA CTC forced alignment for Latin/English and CJK text with free-end unsung detection."""
     gt = ground_truth_text.strip()
     if not gt:
         return None
@@ -141,7 +219,7 @@ def _try_mms_fa(audio_path: Path, ground_truth_text: str, prefer_cuda: bool) -> 
         waveform, _ = librosa.load(str(audio_path), sr=sr, mono=True)
 
         gt_tokens = tokenize_lyrics(ground_truth_text)
-        dict_chars = set(dictionary.keys()) - {"*"}
+        dict_chars = set(dictionary.keys()) - {"*", "-"}
         transcript_tokens = []
         any_valid = False
         for tok in gt_tokens:
@@ -189,7 +267,12 @@ def _try_mms_fa(audio_path: Path, ground_truth_text: str, prefer_cuda: bool) -> 
                     pos = chunk_end
                 emission = torch.cat(chunk_emissions, dim=1)
 
-        token_spans = aligner(emission[0].cpu() if emission.device.type != "cpu" else emission[0], transcript_tokens)
+        emis_cpu = emission[0].cpu() if emission.device.type != "cpu" else emission[0]
+        blank_id = int(dictionary.get("-", 0))
+        k_star = _free_end_ctc_prefix_len(emis_cpu, transcript_tokens, blank_id=blank_id)
+        if k_star <= 0:
+            return None
+        token_spans = aligner(emis_cpu, transcript_tokens[:k_star])
         total_duration = len(waveform) / float(sr)
         num_frames = emission.shape[1]
         frame_dur = total_duration / float(num_frames)
@@ -210,6 +293,17 @@ def _try_mms_fa(audio_path: Path, ground_truth_text: str, prefer_cuda: bool) -> 
 
         if not records:
             return None
+        if k_star < len(gt_tokens):
+            tail_t = float(records[-1]["end"])
+            for i_u in range(k_star, len(gt_tokens)):
+                records.append({
+                    "word": gt_tokens[i_u]["text"],
+                    "start": tail_t,
+                    "end": tail_t,
+                    "probability": 0.0,
+                    "interpolated": True,
+                    "unsung": True,
+                })
         return {
             "raw_lyrics": ground_truth_text,
             "word_timestamps": _expand_word_timestamps(records),
@@ -234,22 +328,56 @@ def _edit_distance(a: str, b: str) -> int:
     return prev[la]
 
 
-def _nw_score(gt_text: str, asr_text: str) -> float:
-    g = gt_text.casefold().strip()
-    a = asr_text.casefold().strip()
+def _canonical_phonetic_key(text: str) -> frozenset[str]:
+    norm_txt = unicodedata.normalize("NFKC", text).strip()
+    if not norm_txt:
+        return frozenset()
+    if re.search(_CJK_PATTERN, norm_txt):
+        if not _HANZI_RE.search(norm_txt):
+            return frozenset([norm_txt.casefold()])
+        try:
+            from pypinyin import Style, lazy_pinyin, pinyin
+            if len(norm_txt) == 1:
+                readings = pinyin(norm_txt, style=Style.NORMAL, heteronym=True)
+                if readings and readings[0]:
+                    return frozenset(r.lower() for r in readings[0] if r)
+            joined = "".join(lazy_pinyin(norm_txt, style=Style.NORMAL)).lower()
+            return frozenset([joined]) if joined else frozenset([norm_txt.casefold()])
+        except ImportError:
+            return frozenset([norm_txt.casefold()])
+    nfkd = unicodedata.normalize("NFKD", norm_txt)
+    stripped = "".join(
+        c for c in nfkd
+        if not unicodedata.category(c).startswith("M") and c not in ("'", "’")
+    ).casefold().strip()
+    return frozenset([stripped]) if stripped else frozenset([norm_txt.casefold()])
+
+
+def _token_match(gt_text: str, asr_text: str) -> tuple[float, float]:
+    g = unicodedata.normalize("NFKC", gt_text).casefold().strip()
+    a = unicodedata.normalize("NFKC", asr_text).casefold().strip()
     if not g or not a:
-        return -2.0
+        return -2.0, 0.0
     if g == a:
-        return 3.0
-    dist = _edit_distance(g, a)
-    sim = max(0.0, 1.0 - dist / max(len(g), len(a)))
-    if sim >= 0.5:
-        return 1.2 * sim
-    return -2.0
+        return 3.0, 1.0
+    k_g = _canonical_phonetic_key(gt_text)
+    k_a = _canonical_phonetic_key(asr_text)
+    if k_g and k_a and (k_g & k_a):
+        return 2.6, 0.9
+    if not re.search(_CJK_PATTERN, gt_text) and not re.search(_CJK_PATTERN, asr_text):
+        dist = _edit_distance(g, a)
+        sim = max(0.0, 1.0 - dist / max(len(g), len(a)))
+        if sim >= 0.5:
+            return 1.2 * sim, 0.0
+    return -2.0, 0.0
+
+
+def _nw_score(gt_text: str, asr_text: str) -> float:
+    return _token_match(gt_text, asr_text)[0]
 
 
 def _project_records_to_ground_truth(records: list[dict], ground_truth_text: str) -> list[dict]:
-    """Needleman-Wunsch DP alignment projecting ASR timestamps onto ground-truth tokens."""
+    """Semi-global Needleman-Wunsch DP alignment projecting ASR timestamps onto ground-truth tokens."""
     gt_tokens = tokenize_lyrics(ground_truth_text)
     if not gt_tokens:
         return records
@@ -281,34 +409,51 @@ def _project_records_to_ground_truth(records: list[dict], ground_truth_text: str
             else:
                 bt[i][j] = 2
 
+    best_end_i = m
+    best_end_sc = -math.inf
+    for i_cand in range(0, m + 1):
+        cand_sc = dp[i_cand][n] - (0.8 if i_cand < m else 0.0)
+        if cand_sc >= best_end_sc - 1e-12:
+            best_end_sc = cand_sc
+            best_end_i = i_cand
+
     matched = {}
-    i, j = m, n
+    i, j = best_end_i, n
     while i > 0 or j > 0:
         if i > 0 and j > 0 and bt[i][j] == 0:
             matched[i - 1] = j - 1
             i -= 1
             j -= 1
-        elif i > 0 and bt[i][j] == 1:
+        elif i > 0 and (j == 0 or bt[i][j] == 1):
             i -= 1
         else:
             j -= 1
 
     result = []
     has_positive_match = False
+    last_pos_gt_idx = -1
+    last_pos_rec_idx = -1
     for i, tok in enumerate(gt_tokens):
         if i in matched:
-            r = records[matched[i]]
-            sc = _nw_score(tok["text"], r["word"])
+            r_idx = matched[i]
+            r = records[r_idx]
+            sc, trust = _token_match(tok["text"], r["word"])
             if sc > 0.0:
                 has_positive_match = True
-                sim = 1.0 if sc >= 2.99 else round(sc / 1.2, 4)
-                is_exact = (tok["text"].casefold().strip() == r["word"].casefold().strip())
-                is_interp = bool(r.get("interpolated", False)) or not is_exact
-                rec = {"word": tok["text"], "start": float(r["start"]),
-                       "end": float(r["end"]),
-                       "probability": 0.0 if is_interp else round(float(r.get("probability", 0.0)) * sim, 4)}
+                last_pos_gt_idx = i
+                last_pos_rec_idx = max(last_pos_rec_idx, r_idx)
+                is_unsung = bool(r.get("unsung", False))
+                is_interp = bool(r.get("interpolated", False)) or is_unsung or (trust <= 0.0)
+                rec = {
+                    "word": tok["text"],
+                    "start": float(r["start"]),
+                    "end": float(r["end"]),
+                    "probability": 0.0 if is_interp else round(float(r.get("probability", 0.0)) * trust, 4),
+                }
                 if is_interp:
                     rec["interpolated"] = True
+                    if is_unsung:
+                        rec["unsung"] = True
                 elif r.get("subdivided"):
                     rec["subdivided"] = True
                     rec["group_start"] = float(r.get("group_start", r["start"]))
@@ -324,6 +469,12 @@ def _project_records_to_ground_truth(records: list[dict], ground_truth_text: str
     observed_durs = [max(1e-3, float(r["end"]) - float(r["start"])) for r in records if float(r["end"]) > float(r["start"])]
     med_word_dur = float(median(observed_durs)) if observed_durs else 0.16
 
+    rem_asr_dur = 0.0
+    if 0 <= last_pos_rec_idx < len(records) - 1:
+        rem_asr_dur = max(0.0, float(records[-1]["end"]) - float(records[last_pos_rec_idx]["end"]))
+    max_trailing_interp = math.ceil(rem_asr_dur / max(0.05, med_word_dur)) if rem_asr_dur > 1e-6 else 0
+    unsung_start_idx = last_pos_gt_idx + 1 + max_trailing_interp
+
     i = 0
     prev_matched_idx = -1
     while i < len(result):
@@ -338,6 +489,30 @@ def _project_records_to_ground_truth(records: list[dict], ground_truth_text: str
                 break
         gap_start = prev_matched_idx + 1
         gap_end = next_matched_idx if next_matched_idx >= 0 else len(result)
+        if next_matched_idx < 0 and prev_matched_idx >= 0:
+            interp_end = min(gap_end, unsung_start_idx)
+            interp_count = max(0, interp_end - gap_start)
+            left_time = float(result[prev_matched_idx]["end"])
+            if interp_count > 0:
+                right_time = left_time + med_word_dur * interp_count
+                span = right_time - left_time
+                for offset, idx in enumerate(range(gap_start, interp_end)):
+                    s = left_time + span * offset / interp_count
+                    e = left_time + span * (offset + 1) / interp_count
+                    result[idx]["start"] = max(0.0, float(s))
+                    result[idx]["end"] = max(result[idx]["start"] + 1e-4, float(e))
+                    result[idx]["probability"] = 0.0
+                    result[idx]["interpolated"] = True
+                tail_anchor_t = float(result[interp_end - 1]["end"])
+            else:
+                tail_anchor_t = max(0.0, left_time)
+            for idx in range(interp_end, gap_end):
+                result[idx]["start"] = tail_anchor_t
+                result[idx]["end"] = tail_anchor_t
+                result[idx]["probability"] = 0.0
+                result[idx]["interpolated"] = True
+                result[idx]["unsung"] = True
+            break
         gap_count = gap_end - gap_start
         if prev_matched_idx >= 0:
             left_time = result[prev_matched_idx]["end"]
@@ -389,10 +564,12 @@ def _project_records_to_ground_truth(records: list[dict], ground_truth_text: str
             r["start"] = prev_start
             r["probability"] = 0.0
             r["interpolated"] = True
-        if r["end"] <= r["start"]:
+        if r["end"] <= r["start"] and not r.get("unsung", False):
             r["end"] = r["start"] + 1e-4
             r["probability"] = 0.0
             r["interpolated"] = True
+        elif r.get("unsung", False) and r["end"] < r["start"]:
+            r["end"] = r["start"]
         prev_start = r["start"]
 
     return result
@@ -456,8 +633,8 @@ def transcribe_word_timestamps(
         return {"raw_lyrics": text, "word_timestamps": expanded_qwen,
                 "backend": backend}
 
-    # Tier 2: MMS-FA CTC for Latin ground truth (skip when text is CJK/Kana/Hangul)
-    if ground_truth_text.strip() and not re.search(_CJK_PATTERN, ground_truth_text):
+    # Tier 2: MMS-FA CTC when >= 90% of ground-truth tokens romanize cleanly (Latin, CJK via Pinyin, or mixed)
+    if ground_truth_text.strip() and _can_mms_align(ground_truth_text):
         mms_result = _try_mms_fa(audio_path, ground_truth_text, prefer_cuda)
         if mms_result is not None:
             return mms_result
@@ -528,11 +705,6 @@ def transcribe_word_timestamps(
 
         return {"raw_lyrics": text, "word_timestamps": expanded_whisper,
                 "backend": f"faster-whisper-{device}"}
-    if ground_truth_text.strip() and re.search(_CJK_PATTERN, ground_truth_text):
-        mms_cjk = _try_mms_fa(audio_path, ground_truth_text, prefer_cuda)
-        if mms_cjk is not None:
-            return mms_cjk
-        failures.append("mms-fa-cjk: fell through")
     raise RuntimeError("All timestamp backends failed: " + "; ".join(failures)) from last_failure
 
 
@@ -578,7 +750,7 @@ def _align_text_tokens(tokens, notes):
 
 
 def _match_anchors(tokens, records, intervals=None, max_allow_gap=1.5):
-    valid_records = [r for r in records if not r.get("interpolated", False)]
+    valid_records = [r for r in records if not r.get("interpolated", False) and not r.get("unsung", False)]
     m, k = len(tokens), len(valid_records)
     rec_bonus = [0.0] * k
     if intervals:
@@ -600,8 +772,10 @@ def _match_anchors(tokens, records, intervals=None, max_allow_gap=1.5):
             if lengths[i + 1][j] > max_cell:
                 max_cell = lengths[i + 1][j]
                 choice = 1
-            if tokens[i]["text"].casefold() == valid_records[j]["word"].casefold():
-                cand = 1.0 + rec_bonus[j] + lengths[i + 1][j + 1]
+            _sc_m, tr_m = _token_match(tokens[i]["text"], valid_records[j]["word"])
+            if tr_m > 0.0:
+                match_gain = 1.0 if tr_m >= 0.99 else (1.0 - 0.25 / max(1, m))
+                cand = match_gain + rec_bonus[j] + lengths[i + 1][j + 1]
                 if cand >= max_cell - 1e-12:
                     max_cell = cand
                     choice = 0
@@ -645,7 +819,7 @@ def _melisma_log_affinity(ov_ratio, tail_decay, pitch_step, lead, tempo_scale=1.
     return max(e_ov, e_tail)
 
 
-def _align_anchored_tokens(tokens, notes, intervals, anchors, baseline):
+def _align_anchored_tokens(tokens, notes, intervals, anchors, baseline, spb=None):
     n, m = len(notes), len(tokens)
     if n == 0 or m == 0:
         return [""] * n, [None] * n
@@ -660,6 +834,8 @@ def _align_anchored_tokens(tokens, notes, intervals, anchors, baseline):
     ]
     subdiv_targets = {}
     subdiv_melismas = {}
+    subdiv_group_end = {}
+    subdiv_not_last = {}
     idx_tok = 0
     while idx_tok < m:
         anc = anchors[idx_tok]
@@ -678,49 +854,19 @@ def _align_anchored_tokens(tokens, notes, intervals, anchors, baseline):
             if len(g_notes) >= g_count:
                 g_lyr, g_own = _align_text_tokens(tokens[idx_tok:end_tok], [notes[j_n] for j_n in g_notes])
                 for offset_t in range(g_count):
+                    tok_pos = idx_tok + offset_t
+                    subdiv_group_end[tok_pos] = ge
+                    if offset_t < g_count - 1:
+                        subdiv_not_last[tok_pos] = ge
                     if offset_t in g_own:
-                        subdiv_targets[idx_tok + offset_t] = g_notes[g_own.index(offset_t)]
-                        subdiv_melismas[idx_tok + offset_t] = {
+                        subdiv_targets[tok_pos] = g_notes[g_own.index(offset_t)]
+                        subdiv_melismas[tok_pos] = {
                             g_notes[k_n] for k_n, ow in enumerate(g_own) if ow == offset_t and g_lyr[k_n] == "-"
                         }
             idx_tok = end_tok
         else:
             idx_tok += 1
-    costs = [[math.inf] * (n + 1) for _ in range(m + 1)]
-    placed = [[False] * (n + 1) for _ in range(m + 1)]
-    costs[0] = [0.0] * (n + 1)
-    for i in range(1, m + 1):
-        anchor = anchors[i - 1]
-        for j in range(1, n + 1):
-            start, end = intervals[j - 1]
-            duration = max(1e-6, end - start)
-            onset_cost = abs(j - 1 - baseline_onsets[i - 1]) / max(1, n)
-            if anchor is not None:
-                if (i - 1) in subdiv_targets:
-                    gs = float(anchor.get("group_start", anchor["start"]))
-                    ge = float(anchor.get("group_end", anchor["end"]))
-                    g_ov = max(0.0, min(end, ge) - max(start, gs))
-                    if g_ov > 1e-6:
-                        onset_cost = abs((j - 1) - subdiv_targets[i - 1]) / max(1, n)
-                    else:
-                        onset_cost = abs(start - gs) / duration + 1.0
-                else:
-                    overlap = max(0.0, min(end, anchor["end"]) - max(start, anchor["start"]))
-                    onset_cost = abs(start - anchor["start"]) / duration + 1 - overlap / duration
-            candidate = costs[i - 1][j - 1] + onset_cost
-            costs[i][j] = costs[i][j - 1]
-            if candidate < costs[i][j]:
-                costs[i][j] = candidate
-                placed[i][j] = True
-    onsets = [0] * m
-    i, j = m, n
-    while i and j > 0:
-        if placed[i][j] or j == i:
-            onsets[i - 1] = j - 1
-            i -= 1
-        j -= 1
-    # Tempo-adaptive melisma scales: the empirical median note duration rescales the
-    # legato gap and tail-decay floor; inside the reference band the scale is exactly 1.
+
     note_durs = [max(0.0, float(ne) - float(ns)) for ns, ne in intervals]
     med_note_dur = median(note_durs) if note_durs else MELISMA_DUR_BAND[0]
     if med_note_dur < MELISMA_DUR_BAND[0]:
@@ -729,44 +875,181 @@ def _align_anchored_tokens(tokens, notes, intervals, anchors, baseline):
         tempo_scale = min(1.5, med_note_dur / MELISMA_DUR_BAND[1])
     else:
         tempo_scale = 1.0
-    legato_gap = MELISMA_LEGATO_GAP * tempo_scale
+    eff_spb = float(spb) if (spb is not None and math.isfinite(spb) and spb > 0.0) else max(0.25, float(med_note_dur))
+    g_leg = max(MELISMA_LEGATO_GAP * tempo_scale, 0.5 * eff_spb)
+    g_phr = max(1.5, 2.0 * eff_spb)
     tail_tau_floor = MELISMA_TAIL_TAU_FLOOR * tempo_scale
-    lyrics, owners = [""] * n, [None] * n
-    for i, onset in enumerate(onsets):
-        lyrics[onset], owners[onset] = tokens[i]["text"], i
-        stop = onsets[i + 1] if i + 1 < m else n
+    tau_gap = max(0.08, (0.5 * eff_spb) / math.log(2.0))
+
+    # Build monotone onset estimates s_hat[i] and syllable territories W_i = [w_lo[i], w_hi[i]).
+    s_hat = [None] * m
+    for i in range(m):
+        if anchors[i] is not None:
+            if i in subdiv_targets:
+                s_hat[i] = float(intervals[subdiv_targets[i]][0])
+            else:
+                s_hat[i] = float(anchors[i]["start"])
+    meas_idx = [i for i, v in enumerate(s_hat) if v is not None]
+    if meas_idx:
+        first_m = meas_idx[0]
+        first_s = float(s_hat[first_m])
+        t0_sec = min(float(intervals[0][0]), first_s)
+        for i in range(0, first_m):
+            s_hat[i] = t0_sec + max(0.0, first_s - t0_sec) * i / max(1, first_m)
+        for p_k in range(len(meas_idx) - 1):
+            i_l, i_r = meas_idx[p_k], meas_idx[p_k + 1]
+            s_l, s_r = float(s_hat[i_l]), float(s_hat[i_r])
+            for i in range(i_l + 1, i_r):
+                s_hat[i] = s_l + max(0.0, s_r - s_l) * (i - i_l) / (i_r - i_l)
+        last_m = meas_idx[-1]
+        last_s = float(s_hat[last_m])
+        t1_sec = max(float(intervals[-1][1]), last_s)
+        for i in range(last_m + 1, m):
+            s_hat[i] = last_s + max(0.0, t1_sec - last_s) * (i - last_m) / max(1, m - last_m)
+    else:
+        t0_sec, t1_sec = float(intervals[0][0]), float(intervals[-1][1])
+        for i in range(m):
+            s_hat[i] = t0_sec + max(0.0, t1_sec - t0_sec) * i / max(1, m)
+    for i in range(1, m):
+        if s_hat[i] < s_hat[i - 1]:
+            s_hat[i] = s_hat[i - 1]
+
+    max_syl_span = max(2.5, 4.0 * eff_spb)
+    w_lo = [0.0] * m
+    w_hi = [0.0] * m
+    for i in range(m):
+        w_lo[i] = float(s_hat[i])
+        anc_end = float(anchors[i]["end"]) if anchors[i] is not None else w_lo[i]
+        nat_cap = max(anc_end + eff_spb, w_lo[i] + max_syl_span)
+        if i + 1 < m:
+            w_hi[i] = max(w_lo[i], min(float(s_hat[i + 1]), nat_cap))
+        else:
+            w_hi[i] = max(w_lo[i], min(max(float(intervals[-1][1]), anc_end) + 0.05, nat_cap))
+
+    # Precompute phi_O(i, j) and phi_C(i, j) for joint 3-label Viterbi over {PRE_B, O_i, C_i, B_i}.
+    phi_o = [[0.0] * n for _ in range(m)]
+    phi_c = [[-math.inf] * n for _ in range(m)]
+    for i in range(m):
         anchor = anchors[i]
-        next_anchor_start = math.inf
-        if i + 1 < m and anchors[i + 1] is not None:
-            next_anchor_start = anchors[i + 1]["start"]
-        for j in range(onset + 1, stop):
+        for j in range(n):
             start, end = intervals[j]
             duration = max(1e-6, end - start)
-            gap = start - intervals[j - 1][1]
             if anchor is not None:
-                if i in subdiv_melismas:
-                    if j not in subdiv_melismas[i]:
-                        break
-                    lyrics[j], owners[j] = "-", i
-                    continue
-                if gap > legato_gap:
-                    break
-                if end > next_anchor_start + MELISMA_NEXT_ANCHOR_TOL:
-                    break
-                overlap = max(0.0, min(end, anchor["end"]) - max(start, anchor["start"]))
-                ov_ratio = overlap / duration
-                tail_ext = max(0.0, start - anchor["end"])
-                tail_decay = math.exp(-tail_ext / max(tail_tau_floor, 0.45 * duration))
-                pitch_step = abs(float(notes[j].pitch) - float(notes[j - 1].pitch))
-                lead = max(0.0, float(anchor["start"]) - start)
-                if _melisma_log_affinity(ov_ratio, tail_decay, pitch_step, lead, tempo_scale) < 0.0:
-                    break
+                if i in subdiv_targets:
+                    gs = float(anchor.get("group_start", anchor["start"]))
+                    ge = float(anchor.get("group_end", anchor["end"]))
+                    g_ov = max(0.0, min(end, ge) - max(start, gs))
+                    if g_ov > 1e-6:
+                        onset_cost = abs(j - subdiv_targets[i]) / max(1, n)
+                    else:
+                        onset_cost = abs(start - gs) / duration + 1.0
+                else:
+                    overlap = max(0.0, min(end, float(anchor["end"])) - max(start, float(anchor["start"])))
+                    onset_cost = abs(start - float(anchor["start"])) / duration + 1.0 - overlap / duration
             else:
-                if gap > legato_gap or end > next_anchor_start + MELISMA_NEXT_ANCHOR_TOL:
-                    break
-                if baseline[j] != i and abs(float(notes[j].pitch) - float(notes[j - 1].pitch)) > MELISMA_STEP_FREE:
-                    break
-            lyrics[j], owners[j] = "-", i
+                base_cost = abs(j - baseline_onsets[i]) / max(1, n)
+                ter_cost = 0.35 * (abs(start - w_lo[i]) / duration)
+                onset_cost = 0.5 * base_cost + ter_cost
+            phi_o[i][j] = -onset_cost
+
+            if j == 0:
+                continue
+            gap = max(0.0, start - intervals[j - 1][1])
+            if gap > g_phr:
+                phi_c[i][j] = -math.inf
+                continue
+            if i in subdiv_melismas and (i in subdiv_not_last or start < subdiv_group_end[i] - 1e-6):
+                phi_c[i][j] = 1.0 if j in subdiv_melismas[i] else -math.inf
+                continue
+            pitch_step = abs(float(notes[j].pitch) - float(notes[j - 1].pitch))
+            ter_ov = max(0.0, min(end, w_hi[i]) - max(start, w_lo[i]))
+            rho = ter_ov / duration
+            if i in subdiv_not_last and start >= subdiv_not_last[i] - 1e-6:
+                rho = 0.0
+            e_ter = (
+                math.log(max(rho, 1e-9) / 0.5)
+                - max(0.0, gap - g_leg) / tau_gap
+                - ((1.0 if gap > g_leg else 0.0) * max(0.0, pitch_step - MELISMA_STEP_FREE))
+            )
+            if anchor is not None:
+                overlap = max(0.0, min(end, float(anchor["end"])) - max(start, float(anchor["start"])))
+                ov_ratio = overlap / duration
+                tail_ext = max(0.0, start - float(anchor["end"]))
+                tail_decay = math.exp(-tail_ext / max(tail_tau_floor, 0.45 * duration))
+                lead = max(0.0, float(anchor["start"]) - start)
+                e_anc = _melisma_log_affinity(ov_ratio, tail_decay, pitch_step, lead, tempo_scale)
+                if gap > g_leg:
+                    e_anc -= (gap - g_leg) / tau_gap
+                raw_aff = max(e_ter, e_anc)
+            else:
+                if baseline[j] != i and gap > g_leg and pitch_step > MELISMA_STEP_FREE:
+                    raw_aff = -2.0
+                else:
+                    raw_aff = e_ter
+            phi_c[i][j] = max(-2.0, min(2.0, raw_aff))
+
+    # State indexing: 0 = PRE_B; for token i in 0..m-1: 3*i+1 = O_i, 3*i+2 = C_i, 3*i+3 = B_i.
+    n_states = 1 + 3 * m
+    dp_v = [[-math.inf] * n_states for _ in range(n)]
+    back = [[-1] * n_states for _ in range(n)]
+    dp_v[0][0] = 0.0
+    dp_v[0][1] = phi_o[0][0]
+    for j in range(1, n):
+        prev_v = dp_v[j - 1]
+        cur_v = dp_v[j]
+        cur_b = back[j]
+        if prev_v[0] > -math.inf:
+            cur_v[0] = prev_v[0]
+            cur_b[0] = 0
+            cur_v[1] = prev_v[0] + phi_o[0][j]
+            cur_b[1] = 0
+        for i in range(m):
+            s_o = 3 * i + 1
+            s_c = 3 * i + 2
+            s_b = 3 * i + 3
+            if i > 0:
+                p_o = 3 * (i - 1) + 1
+                p_c = 3 * (i - 1) + 2
+                p_b = 3 * (i - 1) + 3
+                best_p, best_idx = prev_v[p_o], p_o
+                if prev_v[p_c] > best_p:
+                    best_p, best_idx = prev_v[p_c], p_c
+                if prev_v[p_b] > best_p:
+                    best_p, best_idx = prev_v[p_b], p_b
+                if best_p > -math.inf:
+                    cur_v[s_o] = best_p + phi_o[i][j]
+                    cur_b[s_o] = best_idx
+            # C_i: contiguous continuation from O_i or C_i only
+            if phi_c[i][j] > -math.inf:
+                best_cont, cont_idx = prev_v[s_o], s_o
+                if prev_v[s_c] > best_cont:
+                    best_cont, cont_idx = prev_v[s_c], s_c
+                if best_cont > -math.inf:
+                    cur_v[s_c] = best_cont + phi_c[i][j]
+                    cur_b[s_c] = cont_idx
+            # B_i: blank after token i from O_i, C_i, or B_i
+            best_any, any_idx = prev_v[s_o], s_o
+            if prev_v[s_c] > best_any:
+                best_any, any_idx = prev_v[s_c], s_c
+            if prev_v[s_b] > best_any:
+                best_any, any_idx = prev_v[s_b], s_b
+            if best_any > -math.inf:
+                cur_v[s_b] = best_any
+                cur_b[s_b] = any_idx
+
+    end_candidates = (3 * (m - 1) + 1, 3 * (m - 1) + 2, 3 * (m - 1) + 3)
+    best_state = max(end_candidates, key=lambda st: dp_v[n - 1][st])
+    lyrics, owners = [""] * n, [None] * n
+    st = best_state
+    for j in range(n - 1, -1, -1):
+        if st > 0:
+            tok_i = (st - 1) // 3
+            kind = (st - 1) % 3
+            if kind == 0:
+                lyrics[j], owners[j] = tokens[tok_i]["text"], tok_i
+            elif kind == 1:
+                lyrics[j], owners[j] = "-", tok_i
+        st = back[j][st]
     return lyrics, owners
 
 
@@ -895,18 +1178,38 @@ def align_lyrics_to_notes(
     if not resolved_raw_lyrics and records:
         resolved_raw_lyrics = _join_tokens([record["word"] for record in records])
     all_tokens = tokenize_lyrics(resolved_raw_lyrics)
+    unsung_token_set: set[int] = set()
+    if records and all_tokens and any(r.get("unsung", False) for r in records):
+        if len(records) == len(all_tokens) and all(
+            _token_match(all_tokens[i]["text"], records[i]["word"])[1] >= 0.99
+            for i in range(len(all_tokens))
+        ):
+            unsung_token_set = {i for i, r in enumerate(records) if r.get("unsung", False)}
+        else:
+            sung_only = [r for r in records if not r.get("unsung", False)]
+            if sung_only:
+                reprojected = _project_records_to_ground_truth(sung_only, resolved_raw_lyrics)
+                records = _expand_word_timestamps(reprojected)
+                unsung_token_set = {
+                    i for i, r in enumerate(records)
+                    if i < len(all_tokens) and r.get("unsung", False)
+                }
+            else:
+                unsung_token_set = set(range(len(all_tokens)))
+    sung_records = [r for r in records if not r.get("unsung", False)]
     max_allow_gap = max(1.5, 2.0 * spb)
-    all_anchors = _match_anchors(all_tokens, records, intervals, max_allow_gap)
+    all_anchors = _match_anchors(all_tokens, sung_records, intervals, max_allow_gap)
     n_notes = len(notes)
+    g_leg_sec = max(MELISMA_LEGATO_GAP, 0.5 * spb)
     if n_notes == 0:
         selected_idx = []
     elif any(a is not None for a in all_anchors):
         anchored_scored = []
         for idx_t, anc in enumerate(all_anchors):
-            if anc is not None:
+            if anc is not None and idx_t not in unsung_token_set:
                 ov = max((max(0.0, min(ne, anc["end"]) - max(ns, anc["start"])) for ns, ne in intervals), default=0.0)
                 min_gap = min((max(0.0, ns - anc["end"], anc["start"] - ne) for ns, ne in intervals), default=math.inf)
-                if ov > 1e-6 or (len(all_tokens) <= n_notes and min_gap <= max_allow_gap):
+                if ov > 1e-6 or (len(all_tokens) - len(unsung_token_set) <= n_notes and min_gap <= max_allow_gap):
                     anchored_scored.append((1 if ov > 1e-6 else 0, ov, -min_gap, -idx_t, idx_t))
         if len(anchored_scored) > n_notes:
             anchored_scored = sorted(anchored_scored, reverse=True)[:n_notes]
@@ -918,13 +1221,16 @@ def align_lyrics_to_notes(
             anc_tokens = [all_tokens[idx_t] for idx_t in kept_anchored]
             anc_records = [all_anchors[idx_t] for idx_t in kept_anchored]
             _, anc_base = _align_text_tokens(anc_tokens, notes)
-            _, anc_owners = _align_anchored_tokens(anc_tokens, notes, intervals, anc_records, anc_base)
+            _, anc_owners = _align_anchored_tokens(anc_tokens, notes, intervals, anc_records, anc_base, spb=spb)
             anc_note_idx = [next((j_n for j_n, ow in enumerate(anc_owners) if ow == r_i), r_i) for r_i in range(k_anc)]
             selected_set = set(kept_anchored)
             for r_i in range(k_anc + 1):
                 t_lo = 0 if r_i == 0 else kept_anchored[r_i - 1] + 1
                 t_hi = len(all_tokens) if r_i == k_anc else kept_anchored[r_i]
                 n_lo = 0 if r_i == 0 else anc_note_idx[r_i - 1] + 1
+                if r_i == k_anc and not unsung_token_set and len(all_tokens) > n_notes:
+                    while n_lo < n_notes and (intervals[n_lo][0] - intervals[n_lo - 1][1]) <= g_leg_sec:
+                        n_lo += 1
                 n_hi = n_notes if r_i == k_anc else anc_note_idx[r_i]
                 cap = max(0, n_hi - n_lo)
                 if cap > 0:
@@ -940,22 +1246,26 @@ def align_lyrics_to_notes(
                                 eff_hi = min(eff_hi, t_idx)
                     unanc_in_span = [
                         t_idx for t_idx in range(eff_lo, max(eff_lo, eff_hi))
-                        if t_idx not in selected_set and t_idx not in rejected_anchor_set
+                        if t_idx not in selected_set and t_idx not in rejected_anchor_set and t_idx not in unsung_token_set
                     ]
                     for t_idx in unanc_in_span[:cap]:
                         selected_set.add(t_idx)
             selected_idx = sorted(selected_set)[:n_notes]
         else:
-            eligible_unanc = [idx_t for idx_t in range(len(all_tokens)) if idx_t not in rejected_anchor_set]
+            eligible_unanc = [
+                idx_t for idx_t in range(len(all_tokens))
+                if idx_t not in rejected_anchor_set and idx_t not in unsung_token_set
+            ]
             selected_idx = eligible_unanc[:n_notes]
     else:
-        selected_idx = list(range(min(len(all_tokens), n_notes)))
+        eligible_all = [idx_t for idx_t in range(len(all_tokens)) if idx_t not in unsung_token_set]
+        selected_idx = eligible_all[:n_notes]
 
     sub_tokens = [all_tokens[k] for k in selected_idx]
     sub_anchors = [all_anchors[k] for k in selected_idx]
     note_lyrics, sub_owners = _align_text_tokens(sub_tokens, notes)
     if any(anchor is not None for anchor in sub_anchors) and len(sub_tokens) <= n_notes:
-        note_lyrics, sub_owners = _align_anchored_tokens(sub_tokens, notes, intervals, sub_anchors, sub_owners)
+        note_lyrics, sub_owners = _align_anchored_tokens(sub_tokens, notes, intervals, sub_anchors, sub_owners, spb=spb)
     owners = [selected_idx[o] if o is not None and o < len(selected_idx) else None for o in sub_owners]
 
     pairs, blocks, unaligned_tokens = [], [], []
@@ -978,6 +1288,8 @@ def align_lyrics_to_notes(
             unaligned_entry = {"token_index": i, "text": token["text"],
                                "line_index": token["line_index"], "note_indices": [],
                                "start": p_start, "end": p_end, "unaligned": True}
+            if i in unsung_token_set:
+                unaligned_entry["reason"] = "unsung"
             pairs.append(unaligned_entry)
             unaligned_tokens.append(unaligned_entry)
     group = []

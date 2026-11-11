@@ -66,16 +66,23 @@ def _guitar_bars(arrangement, timeline):
                     technique = event.get('technique', '')
                     note = ('x' if technique == 'X' else str(event['fret'])) + '.' + str(event['string'])
                     effects = []
+                    slide_from = event.get('slide_from_fret')
+                    is_attack = (start == a and component == 0)
                     if technique == 'PM':
                         effects.append('pm')
-                    elif technique in ('H', 'P'):
+                    elif technique in ('H', 'P') and is_attack:
                         effects.append('h')
+                    if is_attack and technique != 'X':
+                        if slide_from is not None and int(slide_from) != int(event['fret']):
+                            effects.append('sib' if int(slide_from) < int(event['fret']) else 'sia')
+                        elif technique == 'SL':
+                            effects.append('sib')
                     if (start < a or component) and technique != 'X':
                         effects.append('t')
                     if effects:
                         note += ' {' + ' '.join(effects) + '}'
                     notes.append(note)
-                text = 'CM' if component == 0 and any(e.get('technique') == 'CM' for _, e in active) else None
+                text = 'CM' if component == 0 and any(e.get('technique') in ('CM', 'SL') for _, e in active) else None
                 beat = _beat(notes or ['r'], part, chords[a] if a in chords and component == 0 else None, text)
                 beats.append(beat)
         bars.append(' '.join(beats))

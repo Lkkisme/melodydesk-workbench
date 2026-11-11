@@ -324,7 +324,8 @@ class ForensicRegressionTests(unittest.TestCase):
             bar_start_seconds=[0.0, 2.0, 4.0],
         )
         suggested_3 = guitar.suggest(proj_3bars, 0)
-        voicings_3 = [generate_voicings(ch, 0)[0]["frets"] for ch in suggested_3]
+        expected_3 = ["C", "G", suggested_3[2]]
+        voicings_3 = [generate_voicings(ch, 0)[0]["frets"] for ch in expected_3]
         sess_3bars = srv.Session(
             project=proj_3bars,
             base_chords=["C", "G"],
@@ -332,7 +333,7 @@ class ForensicRegressionTests(unittest.TestCase):
             bar_start_seconds=[0.0, 2.0, 4.0],
         )
         srv._rebuild(sess_3bars)
-        self.assertEqual(len(sess_3bars.base_chords), 3)
+        self.assertEqual(sess_3bars.base_chords, expected_3)
         self.assertEqual(len(sess_3bars.custom_voicings), 3)
         self.assertEqual(sess_3bars.custom_voicings[0], voicings_3[0])
 
@@ -359,6 +360,913 @@ class ForensicRegressionTests(unittest.TestCase):
         r_split_off = client.post("/api/reharmonize", json={"split_bar": False})
         self.assertEqual(r_split_off.status_code, 200)
         self.assertFalse(r_split_off.json()["split_bar"])
+
+    def test_plan_a_audit_counterexamples(self):
+        import xml.etree.ElementTree as ET
+        from subpkgs.guitar_reharm.guitar_simulator import _active_rms
+        from subpkgs.score_web.yoopu_svg_renderer import _svg_text
+        from subpkgs.stem_mir.beat_tracker import _bar_beat_positions
+        from subpkgs.stem_mir.chord_recognizer import synthesize_melody_conditioned_harmony
+
+        # 1. Compound 6/8 _bar_beat_positions with half-bar dotted-quarter beat at 1.2s in [0.0, 2.4]
+        pos_68 = _bar_beat_positions(np.array([1.35]), 0.0, 2.4, measure_beats=3, is_compound=True)
+        self.assertAlmostEqual(pos_68[0], 0.0, places=4)
+        self.assertAlmostEqual(pos_68[1], 0.90, places=3)
+        self.assertAlmostEqual(pos_68[2], 1.70, places=3)
+        self.assertEqual(len(pos_68), 3)
+
+        # 2. Short-buffer (< 50ms) safety in _active_rms and _has_audible_accompaniment
+        short_stereo = np.full((400, 2), 0.15, dtype=np.float32)
+        rms_short, _ = _active_rms(short_stereo, sr=44100)
+        self.assertAlmostEqual(rms_short, 0.15, places=3)
+        with tempfile.TemporaryDirectory() as tmp:
+            short_wav = Path(tmp) / "short_acc.wav"
+            sf.write(str(short_wav), short_stereo, 44100)
+            self.assertTrue(srv._has_audible_accompaniment(short_wav))
+
+        # 3. _svg_text emits a single valid XML text-anchor attribute when overridden
+        svg_node = _svg_text(10.0, 20.0, "1 = D", 12, text_anchor="start")
+        self.assertEqual(svg_node.count("text-anchor="), 1)
+        parsed = ET.fromstring(svg_node)
+        self.assertEqual(parsed.attrib.get("text-anchor"), "start")
+
+        # 4. _calibrate_lead_vocal_stem content-hash cache distinguishes different waveforms
+        sr = 22050
+        t = np.linspace(0.0, 1.5, int(1.5 * sr), endpoint=False, dtype=np.float32)
+        v_a = np.column_stack([0.2 * np.sin(2 * np.pi * 220.0 * t), 0.2 * np.sin(2 * np.pi * 220.0 * t)])
+        v_b = np.column_stack([0.2 * np.sin(2 * np.pi * 660.0 * t), 0.2 * np.sin(2 * np.pi * 660.0 * t)])
+        cal_a = srv._calibrate_lead_vocal_stem(v_a, sr)
+        cal_b = srv._calibrate_lead_vocal_stem(v_b, sr)
+        self.assertGreater(float(np.max(np.abs(cal_a - cal_b))), 0.05)
+
+        # 5. 7sus4 avoid-note check penalizes natural 3rd melody clash against sus4
+        mel_b4 = [Note(start=0.0, duration=4.0, pitch=71, raw_start=0.0, raw_duration=2.0)]
+        harm = synthesize_melody_conditioned_harmony(mel_b4, bpm=120.0, beat_origin=0.0, meter="4/4", tonic="C", minor=False, clip_duration=2.0)
+        self.assertNotEqual(harm["chords"][0], "G7sus4")
+
+        # 6. Portable manifest path resolution handles missing relative paths cleanly
+        self.assertIsNone(srv._resolve_repertoire_path("work/repertoire_audio/nonexistent_file_xyz.wav"))
+
+    def test_fable_audit_and_musicality_deliverables(self):
+        from fastapi.testclient import TestClient
+        from subpkgs.guitar_reharm import recommend_artistry
+        from subpkgs.singing_lyrics.lyric_aligner import _project_records_to_ground_truth, _token_match
+        from subpkgs.singing_lyrics.singing_transcriber import regulate_singing_notes_for_score
+        from subpkgs.stem_mir.beat_tracker import _onset_autocorrelation, _tactus_octave_log_posterior
+
+        # A2: regulate_singing_notes_for_score preserves immutable physical raw_start / raw_duration
+        raw_in = [
+            Note(start=0.0, duration=1.0, pitch=64, raw_start=10.275, raw_duration=0.785),
+            Note(start=2.0, duration=1.0, pitch=67, raw_start=11.310, raw_duration=0.640),
+        ]
+        reg_out = regulate_singing_notes_for_score(raw_in, bpm=120.0, beat_origin=10.0, clip_duration=14.0)
+        self.assertAlmostEqual(reg_out[0].raw_start, 10.275, places=5)
+        self.assertAlmostEqual(reg_out[0].raw_duration, 0.785, places=5)
+
+        # A1, A3, A4: /api/cleanup piecewise bounds, /api/reharmonize meter/bpm sync, tail-only base_chords resize
+        bt_warped = [0.0, 0.4, 1.0, 1.4, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0]
+        test_app = srv.create_app()
+        with test_app.state.session_lock:
+            s_cur = test_app.state.session
+            p_warped = Project(
+                title="seam_test",
+                tonic="C",
+                meter="4/4",
+                bpm=120.0,
+                beat_origin=0.0,
+                clip_duration=6.0,
+                source="dummy_rec.wav",
+                notes=[
+                    Note(pitch=60, start=1.25, duration=0.5, raw_start=0.4, raw_duration=0.3, edited=False),
+                    Note(pitch=64, start=2.0, duration=1.0, raw_start=1.0, raw_duration=0.4, edited=True),
+                    Note(pitch=67, start=7.0, duration=1.0, raw_start=3.5, raw_duration=0.5, edited=False),
+                ],
+                bar_start_seconds=[0.0, 2.0, 4.0, 6.0],
+                beat_times=list(bt_warped),
+            )
+            s_cur.project = p_warped
+            s_cur.capo = 0
+            s_cur.preset = "original"
+            s_cur.split_bar = False
+            s_cur.bar_start_seconds = [0.0, 2.0, 4.0, 6.0]
+            s_cur.beat_times = list(bt_warped)
+            s_cur.base_chords = ["Cmaj7", "Am7", "Dm7"]
+            s_cur.custom_voicings = [[-1, 3, 2, 0, 0, 0], None, None]
+            s_cur.note_lyrics = ["一", "二", "三"]
+            s_cur.reference_note_lyrics = ["一", "二", "三"]
+            s_cur.note_ref_indices = [0, 1, 2]
+            srv._rebuild(s_cur)
+
+        client = TestClient(test_app)
+        # A1: cleanup uses piecewise beat_times (raw_start=0.4 -> beat 1.0, bounded below edited note at 2.0)
+        r_clean = client.post("/api/cleanup", json={"mode": "binary"})
+        self.assertEqual(r_clean.status_code, 200)
+        n_tbl = r_clean.json()["notes_table"]
+        self.assertAlmostEqual(n_tbl[0]["start"], 1.0, places=3)
+        self.assertLessEqual(n_tbl[0]["start"] + n_tbl[0]["duration"], 2.0 + 1e-6)
+
+        # A4: moving last note into bar 3 extends tail only without wiping bar 0's chord or custom voicing
+        r_ext = client.post("/api/edit_note", json={"index": 2, "start": 12.5, "duration": 1.0})
+        self.assertEqual(r_ext.status_code, 200)
+        with test_app.state.session_lock:
+            self.assertEqual(len(test_app.state.session.base_chords), 4)
+            self.assertEqual(test_app.state.session.base_chords[:3], ["Cmaj7", "Am7", "Dm7"])
+            self.assertEqual(test_app.state.session.custom_voicings[0], [-1, 3, 2, 0, 0, 0])
+
+        # A3: meter-only change preserves beat_times and recomputes 3/4 bar_start_seconds
+        r_meter = client.post("/api/reharmonize", json={"meter": "3/4"})
+        self.assertEqual(r_meter.status_code, 200)
+        m_json = r_meter.json()
+        self.assertEqual(len(m_json["beat_times"]), len(bt_warped))
+        self.assertAlmostEqual(m_json["bar_start_seconds"][1], bt_warped[3], places=3)
+
+        # A3: bpm change on recording-backed session clears beat_times and resyncs unedited notes from raw_start
+        r_bpm = client.post("/api/reharmonize", json={"bpm": 60.0})
+        self.assertEqual(r_bpm.status_code, 200)
+        b_json = r_bpm.json()
+        self.assertEqual(b_json["beat_times"], [])
+        # Note 0 had raw_start=0.4s -> at 60 BPM (1 beat/sec) from origin=0.0, start snaps near 0.5 (not 1.0)
+        self.assertLess(b_json["notes_table"][0]["start"], 0.76)
+
+        # A5: 6/8 compound strum direction follows metrical depth (beat 1.5 = downstroke, weak eighths = upstroke)
+        proj_68 = Project(
+            title="68_dir",
+            tonic="D",
+            meter="6/8",
+            bpm=90.0,
+            notes=[Note(pitch=62, start=0.0, duration=1.5), Note(pitch=66, start=1.5, duration=1.5)],
+        )
+        arr_68 = arrange_advanced(proj_68, chords=["D"], style="扫弦伴奏")
+        ev_by_beat = {}
+        for ev in arr_68["events"]:
+            ev_by_beat.setdefault(round(ev["beat"], 2), set()).add(ev.get("direction"))
+        self.assertEqual(ev_by_beat.get(0.0), {"↓"})
+        self.assertEqual(ev_by_beat.get(1.5), {"↓"})
+        for wk in (0.5, 1.0, 2.0, 2.5):
+            if wk in ev_by_beat:
+                self.assertEqual(ev_by_beat[wk], {"↑"})
+
+        # A6 & B3 UI wiring check in static/index.html
+        idx_html = (Path(__file__).resolve().parent / "static" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("sj.status === 'superseded'", idx_html)
+        self.assertIn("function pickStyle(", idx_html)
+        self.assertIn("★ 本曲推荐", idx_html)
+
+        # Deliverable 2: Multi-cue tactus octave posterior flips double-time 164 BPM -> 82 BPM (m* = 2.0)
+        sr_env = 100.0
+        env_len = int(20 * sr_env)
+        env_t = np.zeros(env_len, dtype=np.float64)
+        # True pulse every 0.7317s (~82 BPM), tracker falsely emitted double-time every 0.36585s (~164 BPM)
+        raw_164 = np.arange(0.0, 18.0, 60.0 / 164.0)
+        for idx_p, bt_s in enumerate(raw_164):
+            f_i = int(round(bt_s * sr_env))
+            if f_i < env_len:
+                env_t[f_i] = 1.0 if (idx_p % 2 == 0) else 0.75
+        acf_sub = _onset_autocorrelation(env_t)
+        raw_db_164 = raw_164[::4]  # Tracker grouped 4 fast pulses = 1.4634s pseudo-bar (half of true 4/4 bar)
+        median_bar_164 = float(np.median(np.diff(raw_db_164)))
+        vocal_82 = np.arange(0.5, 17.5, 0.40, dtype=np.float64)
+        post_82 = _tactus_octave_log_posterior(
+            acf_sub=acf_sub,
+            frames_per_sec=sr_env,
+            median_bar=median_bar_164,
+            bar_q_beats=4.0,
+            beat_arr=raw_164,
+            cleaned_db=raw_db_164,
+            syl_arr=vocal_82,
+            lo_bpm=55.0,
+            hi_bpm=190.0,
+            is_compound_meter=False,
+            d_hc_sec=2.10,
+        )
+        best_scale = max(post_82, key=lambda sc: post_82[sc])
+        self.assertEqual(best_scale, 2.0)
+
+        # Deliverable 3: Phonetic CJK matching + unsung Verse 3 cutoff + humming island & 16th-rest melisma
+        sc_trad, tr_trad = _token_match("愛", "爱")
+        self.assertGreater(sc_trad, 2.0)
+        self.assertGreater(tr_trad, 0.8)
+        sc_homo, _ = _token_match("他", "她")
+        self.assertGreater(sc_homo, 2.0)
+        sc_diff, _ = _token_match("他", "大")
+        self.assertLessEqual(sc_diff, 0.0)
+
+        asr_2v = [
+            {"word": "春", "start": 4.0, "end": 4.4, "probability": 0.95},
+            {"word": "风", "start": 4.5, "end": 4.9, "probability": 0.95},
+        ]
+        proj_3v = _project_records_to_ground_truth(asr_2v, "春风 秋雨 冬雪")
+        self.assertFalse(proj_3v[0].get("unsung", False))
+        self.assertFalse(proj_3v[1].get("unsung", False))
+        self.assertTrue(all(r.get("unsung", False) for r in proj_3v[2:]))
+
+        # Humming note at beat 0.0 (raw 0.2s) > 3 beats before first lyric at 4.0s, plus 16th-rest melisma on '风'
+        notes_lyr = [
+            Note(start=0.0, duration=1.5, pitch=60, raw_start=0.2, raw_duration=0.7),
+            Note(start=8.0, duration=1.0, pitch=64, raw_start=4.0, raw_duration=0.45),
+            Note(start=9.0, duration=0.75, pitch=67, raw_start=4.5, raw_duration=0.35),
+            Note(start=10.0, duration=1.0, pitch=69, raw_start=4.95, raw_duration=0.45),
+        ]
+        proj_lyr = Project(title="lyr", tonic="C", meter="4/4", bpm=120.0, beat_origin=0.0, source="v.wav", notes=notes_lyr)
+        al_out = align_lyrics_to_notes(
+            proj_lyr,
+            raw_lyrics="春风 秋雨 冬雪",
+            word_timestamps=[
+                {"word": "春", "start": 4.0, "end": 4.4, "probability": 0.95},
+                {"word": "风", "start": 4.5, "end": 5.4, "probability": 0.95},
+                {"word": "秋", "start": 5.4, "end": 5.4, "probability": 0.0, "interpolated": True, "unsung": True},
+                {"word": "雨", "start": 5.4, "end": 5.4, "probability": 0.0, "interpolated": True, "unsung": True},
+                {"word": "冬", "start": 5.4, "end": 5.4, "probability": 0.0, "interpolated": True, "unsung": True},
+                {"word": "雪", "start": 5.4, "end": 5.4, "probability": 0.0, "interpolated": True, "unsung": True},
+            ],
+        )
+        self.assertEqual(al_out["note_lyrics"], ["", "春", "风", "-"])
+
+        # Deliverables 4 & 5: B1 final-bar sustained roll + B2 motif CM non-collision
+        # 6-bar piece: Bars 0..1 silent Intro, Bar 2 sung phrase, Bar 3 single silent breath bar, Bar 4 sung, Bar 5 silent Outro/Final
+        notes_b12 = [
+            Note(start=8.0, duration=1.0, pitch=64, raw_start=4.0, raw_duration=0.5),
+            Note(start=9.0, duration=1.0, pitch=67, raw_start=4.5, raw_duration=0.5),
+            Note(start=10.0, duration=1.5, pitch=69, raw_start=5.0, raw_duration=0.75),
+            Note(start=16.0, duration=1.0, pitch=67, raw_start=8.0, raw_duration=0.5),
+            Note(start=17.0, duration=2.0, pitch=64, raw_start=8.5, raw_duration=1.0),
+        ]
+        proj_b12 = Project(title="b12", tonic="C", meter="4/4", bpm=96.0, notes=notes_b12)
+        arr_b12 = arrange_advanced(
+            proj_b12,
+            chords=["C", "G/B", "Am7", "Fmaj7", "G7", "Cmaj7"],
+            style="指弹律动",
+            slap_x=True,
+            embellish_hp=True,
+            passing_bass=True,
+            intro_mode="chord_melody",
+        )
+        # Intro bars 0..1 have CM notes, and NO same-string overlap between CM and accompaniment
+        intro_cm = [e for e in arr_b12["events"] if e["bar"] in (0, 1) and e.get("technique") == "CM"]
+        self.assertGreaterEqual(len(intro_cm), 2)
+        by_str: dict[int, list[dict]] = {}
+        for ev in arr_b12["events"]:
+            if ev.get("technique") != "X":
+                by_str.setdefault(ev["string"], []).append(ev)
+        for s_num, s_evs in by_str.items():
+            s_evs_sorted = sorted(s_evs, key=lambda x: x["start"])
+            for i_e in range(len(s_evs_sorted) - 1):
+                self.assertLessEqual(
+                    s_evs_sorted[i_e]["start"] + s_evs_sorted[i_e]["duration"],
+                    s_evs_sorted[i_e + 1]["start"] + 1e-6,
+                )
+        # Single interior silent Bar 3 is a B1 breath bar (no scale-drill CM)
+        bar3_cm = [e for e in arr_b12["events"] if e["bar"] == 3 and e.get("technique") == "CM"]
+        self.assertEqual(len(bar3_cm), 0)
+        # Final Bar 5 is strictly one rolled chord at beat 0 of duration = measure (4.0), with roll_step_sec and no slaps
+        bar5_evs = [e for e in arr_b12["events"] if e["bar"] == 5]
+        self.assertTrue(bar5_evs)
+        self.assertTrue(all(abs(e["beat"]) < 1e-9 and abs(e["duration"] - 4.0) < 1e-6 for e in bar5_evs))
+        self.assertTrue(all("roll_step_sec" in e for e in bar5_evs))
+        self.assertTrue(all(e.get("technique") != "X" for e in bar5_evs))
+
+        # Deliverable 6: recommend_artistry pure musical discrimination
+        rec_waltz = recommend_artistry(
+            Project(title="x", tonic="G", meter="3/4", bpm=96.0, notes=[
+                Note(start=0.0, duration=2.0, pitch=64),
+                Note(start=2.0, duration=1.0, pitch=67),
+                Note(start=3.0, duration=3.0, pitch=69),
+            ]),
+            ["Em", "D", "C", "Em", "G", "D", "Em", "Em"],
+        )
+        self.assertEqual(rec_waltz["preset"], "original")
+        rec_rnb = recommend_artistry(
+            Project(title="y", tonic="F", meter="4/4", bpm=90.0, notes=[
+                Note(start=0.25, duration=0.75, pitch=65),
+                Note(start=1.75, duration=0.75, pitch=67),
+                Note(start=2.75, duration=0.75, pitch=69),
+                Note(start=4.25, duration=0.75, pitch=65),
+            ]),
+            ["Fmaj7", "E7", "Am7", "Gm7", "C9", "Bbm6", "Am7", "D7"],
+        )
+        self.assertEqual(rec_rnb["preset"], "neosoul_jazz")
+        self.assertTrue(rec_rnb["reason"])
+
+        # Gate 4 counterexamples: R1/R2 (all-N.C. & '0/4'/'Am'), T1 (sub-tick clamp), L1 (edited unsung tail), G1 (CM ceiling & 1-bar intro)
+        from types import SimpleNamespace
+        from subpkgs.score_web._score_timing import build_score_timeline
+        rec_nc = recommend_artistry(
+            Project(title="nc_waltz", tonic="C", meter="3/4", bpm=96.0, notes=[
+                Note(start=0.0, duration=2.0, pitch=69),
+                Note(start=2.0, duration=1.0, pitch=72),
+                Note(start=3.0, duration=3.0, pitch=76),
+            ]),
+            ["N.C."] * 8,
+        )
+        self.assertEqual(rec_nc["preset"], "original")
+        self.assertGreater(max(rec_nc["scores"].values()) - min(rec_nc["scores"].values()), 0.20)
+        rec_edge = recommend_artistry(
+            SimpleNamespace(meter="0/4", tonic="Am", bpm=100.0, notes=[Note(start=0.0, duration=1.0, pitch=69)]),
+            ["Am"],
+        )
+        self.assertIn(rec_edge["preset"], ("folk_easy", "original", "emotional_pop", "neosoul_jazz"))
+
+        reg_subtick = regulate_singing_notes_for_score(
+            [Note(pitch=60, start=0.0, duration=1.0, raw_start=0.0, raw_duration=0.5),
+             Note(pitch=62, start=4.0, duration=1.0, raw_start=2.0, raw_duration=0.5)],
+            bpm=120.0, beat_origin=0.0, clip_duration=2.004,
+        )
+        p_subtick = Project(title="st", tonic="C", meter="4/4", bpm=120.0, notes=reg_subtick)
+        tl_subtick = build_score_timeline(p_subtick, arrange_advanced(p_subtick, chords=["C", "G"]))
+        self.assertGreaterEqual(len(tl_subtick), 1)
+
+        proj_l1 = Project(title="l1", tonic="C", meter="4/4", bpm=120.0, beat_origin=0.0, source="v.wav", notes=[
+            Note(start=0.0, duration=1.0, pitch=60, raw_start=0.0, raw_duration=0.45),
+            Note(start=1.0, duration=1.0, pitch=62, raw_start=0.5, raw_duration=0.45),
+            Note(start=2.0, duration=1.0, pitch=64, raw_start=1.0, raw_duration=0.45),
+            Note(start=3.0, duration=1.0, pitch=65, raw_start=1.5, raw_duration=0.45),
+        ])
+        wt_l1 = [
+            {"word": "one", "start": 0.0, "end": 0.45, "probability": 0.95},
+            {"word": "two", "start": 0.5, "end": 1.95, "probability": 0.95},
+            {"word": "three", "start": 1.95, "end": 1.95, "probability": 0.0, "interpolated": True, "unsung": True},
+            {"word": "four", "start": 1.95, "end": 1.95, "probability": 0.0, "interpolated": True, "unsung": True},
+        ]
+        al_l1 = align_lyrics_to_notes(proj_l1, raw_lyrics="one two three five", word_timestamps=wt_l1)
+        self.assertEqual(al_l1["note_lyrics"], ["one", "two", "-", "-"])
+
+        p_1bar = Project(title="1b", tonic="C", meter="4/4", bpm=100.0, notes=[
+            Note(pitch=64, start=4.0, duration=1.0, raw_start=2.4, raw_duration=0.6),
+            Note(pitch=67, start=5.0, duration=3.0, raw_start=3.0, raw_duration=1.8),
+        ])
+        arr_1bar = arrange_advanced(
+            p_1bar, chords=["C", "G", "C"], style="抒情琶音",
+            intro_mode="chord_melody", passing_bass=True, slap_x=True, embellish_hp=True,
+        )
+        b0_evs = [e for e in arr_1bar["events"] if e["bar"] == 0]
+        self.assertTrue(any(e.get("technique") == "CM" for e in b0_evs))
+        self.assertTrue(all(e.get("technique") not in ("PB", "X", "H", "P") for e in b0_evs))
+        self.assertTrue(all(abs(e["beat"]) < 1e-9 or e.get("technique") == "CM" for e in b0_evs))
+        self.assertIn("function cmIntroMode(", idx_html)
+
+        # lkktest Issue 3: custom_note_lyrics keyed by stable ref_idx survives note reorder + BPM resync
+        with test_app.state.session_lock:
+            s_ref = test_app.state.session
+            s_ref.project = Project(
+                title="ref_lyric_bpm", tonic="C", meter="4/4", bpm=120.0, beat_origin=0.0,
+                clip_duration=4.0, source="dummy_rec.wav",
+                notes=[
+                    Note(pitch=60, start=0.0, duration=1.0, raw_start=0.0, raw_duration=0.4, edited=False),
+                    Note(pitch=64, start=1.0, duration=1.0, raw_start=0.5, raw_duration=0.4, edited=False),
+                ],
+                reference_notes=[
+                    Note(pitch=60, start=0.0, duration=1.0, raw_start=0.0, raw_duration=0.4),
+                    Note(pitch=64, start=1.0, duration=1.0, raw_start=0.5, raw_duration=0.4),
+                ],
+            )
+            s_ref.raw_lyrics = "one two"
+            s_ref.word_timestamps = [
+                {"word": "one", "start": 0.0, "end": 0.4, "probability": 0.9},
+                {"word": "two", "start": 0.5, "end": 0.9, "probability": 0.9},
+            ]
+            s_ref.note_lyrics = ["one", "two"]
+            s_ref.reference_note_lyrics = ["one", "two"]
+            s_ref.note_ref_indices = [0, 1]
+            s_ref.custom_note_lyrics = {}
+            s_ref.base_chords = ["C"]
+            s_ref.custom_voicings = [None]
+            srv._rebuild(s_ref)
+        # Set custom lyric 'alpha' on note 0 (ref_idx=0), then move it after note 1 (start=2.5)
+        self.assertEqual(client.post("/api/edit_note", json={"index": 0, "lyric": "alpha"}).status_code, 200)
+        self.assertEqual(client.post("/api/edit_note", json={"index": 0, "start": 2.5, "duration": 1.0}).status_code, 200)
+        r_bpm2 = client.post("/api/reharmonize", json={"bpm": 100.0})
+        self.assertEqual(r_bpm2.status_code, 200)
+        tbl2 = r_bpm2.json()["notes_table"]
+        self.assertEqual(tbl2[1]["lyric"], "alpha")
+        self.assertNotEqual(tbl2[0]["lyric"], "alpha")
+
+        # lkktest round-2: restore_reference after BPM change keeps reference_notes aligned to new BPM
+        r_rest = client.post("/api/restore_reference")
+        self.assertEqual(r_rest.status_code, 200)
+        rest_tbl = r_rest.json()["notes_table"]
+        # Note 1 had raw_start=0.5s -> at 100 BPM (0.833 beats), start snaps near 0.75..1.0 (not stale 120-BPM beat)
+        self.assertLess(rest_tbl[1]["start"], 0.90)
+
+        # Anti-phase stereo accompaniment preserves Parseval energy in _has_audible_accompaniment
+        import soundfile as sf
+        with tempfile.TemporaryDirectory() as td_st:
+            st_wav = Path(td_st) / "antiphase_acc.wav"
+            t_vec = np.arange(0, 22050, dtype=np.float64) / 22050.0
+            sig = (0.10 * np.sin(2.0 * np.pi * 440.0 * t_vec)).astype(np.float32)
+            stereo_ap = np.stack([sig, -sig], axis=1)
+            sf.write(str(st_wav), stereo_ap, 22050)
+            self.assertTrue(srv._has_audible_accompaniment(st_wav))
+
+    def test_compound_68_arpeggio_baritone_reharm_and_diatonic_pb_invariants(self):
+        # 1. Baritone E3 (MIDI 52) & A3 (MIDI 57) over G major in D major must be consonant tension, NOT clash
+        baritone_e3 = [Note(start=0.0, duration=2.0, pitch=52, raw_start=0.0, raw_duration=1.2)]
+        rep_g_e3 = check_melody_clash("G", baritone_e3, 0.0, 3.0, "D")
+        self.assertNotEqual(rep_g_e3["status"], "clash")
+        rep_gadd9_e3 = check_melody_clash("Gadd9", baritone_e3, 0.0, 3.0, "D")
+        self.assertNotEqual(rep_gadd9_e3["status"], "clash")
+
+        # G6 voicing must keep treble strings open/sounding rather than muting both Strings 1 & 2
+        g6_v = generate_voicings("G6", capo=0)[0]["frets"]
+        self.assertFalse(g6_v[4] < 0 and g6_v[5] < 0)
+
+        # 2. Tonic D pedal with root D3/D4 vocal notes in emotional_pop avoids 3x Dmaj7 spam and G6 fallback
+        notes_d_folk = [
+            Note(start=12.0, duration=2.5, pitch=50, raw_start=8.0, raw_duration=1.6),
+            Note(start=15.0, duration=1.0, pitch=54, raw_start=10.0, raw_duration=0.6),
+            Note(start=17.5, duration=0.5, pitch=55, raw_start=11.6, raw_duration=0.3),
+            Note(start=18.0, duration=2.5, pitch=52, raw_start=12.0, raw_duration=1.6),
+        ]
+        proj_d = Project(title="folk68", tonic="D", meter="6/8", bpm=90.0, notes=notes_d_folk)
+        reh = reharmonize_progression(
+            ["D", "Bm7", "A7sus4", "D", "D", "F#m7", "G", "A"],
+            proj_d,
+            preset="emotional_pop",
+            tonic="D",
+            capo=2,
+        )
+        reh_syms = [b["chord"] for b in reh]
+        self.assertNotIn("G6", reh_syms)
+        self.assertNotIn("Dmaj7", [reh_syms[4]])  # Bar 4 sings root D3 -> D or Dadd9, not Dmaj7
+        for idx_r in range(len(reh_syms) - 2):
+            self.assertFalse(reh_syms[idx_r] == reh_syms[idx_r + 1] == reh_syms[idx_r + 2] == "Dmaj7")
+
+        # 3. 6/8 抒情琶音 follows P-i-m-a-m-i (Strings 3 -> 2 -> 1 -> 2 -> 3), keeps CM second-half continuity,
+        #    and never emits out-of-key C-natural (pc 0) passing bass on G -> D in D major
+        arr_d = arrange_advanced(
+            proj_d,
+            chords=["D", "Bm7", "A7sus4", "D", "D", "F#m7", "G", "D"],
+            style="抒情琶音",
+            capo=2,
+            passing_bass=True,
+            embellish_hp=True,
+            intro_mode="chord_melody",
+        )
+        # Bar 5 (F#m7, vocal ends at beat 1.0 -> vocal_gap_here on beats 1.0..2.5) must traverse String 3, 2, and 1
+        b5_treble = [
+            e["string"]
+            for e in sorted(arr_d["events"], key=lambda x: x["beat"])
+            if e["bar"] == 5 and e["beat"] > 0.0 and e.get("technique", "") == ""
+        ]
+        self.assertEqual(b5_treble[:4], [3, 2, 1, 2])
+
+        # Multi-bar 6/8 intro Bar 1 (Bm7, CM) has accompaniment/melody activity in second half (beat >= 1.5)
+        b1_late = [e for e in arr_d["events"] if e["bar"] == 1 and e["beat"] >= 1.99]
+        self.assertGreaterEqual(len(b1_late), 1)
+
+        # Passing bass in D major never plays C natural (pc == 0) and never fires on static D -> D (Bar 3 -> Bar 4)
+        pb_evs = [e for e in arr_d["events"] if e.get("technique") == "PB"]
+        self.assertTrue(all((e["pitch"] % 12) != 0 for e in pb_evs))
+        self.assertFalse(any(e["bar"] == 3 and e.get("technique") == "PB" for e in arr_d["events"]))
+
+        # 4. Secondary fill_beat (4/4 non-arpeggio with vnc<=1) enforces H/P refractory cooldown (no back-to-back bars)
+        proj_c44 = Project(
+            title="c44_fill",
+            tonic="C",
+            meter="4/4",
+            bpm=100.0,
+            notes=[Note(start=4.0 * b, duration=1.5, pitch=64, raw_start=2.4 * b, raw_duration=0.9) for b in range(5)],
+        )
+        arr_c44 = arrange_advanced(
+            proj_c44,
+            chords=["Cadd9"] * 5,
+            style="指弹律动",
+            passing_bass=True,
+            embellish_hp=True,
+        )
+        hp_bars_44 = sorted({e["bar"] for e in arr_c44["events"] if e.get("technique") in ("H", "P")})
+        for idx_hp in range(len(hp_bars_44) - 1):
+            self.assertGreaterEqual(hp_bars_44[idx_hp + 1] - hp_bars_44[idx_hp], 2)
+
+        # 5. Late/out-of-bounds vocal_onsets_sec with pre_vocal_bars=0 still keeps beat_origin < duration & non-empty downbeats
+        with tempfile.TemporaryDirectory() as td_bt:
+            bt_wav = Path(td_bt) / "click_8s.wav"
+            sr_bt = 22050
+            dur_bt = 8.0
+            y_bt = np.zeros(int(sr_bt * dur_bt), dtype=np.float32)
+            for click_t in np.arange(0.0, dur_bt, 0.5):
+                idx0 = int(round(click_t * sr_bt))
+                idx1 = min(len(y_bt), idx0 + int(0.02 * sr_bt))
+                y_bt[idx0:idx1] = 0.4 * np.sin(2.0 * np.pi * 880.0 * (np.arange(idx1 - idx0) / sr_bt)).astype(np.float32)
+            sf.write(str(bt_wav), y_bt, sr_bt)
+            bt_res = track_beats_and_downbeats(
+                bt_wav,
+                bpm_range=(90.0, 150.0),
+                prefer_cuda=False,
+                meter_hint="4/4",
+                vocal_onsets_sec=[7.95, 8.50, float("nan")],
+                pre_vocal_bars=0,
+            )
+            self.assertLess(bt_res["beat_origin"], dur_bt)
+            self.assertGreaterEqual(len(bt_res["downbeats"]), 1)
+
+    def test_singing_gap_solo_turnarounds_unvoiced_trim_and_cm_vibrato(self):
+        from singing_model import _trim_and_split_voiced_intervals
+        from subpkgs.guitar_reharm.guitar_simulator import synthesize_realistic_guitar
+
+        # 1. Zombie phrase-ending silence trimming & breath-gap splitting in singing_model
+        sr_sm, hop_sm = 24000, 128
+        n_frames = round(4.0 * sr_sm / hop_sm)
+        uv = np.ones(n_frames, dtype=bool)
+        # Voiced 0.0..1.2s, then 2.0s pure breath silence (1.2..3.2s), then voiced 3.2..3.8s inside one unsplit interval
+        uv[0 : round(1.2 * sr_sm / hop_sm)] = False
+        uv[round(3.2 * sr_sm / hop_sm) : round(3.8 * sr_sm / hop_sm)] = False
+        probs = np.zeros((1, 128), dtype=np.float32)
+        probs[0, 62] = 0.92
+        trimmed = _trim_and_split_voiced_intervals(
+            pitches=np.array([62]),
+            intervals=np.array([[0, n_frames]]),
+            uv=uv,
+            probability=probs,
+            sr=sr_sm,
+            hop=hop_sm,
+            wav_len=4 * sr_sm,
+        )
+        self.assertEqual(len(trimmed), 2)
+        self.assertLessEqual(trimmed[0].raw_duration, 1.26)
+        self.assertGreaterEqual(trimmed[1].raw_start, 3.19)
+        self.assertLessEqual(trimmed[1].raw_duration, 0.66)
+
+        # 2. Post-verse turnaround with partial-bar vocal tail & pickup + multi-bar 6/8 interlude
+        # Verse 1 spans Bars 0..3 (12 beats in 6/8), holds 0.4b into Bar 4 (ends at 12.4),
+        # Verse 2 enters with a 0.4b pickup at end of Bar 5 (starts at 17.6 -> gap = 5.2b = 1.73 bars),
+        # Verse 2 sings Bars 6..9 (18.0..29.5), then 4-bar interlude Bars 10..13 (30.0..42.0), Verse 3 at Bar 14, Outro Bar 15.
+        notes_gap = [
+            Note(start=0.0, duration=2.5, pitch=54, raw_start=0.0, raw_duration=1.6),
+            Note(start=3.0, duration=2.5, pitch=57, raw_start=2.0, raw_duration=1.6),
+            Note(start=6.0, duration=2.5, pitch=59, raw_start=4.0, raw_duration=1.6),
+            Note(start=9.0, duration=3.4, pitch=57, raw_start=6.0, raw_duration=2.2),  # ends at 12.4 (0.4b into Bar 4)
+            Note(start=17.6, duration=2.9, pitch=54, raw_start=11.7, raw_duration=1.9),  # 0.4b pickup at end of Bar 5
+            Note(start=21.0, duration=2.5, pitch=57, raw_start=14.0, raw_duration=1.6),
+            Note(start=24.0, duration=2.5, pitch=62, raw_start=16.0, raw_duration=1.6),
+            Note(start=27.0, duration=2.5, pitch=59, raw_start=18.0, raw_duration=1.6),
+            Note(start=42.0, duration=2.5, pitch=54, raw_start=28.0, raw_duration=1.6),
+        ]
+        chords_gap = [
+            "D", "Bm7", "G", "A7sus4",
+            "D", "A/C#",  # Turnaround Bars 4..5 (partial boundary bars!)
+            "Bm7", "F#m7", "G", "A",
+            "G", "A", "F#m7", "Bm7",  # 4-bar Interlude Bars 10..13
+            "Em7", "D",
+        ]
+        proj_gap = Project(title="gap_solo", tonic="D", meter="6/8", bpm=90.0, notes=notes_gap)
+        arr_gap = arrange_advanced(
+            proj_gap,
+            chords=chords_gap,
+            style="抒情琶音",
+            capo=2,
+            passing_bass=True,
+            embellish_hp=True,
+            intro_mode="chord_melody",
+            bar_dynamics=[0.76] * len(chords_gap),
+        )
+        # Turnaround Bars 4..5 MUST emit lyrical CM notes despite boundary vocal tail/pickup & 0.76 bar_dynamics, with zero vocal overlap
+        turn_cm = [e for e in arr_gap["events"] if e["bar"] in (4, 5) and e.get("technique") == "CM"]
+        self.assertGreaterEqual(len(turn_cm), 4)
+        for ev in turn_cm:
+            ev_s, ev_e = ev["start"], ev["start"] + ev["duration"]
+            self.assertGreaterEqual(ev["pitch"], 64)
+            self.assertGreaterEqual(ev["velocity"], 84)
+            for vn in notes_gap:
+                self.assertTrue(ev_e <= vn.start + 1e-6 or ev_s >= vn.start + vn.duration - 1e-6)
+
+        # Interlude Bars 10..13: every bar has >= 3 lyrical CM notes, upper singing register, foreground velocity, and no 3x same pitch
+        inter_pitches = []
+        for b_int in (10, 11, 12, 13):
+            b_cm = sorted(
+                [e for e in arr_gap["events"] if e["bar"] == b_int and e.get("technique") == "CM"],
+                key=lambda x: x["beat"],
+            )
+            self.assertGreaterEqual(len(b_cm), 3)
+            self.assertTrue(all(e["pitch"] >= 64 for e in b_cm))
+            b_inner = [
+                e for e in arr_gap["events"]
+                if e["bar"] == b_int and e.get("technique", "") == "" and e["string"] <= 4 and e.get("roll_step_sec") is None
+            ]
+            if b_inner:
+                self.assertGreater(min(e["velocity"] for e in b_cm), max(e["velocity"] for e in b_inner))
+            inter_pitches.extend(e["pitch"] for e in b_cm)
+        for i_p in range(len(inter_pitches) - 2):
+            self.assertFalse(inter_pitches[i_p] == inter_pitches[i_p + 1] == inter_pitches[i_p + 2])
+
+        # 3. Extracted vocal motifs (m_head & m_tail) genuinely shape interlude solo rhythm & contour
+        # Song A: recurring quarter-note stepwise motif [0, +1, +1] on beats [0, 1, 2]
+        notes_motif_a = [
+            Note(start=0.0, duration=1.0, pitch=60), Note(start=1.0, duration=1.0, pitch=62), Note(start=2.0, duration=1.5, pitch=64),
+            Note(start=4.0, duration=1.0, pitch=60), Note(start=5.0, duration=1.0, pitch=62), Note(start=6.0, duration=1.5, pitch=64),
+            Note(start=20.0, duration=2.0, pitch=60),
+        ]
+        # Song B: recurring syncopated fourth-leap motif [0, +3, -2] on beats [0, 1.5, 2.5]
+        notes_motif_b = [
+            Note(start=0.0, duration=1.5, pitch=60), Note(start=1.5, duration=1.0, pitch=65), Note(start=2.5, duration=1.0, pitch=62),
+            Note(start=4.0, duration=1.5, pitch=60), Note(start=5.5, duration=1.0, pitch=65), Note(start=6.5, duration=1.0, pitch=62),
+            Note(start=20.0, duration=2.0, pitch=62),
+        ]
+        chords_ab = ["C", "G", "Am7", "F", "G", "C", "C"]
+        arr_ma = arrange_advanced(Project(title="ma", tonic="C", meter="4/4", bpm=96.0, notes=notes_motif_a), chords=chords_ab, intro_mode="chord_melody")
+        arr_mb = arrange_advanced(Project(title="mb", tonic="C", meter="4/4", bpm=96.0, notes=notes_motif_b), chords=chords_ab, intro_mode="chord_melody")
+        cm_a_b2 = [(round(e["beat"], 2), e["pitch"]) for e in arr_ma["events"] if e["bar"] == 2 and e.get("technique") == "CM"]
+        cm_b_b2 = [(round(e["beat"], 2), e["pitch"]) for e in arr_mb["events"] if e["bar"] == 2 and e.get("technique") == "CM"]
+        self.assertNotEqual(cm_a_b2, cm_b_b2)
+
+        # 4. Sustained CM solo synthesis produces finite, clean stereo audio with delayed wrist vibrato
+        audio_solo = synthesize_realistic_guitar(proj_gap, arr_gap, sr=22050)
+        self.assertEqual(audio_solo.ndim, 2)
+        self.assertEqual(audio_solo.shape[1], 2)
+        self.assertTrue(np.all(np.isfinite(audio_solo)))
+        self.assertGreater(float(np.max(np.abs(audio_solo))), 0.05)
+
+    def test_route1_studio_rr_acoustics_and_route3_btc_melodyt5_ergonomic_solos(self):
+        import os
+        import sys
+        from fastapi.testclient import TestClient
+        from subpkgs.guitar_reharm.chord_voicing import _assign_fingers, _fingers
+        from subpkgs.guitar_reharm.guitar_simulator import (
+            _ensure_sample_index,
+            _fetch_studio_guitar_note,
+            _SHINY_PITCHED,
+            synthesize_realistic_guitar,
+        )
+        from subpkgs.guitar_reharm.melodyt5_bridge import (
+            abc_to_notes,
+            generate_melodyt5_solo_cells,
+            notes_to_abc,
+        )
+        from subpkgs.score_web import server as srv
+        from subpkgs.score_web.alphatex_builder import to_alphatex
+        from subpkgs.score_web.yoopu_svg_renderer import render_publication_score_html
+
+        # 1. Route 1: Studio Multi-RR anti-machine-gun non-identical waveforms & formant-preserving slide synthesis
+        _ensure_sample_index()
+        if _SHINY_PITCHED:
+            rr_waves = [
+                _fetch_studio_guitar_note(64, 1, 11025, 22050, 92.0, "CM", seed=100 + r, rr_idx=r)
+                for r in (1, 2, 3, 4)
+            ]
+            for w in rr_waves:
+                self.assertIsNotNone(w)
+                self.assertTrue(np.all(np.isfinite(w)))
+            # Distinct studio Round-Robin takes must NOT be scalar multiples of one another
+            c12 = float(np.corrcoef(rr_waves[0][:4096], rr_waves[1][:4096])[0, 1])
+            self.assertLess(abs(c12), 0.985)
+
+            sl_up = _fetch_studio_guitar_note(66, 1, 11025, 22050, 94.0, "CM", seed=202, rr_idx=1, slide_delta=2)
+            sl_dn = _fetch_studio_guitar_note(64, 1, 11025, 22050, 94.0, "CM", seed=203, rr_idx=2, slide_delta=-2)
+            self.assertIsNotNone(sl_up)
+            self.assertIsNotNone(sl_dn)
+            self.assertTrue(np.all(np.isfinite(sl_up)))
+            self.assertTrue(np.all(np.isfinite(sl_dn)))
+
+        # 2. Route 1: Simultaneous 'CM' + 'DS' Double-Stop dyad sustains full duration without premature self-choke
+        proj_ds = Project(title="ds_sustain", tonic="D", meter="4/4", bpm=60.0, notes=[])
+        arr_ds = {
+            "title": "ds_sustain",
+            "tonic": "D",
+            "meter": "4/4",
+            "bpm": 60.0,
+            "beat_origin": 0.0,
+            "style": "指弹律动",
+            "capo": 0,
+            "bar_count": 1,
+            "measure_beats": 4.0,
+            "chords": ["D"],
+            "bars": [{
+                "bar": 0,
+                "chord": "D",
+                "roman": "I",
+                "frets": [-1, -1, 0, 2, 3, 2],
+                "split_segments": [{"beat": 0.0, "duration": 4.0, "chord": "D", "roman": "I", "frets": [-1, -1, 0, 2, 3, 2], "capo": 0}],
+            }],
+            "events": [
+                {"bar": 0, "beat": 0.0, "start": 0.0, "duration": 2.5, "string": 4, "fret": 0, "pitch": 50, "velocity": 78, "technique": "", "chord": "D", "segment": 0},
+                {"bar": 0, "beat": 0.0, "start": 0.0, "duration": 2.5, "string": 1, "fret": 5, "pitch": 69, "velocity": 94, "technique": "CM", "slide_from_fret": 3, "chord": "D", "segment": 0},
+                {"bar": 0, "beat": 0.0, "start": 0.0, "duration": 2.5, "string": 2, "fret": 7, "pitch": 66, "velocity": 85, "technique": "DS", "slide_from_fret": 5, "chord": "D", "segment": 0},
+            ],
+        }
+        wav_ds = synthesize_realistic_guitar(proj_ds, arr_ds, sr=22050)
+        self.assertTrue(np.all(np.isfinite(wav_ds)))
+        # Verify the Double-Stop + bass cluster is still audibly ringing at t = 0.8s..1.4s (not choked at 12ms)
+        late_rms = float(np.sqrt(np.mean(wav_ds[int(0.8 * 22050) : int(1.4 * 22050)] ** 2)))
+        self.assertGreater(late_rms, 0.008)
+
+        # 3. Route 1 + Score Sync: AlphaTex emits {sib}/{sia} without breaking ties, SVG renders diagonal slide 'S'
+        tex_ds = to_alphatex(proj_ds, arr_ds)
+        self.assertIn("5.1 {sib}", tex_ds)
+        self.assertIn("7.2 {sib}", tex_ds)
+        svg_ds = render_publication_score_html(proj_ds, arr_ds)
+        self.assertIn(">S<", svg_ds)
+
+        # 4. Route 3: MelodyT5 ABC round-trip & hermetic variation bridge (zero cwd/sys.path mutation)
+        cwd_before = os.getcwd()
+        syspath_before = list(sys.path)
+        for key_rt, meter_rt in (("D", "6/8"), ("F#m", "4/4"), ("Bb", "4/4"), ("Dm", "3/4")):
+            sample_rt = [
+                {"start": 0.0, "duration": 1.0, "pitch": 62},
+                {"start": 1.0, "duration": 0.5, "pitch": 65},
+                {"start": 1.5, "duration": 1.5, "pitch": 69},
+            ]
+            abc_s = notes_to_abc(sample_rt, meter_rt, key_rt)
+            self.assertEqual(abc_to_notes(abc_s, meter_rt, key_rt), sample_rt)
+
+        vocal_16 = [
+            Note(start=12.0 + k * 0.75, duration=0.5, pitch=p)
+            for k, p in enumerate((62, 64, 66, 69, 66, 64, 62, 59, 62, 64, 66, 71, 69, 66, 64, 62))
+        ]
+        mt5_out = generate_melodyt5_solo_cells(vocal_16, "6/8", "D", False, num_bars=4)
+        self.assertEqual(os.getcwd(), cwd_before)
+        self.assertEqual(sys.path, syspath_before)
+        self.assertIsInstance(mt5_out, list)
+
+        # 5. Route 3: Joint Fingerboard Solo Viterbi emits warm Double-Stops ('DS') + Slides ('slide_from_fret')
+        #    while strictly satisfying 4-finger playability (overflow == 0, span <= 4) with concurrent bass
+        #    and zero same-string overlap across all 6 strings!
+        proj_solo68 = Project(
+            title="solo68_ergonomic",
+            tonic="D",
+            meter="6/8",
+            bpm=92.0,
+            notes=vocal_16 + [Note(start=42.0, duration=2.0, pitch=62)],
+        )
+        chords_solo68 = [
+            "D", "Bm7", "G", "A7sus4",   # 4-bar Intro (Bars 0..3)
+            "D", "F#m7", "G", "A", "D",  # Sung verse (Bars 4..8)
+            "G", "A", "F#m7", "Bm7", "Em7",  # 5-bar Interlude (Bars 9..13)
+            "D", "D",
+        ]
+        arr_solo68 = arrange_advanced(
+            proj_solo68,
+            chords=chords_solo68,
+            style="抒情琶音",
+            capo=2,
+            passing_bass=True,
+            embellish_hp=True,
+            intro_mode="chord_melody",
+        )
+        evs_68 = arr_solo68["events"]
+        ds_evs = [e for e in evs_68 if e.get("technique") == "DS"]
+        sl_evs = [e for e in evs_68 if e.get("slide_from_fret") is not None]
+        self.assertGreaterEqual(len(ds_evs), 2)
+        self.assertGreaterEqual(len(sl_evs), 1)
+
+        # Check strict same-string non-overlap across all non-X events
+        for s_num in range(1, 7):
+            s_evs = sorted(
+                [e for e in evs_68 if e["string"] == s_num and e.get("technique") != "X"],
+                key=lambda e: e["start"],
+            )
+            for idx_e in range(len(s_evs) - 1):
+                self.assertLessEqual(
+                    s_evs[idx_e]["start"] + s_evs[idx_e]["duration"],
+                    s_evs[idx_e + 1]["start"] + 1e-6,
+                )
+
+        # Check 4-finger left-hand playability on every solo onset (sustained bass + CM + DS, and slide start!)
+        for cm_e in [e for e in evs_68 if e.get("technique") == "CM"]:
+            t_on = cm_e["start"]
+            concurrent = [
+                e for e in evs_68
+                if e.get("technique") != "X" and e["start"] - 1e-6 <= t_on < e["start"] + e["duration"] - 1e-6
+            ]
+            frets6 = [-1] * 6
+            for ce in concurrent:
+                if ce["string"] >= 4 or ce.get("technique") in ("CM", "DS"):
+                    frets6[6 - ce["string"]] = int(ce["fret"])
+            pos_f = [f for f in frets6 if f > 0]
+            if pos_f:
+                self.assertLessEqual(max(pos_f) - min(pos_f), 4)
+            self.assertLessEqual(_fingers(frets6)[0], 4)
+            self.assertEqual(_assign_fingers(tuple(frets6), 2)[1], 0)
+
+        # 6. Route 3: detected_split_chords wires cleanly into reharmonize_progression & FastAPI /api/reharmonize
+        reh_det = reharmonize_progression(
+            ["D", "G", "D"],
+            Project(title="det_split", tonic="D", meter="6/8", bpm=90.0, notes=[]),
+            preset="emotional_pop",
+            tonic="D",
+            split_bar=False,
+            capo=2,
+            detected_split_chords={"1": ["G", "A"]},
+        )
+        self.assertEqual(len(reh_det[0]["split_segments"]), 1)
+        self.assertEqual(len(reh_det[1]["split_segments"]), 2)
+        self.assertAlmostEqual(reh_det[1]["split_segments"][0]["duration"], 1.5)
+        self.assertAlmostEqual(reh_det[1]["split_segments"][1]["duration"], 1.5)
+
+        app_det = srv.create_app()
+        client_det = TestClient(app_det)
+        with app_det.state.session_lock:
+            s_det = app_det.state.session
+            s_det.detected_split_chords = {"0": ["C", "G"]}
+            s_det.use_detected_splits = True
+            s_det.split_bar = False
+            cur_style = s_det.style
+            srv._rebuild(s_det)
+            self.assertEqual(len(s_det.bar_analysis[0]["split_segments"]), 2)
+        # Override segment 1 of detected split bar, then re-click preset card with split_bar=False:
+        # must preserve detected splits AND segment override without 422!
+        r_ov = client_det.post("/api/bar_chord", json={"bar": 0, "segment": 1, "chord": "G7"})
+        self.assertEqual(r_ov.status_code, 200)
+        r_preset_same = client_det.post(
+            "/api/reharmonize",
+            json={"preset": s_det.preset, "style": cur_style, "split_bar": False},
+        )
+        self.assertEqual(r_preset_same.status_code, 200)
+        self.assertTrue(r_preset_same.json()["use_detected_splits"])
+        self.assertEqual(len(r_preset_same.json()["bar_analysis"][0]["split_segments"]), 2)
+        self.assertEqual(r_preset_same.json()["bar_analysis"][0]["split_segments"][1]["chord"], "G7")
+        # Standalone split_bar=False collapses detected split bars cleanly without 422 even with prior 0:1 override
+        r_off = client_det.post("/api/reharmonize", json={"split_bar": False})
+        self.assertEqual(r_off.status_code, 200)
+        self.assertFalse(r_off.json()["use_detected_splits"])
+        self.assertEqual(len(r_off.json()["bar_analysis"][0]["split_segments"]), 1)
+        r_mtr = client_det.post("/api/reharmonize", json={"meter": "3/4"})
+        self.assertEqual(r_mtr.status_code, 200)
+        with app_det.state.session_lock:
+            self.assertEqual(app_det.state.session.detected_split_chords, {})
+
+        # 7. Enharmonic sharp tonics (A#, D#, G#, A#m), 3/4 cross-segment sustained avoid-note guard, & bare 'SL' parity
+        from subpkgs.guitar_reharm.melodyt5_bridge import canonical_abc_key, phrase_cells
+        from subpkgs.guitar_reharm.arrangement_grooves import _adapt_cell_viterbi
+        self.assertEqual(canonical_abc_key("A#"), "Bb")
+        self.assertEqual(canonical_abc_key("D#"), "Eb")
+        self.assertEqual(canonical_abc_key("G#"), "Ab")
+        self.assertEqual(canonical_abc_key("A#m"), "Bbm")
+        self.assertEqual(canonical_abc_key("Ddor"), "Ddor")
+        self.assertEqual(canonical_abc_key("A#dor"), "Bbdor")
+        from subpkgs.guitar_reharm.melodyt5_bridge import key_signature
+        for mode_k in ("Ddor", "Gmix", "Flyd", "Ephr", "A#dor", "F#m", "A#"):
+            self.assertEqual(key_signature(canonical_abc_key(mode_k)), key_signature(mode_k))
+        cells_bb_dn = phrase_cells(
+            [{"start": 0.0, "duration": 1.0, "pitch": 70}, {"start": 1.0, "duration": 1.0, "pitch": 69}],
+            "A#",
+            cumulative=False,
+        )
+        cells_bb_up = phrase_cells(
+            [{"start": 0.0, "duration": 1.0, "pitch": 72}, {"start": 1.0, "duration": 1.0, "pitch": 74}],
+            "A#",
+            cumulative=False,
+        )
+        self.assertEqual(cells_bb_dn[1][2], -1)
+        self.assertEqual(cells_bb_up[1][2], 1)
+
+        # 3/4 split C (beats 0..2) | G (beats 2..3): note at beat 1.0 sustaining 2.0 beats overlaps G, so pitch C (pc=0) must be banned
+        proj_34 = Project(title="split34", tonic="C", meter="3/4", bpm=96.0, notes=[])
+        reh_34 = reharmonize_progression(
+            ["C", "Am"],
+            proj_34,
+            preset="original",
+            tonic="C",
+            split_bar=False,
+            capo=0,
+            detected_split_chords={"0": ["C", "G"]},
+        )
+        arr_34_seed = arrange_advanced(
+            proj_34,
+            chords=[r["chord"] for r in reh_34],
+            style="抒情琶音",
+            capo=0,
+            split_chords=[r["split_segments"] for r in reh_34],
+            intro_mode="none",
+        )
+        bar0_34 = arr_34_seed["bars"][0]
+        vit_34 = _adapt_cell_viterbi(
+            bar=bar0_34,
+            cell_specs=[(0.0, 1.0, 0), (1.0, 2.0, -2)],
+            capo=0,
+            tonic_pc=0,
+            diatonic={0, 2, 4, 5, 7, 9, 11},
+            depths=[0, 2, 1, 2, 1, 2],
+            measure=3.0,
+            role=3,
+            allow_double_stops=False,
+            allow_slides=False,
+        )
+        sustained_1 = [ev for ev in vit_34 if abs(ev["beat"] - 1.0) < 1e-6]
+        self.assertTrue(sustained_1)
+        for ev in sustained_1:
+            self.assertNotEqual(ev["pitch"] % 12, 0, "Pitch C must not sustain across G major (minor-9th above B)")
+
+        # Bare technique='SL' without slide_from_fret emits {sib} (not {sl} to a distant bar)
+        proj_sl = Project(
+            title="bare_sl",
+            tonic="A",
+            meter="4/4",
+            bpm=96.0,
+            notes=[Note(pitch=69, start=12.0, duration=1.0, raw_start=7.5, raw_duration=0.625)],
+        )
+        arr_sl = arrange_advanced(
+            proj_sl,
+            chords=["A", "E", "F#m", "D"],
+            style="抒情琶音",
+            capo=0,
+            intro_mode="chord_melody",
+            instrumental_melody={
+                0: [{"beat": 0.0, "duration": 1.0, "pitch": 69, "string": 1, "technique": "SL", "velocity": 90}],
+                3: [{"beat": 0.0, "duration": 1.0, "pitch": 73, "string": 1, "technique": "CM", "velocity": 90}],
+            },
+        )
+        tex_sl = to_alphatex(proj_sl, arr_sl, [""])
+        self.assertIn("5.1 {sib}", tex_sl)
+        self.assertNotIn("5.1 {sl}", tex_sl)
 
 
 if __name__ == "__main__":

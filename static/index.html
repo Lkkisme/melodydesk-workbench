@@ -125,6 +125,21 @@
     .aes-en { font-size: 10px; color: var(--ink-3); font-family: var(--serif); font-style: italic; }
     .aes-chords { font-family: var(--mono); font-size: 10px; color: var(--accent-deep); background: var(--accent-soft); padding: 2px 6px; border-radius: 4px; align-self: stretch; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .aes-desc { font-size: 11px; color: var(--ink-2); line-height: 1.4; margin-top: auto; }
+    .aes.recommended { border-color: rgba(180,83,9,0.42); }
+    .aes-rec-badge {
+      display: none; font-size: 9.5px; font-weight: 700; color: #7C2D12;
+      background: linear-gradient(135deg, #FEF3C7, #FDE68A);
+      border: 1px solid rgba(180,83,9,0.32); padding: 1px 6px; border-radius: 999px;
+      letter-spacing: 0.02em; white-space: nowrap;
+    }
+    .aes.recommended .aes-rec-badge, .aes.recommended-alt .aes-rec-badge { display: inline-block; }
+    .aes.recommended-alt .aes-rec-badge { background: var(--well); color: var(--ink-2); border-color: var(--hair-strong); font-weight: 600; }
+    .rec-hint {
+      display: none; margin: -2px 0 8px; padding: 6px 10px; border-radius: 7px;
+      background: linear-gradient(90deg, rgba(254,243,199,0.65), rgba(255,253,249,0.9));
+      border: 1px solid rgba(180,83,9,0.22); font-size: 11px; color: var(--ink-2); line-height: 1.45;
+    }
+    .rec-hint b { color: var(--accent-deep); font-weight: 700; }
 
     /* 03 Mixer */
     .transport { display: flex; align-items: center; gap: 12px; }
@@ -325,27 +340,28 @@
       <!-- 02 · Guitar artistry presets -->
       <section class="module">
         <div class="mod-head"><span class="mod-idx">II.</span><span class="mod-title">四大吉他演奏美学</span><span class="mod-spec">Guitar Artistry</span></div>
+        <div id="rec-banner" class="rec-hint"></div>
         <div class="aes-grid">
           <button type="button" class="aes active" data-vibe="original">
-            <span class="aes-top"><span class="aes-idx">A</span><span class="aes-en">Classical Fingerstyle</span><span class="led amber"></span></span>
+            <span class="aes-top"><span class="aes-idx">A</span><span class="aes-en">Classical Fingerstyle</span><span class="aes-rec-badge">★ 本曲推荐</span><span class="led amber"></span></span>
             <span class="aes-title">古典/原版分解</span>
             <span class="aes-chords">C → G/B → Am → F</span>
             <span class="aes-desc">契合人声主旋律和声，古典指弹颗粒感分解拨弦</span>
           </button>
           <button type="button" class="aes" data-vibe="folk_easy">
-            <span class="aes-top"><span class="aes-idx">B</span><span class="aes-en">Open-Chord Strum</span><span class="led amber"></span></span>
+            <span class="aes-top"><span class="aes-idx">B</span><span class="aes-en">Open-Chord Strum</span><span class="aes-rec-badge">★ 本曲推荐</span><span class="led amber"></span></span>
             <span class="aes-title">民谣开放扫弦</span>
             <span class="aes-chords">C → G → Am → F</span>
-            <span class="aes-desc">第一把位开放和弦，温暖共鸣扫弦伴奏</span>
+            <span class="aes-desc">第一把位开放和弦，温暖共鸣扫弦或分解伴奏</span>
           </button>
           <button type="button" class="aes" data-vibe="emotional_pop">
-            <span class="aes-top"><span class="aes-idx">C</span><span class="aes-en">Lyrical Arpeggio</span><span class="led amber"></span></span>
+            <span class="aes-top"><span class="aes-idx">C</span><span class="aes-en">Lyrical Arpeggio</span><span class="aes-rec-badge">★ 本曲推荐</span><span class="led amber"></span></span>
             <span class="aes-title">抒情琶音叙事</span>
             <span class="aes-chords">Cadd9 → G/B → Am7 → Fmaj7</span>
             <span class="aes-desc">Add9/Maj7 泛音色彩，顺阶低音与圆滑音连奏</span>
           </button>
           <button type="button" class="aes" data-vibe="neosoul_jazz">
-            <span class="aes-top"><span class="aes-idx">D</span><span class="aes-en">Jazz Fingerstyle</span><span class="led amber"></span></span>
+            <span class="aes-top"><span class="aes-idx">D</span><span class="aes-en">Jazz Fingerstyle</span><span class="aes-rec-badge">★ 本曲推荐</span><span class="led amber"></span></span>
             <span class="aes-title">爵士指弹律动</span>
             <span class="aes-chords">Cmaj9 → Em7 | A7 → Dm9</span>
             <span class="aes-desc">Maj9/m9 爵士延伸音，一节双和弦对位律动</span>
@@ -371,12 +387,12 @@
 
         <div class="faders">
           <div>
-            <div class="fader-head"><span id="label-vocal-track">真人主唱 (Lead Vocal)</span><span class="tag">STEM 1</span><span class="fader-val" id="val-vol-vocal">85%</span></div>
-            <input type="range" class="fader" id="slider-vol-vocal" min="0" max="100" value="85">
+            <div class="fader-head"><span id="label-vocal-track">真人主唱 (Lead Vocal)</span><span class="tag">STEM 1</span><span class="fader-val" id="val-vol-vocal">90%</span></div>
+            <input type="range" class="fader" id="slider-vol-vocal" min="0" max="100" value="90">
           </div>
           <div>
-            <div class="fader-head"><span>艺术木吉他伴奏 (Guitar)</span><span class="tag">STEM 2</span><span class="fader-val" id="val-vol-guitar">95%</span></div>
-            <input type="range" class="fader accent" id="slider-vol-guitar" min="0" max="100" value="95">
+            <div class="fader-head"><span>艺术木吉他伴奏 (Guitar)</span><span class="tag">STEM 2</span><span class="fader-val" id="val-vol-guitar">82%</span></div>
+            <input type="range" class="fader accent" id="slider-vol-guitar" min="0" max="100" value="82">
           </div>
         </div>
 
@@ -835,7 +851,7 @@
 
     // Mixer scenes
     const SCENES = {
-      'btn-mode-duet': { vocal: 85, guitar: 95 },
+      'btn-mode-duet': { vocal: 90, guitar: 82 },
       'btn-mode-guitar-only': { vocal: 0, guitar: 100 },
       'btn-mode-reference': { vocal: 100, guitar: 0 }
     };
@@ -997,13 +1013,41 @@
     // The active aesthetic card previews the loaded song's real progression; the others keep their sample.
     function renderAestheticChords(s) {
       const progression = (s.chords || []).filter((c, i, arr) => i === 0 || c !== arr[i - 1]).slice(0, 4);
+      const recPreset = s.recommended_preset || '';
+      const secPreset = s.recommended_secondary_preset || '';
+      let recCardTitle = '';
       document.querySelectorAll('.aes').forEach(b => {
         const badge = b.querySelector('.aes-chords');
         if (!badge.dataset.sample) badge.dataset.sample = badge.textContent;
         badge.textContent = b.dataset.vibe === s.preset && progression.length
           ? progression.join(' → ') + ((s.chords || []).length > 4 ? ' …' : '')
           : badge.dataset.sample;
+        const isPrimary = Boolean(recPreset && b.dataset.vibe === recPreset);
+        const isSecondary = Boolean(!isPrimary && secPreset && b.dataset.vibe === secPreset);
+        b.classList.toggle('recommended', isPrimary);
+        b.classList.toggle('recommended-alt', isSecondary);
+        const recTag = b.querySelector('.aes-rec-badge');
+        if (recTag) {
+          recTag.textContent = isPrimary ? '★ 本曲推荐' : (isSecondary ? '★ 亦宜' : '★ 本曲推荐');
+        }
+        if (isPrimary) {
+          const tEl = b.querySelector('.aes-title');
+          recCardTitle = tEl ? tEl.textContent : recPreset;
+        }
       });
+      const banner = document.getElementById('rec-banner');
+      if (banner) {
+        if (recPreset && s.recommended_reason) {
+          banner.style.display = 'block';
+          banner.replaceChildren();
+          const strong = document.createElement('b');
+          strong.textContent = `★ 本曲推荐「${recCardTitle}」：`;
+          banner.appendChild(strong);
+          banner.appendChild(document.createTextNode(s.recommended_reason));
+        } else {
+          banner.style.display = 'none';
+        }
+      }
     }
 
     function renderState(s, refreshAudio = true) {
@@ -1019,7 +1063,30 @@
       if (activeDemo !== 'upload' && s.active_demo) activeDemo = s.active_demo;
       selectTrack(activeDemo);
 
+      if (s.repertoire) {
+        document.querySelectorAll('.track[data-demo]').forEach(btn => {
+          const info = s.repertoire[btn.dataset.demo];
+          if (!info) return;
+          const nameEl = btn.querySelector('.track-name');
+          const metaEl = btn.querySelector('.track-meta');
+          const tagEl = btn.querySelector('.track-tag');
+          if (nameEl && !nameEl.dataset.origHtml) nameEl.dataset.origHtml = nameEl.innerHTML;
+          if (metaEl && !metaEl.dataset.origText) metaEl.dataset.origText = metaEl.textContent;
+          if (tagEl && !tagEl.dataset.origText) tagEl.dataset.origText = tagEl.textContent;
+          if (!info.has_real_vocal) {
+            if (nameEl) nameEl.textContent = info.title || btn.dataset.demo;
+            if (metaEl) metaEl.textContent = info.subtitle || '';
+            if (tagEl) tagEl.textContent = '合成练习曲';
+          } else {
+            if (nameEl && nameEl.dataset.origHtml) nameEl.innerHTML = nameEl.dataset.origHtml;
+            if (metaEl && metaEl.dataset.origText) metaEl.textContent = metaEl.dataset.origText;
+            if (tagEl && tagEl.dataset.origText) tagEl.textContent = tagEl.dataset.origText;
+          }
+        });
+      }
       document.getElementById('label-vocal-track').textContent = s.has_real_vocal ? '真人主唱' : '主旋律领奏';
+      const refBtn = document.getElementById('btn-mode-reference');
+      if (refBtn) refBtn.textContent = s.has_real_vocal ? '纯享真人声' : '纯享主旋律';
       document.querySelectorAll('.aes').forEach(b => b.classList.toggle('active', b.dataset.vibe === s.preset));
       renderAestheticChords(s);
 
@@ -1115,20 +1182,33 @@
         const j = await r.json();
         if (!r.ok) throw new Error(j.detail || '上传失败');
         const poll = setInterval(async () => {
-          const sr = await fetch('/api/job/' + j.job_id);
-          const sj = await sr.json();
-          statusEl.textContent = sj.message || '处理中…';
-          if (sj.status === 'done') {
+          try {
+            const sr = await fetch('/api/job/' + j.job_id);
+            if (!sr.ok) {
+              clearInterval(poll);
+              showError('查询分析任务状态失败');
+              return;
+            }
+            const sj = await sr.json();
+            statusEl.textContent = sj.message || '处理中…';
+            if (sj.status === 'done') {
+              clearInterval(poll);
+              statusEl.textContent = '已生成艺术吉他编配谱与伴奏';
+              document.getElementById('upload-panel').style.display = 'none';
+              activeDemo = 'upload';
+              selectedBarIndex = 0;
+              selectTrack(activeDemo);
+              apiCall('state', undefined, true);
+            } else if (sj.status === 'superseded') {
+              clearInterval(poll);
+              statusEl.textContent = sj.message || '分析请求已被新曲目切换取代';
+            } else if (sj.status === 'error') {
+              clearInterval(poll);
+              showError('分析出错：' + sj.message);
+            }
+          } catch (pollErr) {
             clearInterval(poll);
-            statusEl.textContent = '已生成艺术吉他编配谱与伴奏';
-            document.getElementById('upload-panel').style.display = 'none';
-            activeDemo = 'upload';
-            selectedBarIndex = 0;
-            selectTrack(activeDemo);
-            apiCall('state', undefined, true);
-          } else if (sj.status === 'error') {
-            clearInterval(poll);
-            showError('分析出错：' + sj.message);
+            showError('轮询分析进度中断：' + pollErr.message);
           }
         }, 1000);
       } catch (e) {
@@ -1136,27 +1216,46 @@
       }
     });
 
-    // 02 · Guitar artistry cards — each sends a distinct preset + style combination
+    // 02 · Guitar artistry cards — each sends a distinct preset + style combination by name
+    function pickStyle(styles, vibe, ...preferred) {
+      if (
+        currentState &&
+        currentState.recommended_preset === vibe &&
+        currentState.recommended_style &&
+        styles.includes(currentState.recommended_style)
+      ) {
+        return currentState.recommended_style;
+      }
+      for (const name of preferred) {
+        if (styles.includes(name)) return name;
+      }
+      return styles[0];
+    }
+
+    function cmIntroMode() {
+      return currentState?.accompaniment_backend === 'advanced' ? 'chord_melody' : 'none';
+    }
+
     const VIBE_CONFIGS = {
       original: styles => ({
-        preset: 'original', style: styles[0],
+        preset: 'original', style: pickStyle(styles, 'original', '分解和弦', '民谣分解'),
         split_bar: false, passing_bass: false, slap_x: false, palm_mute: false, embellish_hp: false,
-        intro_mode: 'chord_melody'
+        intro_mode: cmIntroMode()
       }),
       folk_easy: styles => ({
-        preset: 'folk_easy', style: styles[1] || styles[0],
+        preset: 'folk_easy', style: pickStyle(styles, 'folk_easy', '扫弦伴奏', '分解和弦', '民谣扫弦'),
         split_bar: false, passing_bass: false, slap_x: false, palm_mute: false, embellish_hp: false,
-        intro_mode: 'none'
+        intro_mode: cmIntroMode()
       }),
       emotional_pop: styles => ({
-        preset: 'emotional_pop', style: styles[4] || styles[0],
+        preset: 'emotional_pop', style: pickStyle(styles, 'emotional_pop', '抒情琶音', '分解和弦'),
         split_bar: false, passing_bass: true, slap_x: false, palm_mute: false, embellish_hp: true,
-        intro_mode: 'chord_melody'
+        intro_mode: cmIntroMode()
       }),
       neosoul_jazz: styles => ({
-        preset: 'neosoul_jazz', style: styles[3] || styles[1] || styles[0],
+        preset: 'neosoul_jazz', style: pickStyle(styles, 'neosoul_jazz', 'Neo-Soul 律动', '指弹律动', '流行扫弦'),
         split_bar: true, passing_bass: true, slap_x: false, palm_mute: false, embellish_hp: true,
-        intro_mode: 'chord_melody'
+        intro_mode: cmIntroMode()
       })
     };
 

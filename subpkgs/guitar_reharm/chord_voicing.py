@@ -113,16 +113,16 @@ _SHAPES = {
     'C7':[-1,3,2,3,1,0], 'Cm7':[-1,3,5,3,4,3], 'Cmaj9':[-1,3,2,4,3,0],
     'D':[-1,-1,0,2,3,2], 'Dm':[-1,-1,0,2,3,1], 'D7':[-1,-1,0,2,1,2],
     'Dm7':[-1,-1,0,2,1,1], 'Dmaj7':[-1,-1,0,2,2,2], 'Dsus2':[-1,-1,0,2,3,0],
-    'Dsus4':[-1,-1,0,2,3,3], 'Dadd9':[-1,5,4,2,3,0],
+    'Dsus4':[-1,-1,0,2,3,3], 'Dadd9':[-1,5,4,2,3,0], 'D6':[-1,-1,0,2,0,2],
     'E':[0,2,2,1,0,0], 'Em':[0,2,2,0,0,0], 'E7':[0,2,0,1,0,0],
     'Em7':[0,2,2,0,3,0], 'Emaj7':[0,2,1,1,0,0], 'Esus4':[0,2,2,2,0,0],
-    'Em9':[0,2,0,0,0,2],
+    'Em9':[0,2,0,0,0,2], 'Em6':[0,2,2,0,2,0],
     'F':[1,3,3,2,1,1], 'Fmaj7':[-1,-1,3,2,1,0], 'Fm6':[1,-1,0,1,1,1],
     'Fadd9':[-1,-1,3,2,1,3], 'Fsus2':[-1,-1,3,0,1,1], 'Fm':[1,3,3,1,1,1],
     'G':[3,2,0,0,0,3], 'G7':[3,2,0,0,0,1], 'G7sus4':[3,3,0,0,1,1],
-    'Gadd9':[3,0,0,2,0,3], 'Gsus4':[3,3,0,0,1,3], 'Gmaj7':[3,2,0,0,0,2],
+    'Gadd9':[3,0,0,2,0,3], 'Gsus2':[3,0,0,0,3,3], 'Gsus4':[3,3,0,0,1,3], 'Gmaj7':[3,2,0,0,0,2], 'G6':[3,2,0,0,0,0],
     'A':[-1,0,2,2,2,0], 'Am':[-1,0,2,2,1,0], 'Am7':[-1,0,2,0,1,0],
-    'Amaj7':[-1,0,2,1,2,0], 'Asus2':[-1,0,2,2,0,0], 'Asus4':[-1,0,2,2,3,0],
+    'Amaj7':[-1,0,2,1,2,0], 'Asus2':[-1,0,2,2,0,0], 'Asus4':[-1,0,2,2,3,0], 'A6':[-1,0,2,2,2,2],
     'Amadd9':[-1,0,2,4,1,0], 'Am9':[-1,0,5,5,5,7],
     'B':[-1,2,4,4,4,2], 'Bm':[-1,2,4,4,3,2], 'Bm7':[-1,2,4,2,3,2],
     'B7':[-1,2,1,2,0,2],
@@ -309,9 +309,15 @@ def _ergonomic_voicing_cost(frets, parsed, capo):
     req = _required(parsed)
     non_fifth = set(parsed['pcs']) - ({(parsed['root'] + 7) % 12} if len(parsed['pcs']) >= 4 and 7 in parsed['intervals'] else set())
     completeness_cost = len(req - pcs) * 2.5 + len(non_fifth - pcs) * 1.5
-    # Texture: internal mutes (hard to damp cleanly) and thin voicings.
+    # Texture: internal mutes (hard to damp cleanly), muted treble strings (muddy arpeggios), and thin voicings.
     interior = _internal_mutes(frets)
     mute_cost = interior * 2.0 if not (interior == 1 and parsed['bass']) else interior * 0.8
+    if frets[4] < 0 and frets[5] < 0:
+        top_mute_cost = 3.5
+    elif frets[5] < 0 and sum(1 for f in frets[2:6] if f >= 0) < 3:
+        top_mute_cost = 1.2
+    else:
+        top_mute_cost = 0.0
     richness_cost = max(0, 4 - len(sounding)) * 1.5
     # Fretboard geometry: millimetre span, pairwise finger-reach proxy, and neck-position penalty.
     _, span_energy, pair_strain, position_energy, overflow = _fretboard_stretch_mm(frets, capo)
@@ -323,7 +329,7 @@ def _ergonomic_voicing_cost(frets, parsed, capo):
     fingers_cnt, is_barre = _fingers(frets)
     fingers_cost = max(0, fingers_cnt - 3) * 1.5 + (0.35 if is_barre else 0.0) + overflow * 4.0
     cross_cost = sum(0.35 for a, b in zip(pitches, pitches[1:]) if b < a)
-    return (bass_cost + completeness_cost + mute_cost + richness_cost
+    return (bass_cost + completeness_cost + mute_cost + top_mute_cost + richness_cost
             + span_energy + pair_strain + position_energy + barre_cost + fingers_cost + cross_cost)
 
 
