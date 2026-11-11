@@ -113,8 +113,8 @@ _SHAPES = {
     'C7':[-1,3,2,3,1,0], 'Cm7':[-1,3,5,3,4,3], 'Cmaj9':[-1,3,2,4,3,0],
     'D':[-1,-1,0,2,3,2], 'Dm':[-1,-1,0,2,3,1], 'D7':[-1,-1,0,2,1,2],
     'Dm7':[-1,-1,0,2,1,1], 'Dmaj7':[-1,-1,0,2,2,2], 'Dsus2':[-1,-1,0,2,3,0],
-    'Dsus4':[-1,-1,0,2,3,3], 'Dadd9':[-1,5,4,2,3,0], 'D6':[-1,-1,0,2,0,2],
-    'E':[0,2,2,1,0,0], 'Em':[0,2,2,0,0,0], 'E7':[0,2,0,1,0,0],
+    'Dsus4':[-1,-1,0,2,3,3], 'Dadd9':[-1,5,4,2,3,0], 'Dm9':[-1,5,3,5,5,5], 'D6':[-1,-1,0,2,0,2],
+    'E':[0,2,2,1,0,0], 'Em':[0,2,2,0,0,0], 'E7':[0,2,0,1,0,0], 'Eadd9':[0,2,4,1,0,0],
     'Em7':[0,2,2,0,3,0], 'Emaj7':[0,2,1,1,0,0], 'Esus4':[0,2,2,2,0,0],
     'Em9':[0,2,0,0,0,2], 'Em6':[0,2,2,0,2,0],
     'F':[1,3,3,2,1,1], 'Fmaj7':[-1,-1,3,2,1,0], 'Fm6':[1,-1,0,1,1,1],
@@ -122,7 +122,7 @@ _SHAPES = {
     'G':[3,2,0,0,0,3], 'G7':[3,2,0,0,0,1], 'G7sus4':[3,3,0,0,1,1],
     'Gadd9':[3,0,0,2,0,3], 'Gsus2':[3,0,0,0,3,3], 'Gsus4':[3,3,0,0,1,3], 'Gmaj7':[3,2,0,0,0,2], 'G6':[3,2,0,0,0,0],
     'A':[-1,0,2,2,2,0], 'Am':[-1,0,2,2,1,0], 'Am7':[-1,0,2,0,1,0],
-    'Amaj7':[-1,0,2,1,2,0], 'Asus2':[-1,0,2,2,0,0], 'Asus4':[-1,0,2,2,3,0], 'A6':[-1,0,2,2,2,2],
+    'Amaj7':[-1,0,2,1,2,0], 'Aadd9':[-1,0,2,4,2,0], 'Asus2':[-1,0,2,2,0,0], 'Asus4':[-1,0,2,2,3,0], 'A6':[-1,0,2,2,2,2],
     'Amadd9':[-1,0,2,4,1,0], 'Am9':[-1,0,5,5,5,7],
     'B':[-1,2,4,4,4,2], 'Bm':[-1,2,4,4,3,2], 'Bm7':[-1,2,4,2,3,2],
     'B7':[-1,2,1,2,0,2],
@@ -328,7 +328,12 @@ def _ergonomic_voicing_cost(frets, parsed, capo):
         barre_cost = (barre_strings - 1) * 0.8 if barre_strings > 1 else 0.0
     fingers_cnt, is_barre = _fingers(frets)
     fingers_cost = max(0, fingers_cnt - 3) * 1.5 + (0.35 if is_barre else 0.0) + overflow * 4.0
-    cross_cost = sum(0.35 for a, b in zip(pitches, pitches[1:]) if b < a)
+    cross_cost = (
+        sum(1.15 for a, b in zip(pitches, pitches[1:]) if b <= a)
+        + (len(pitches) - len(set(pitches))) * 1.10
+        + (max(0, pitches[1] - pitches[0] - 12) * 0.55 if len(pitches) >= 2 else 0.0)
+        + (max(0.0, (sum(positive) / len(positive)) - 5.0) * 0.45 if positive else 0.0)
+    )
     return (bass_cost + completeness_cost + mute_cost + top_mute_cost + richness_cost
             + span_energy + pair_strain + position_energy + barre_cost + fingers_cost + cross_cost)
 
@@ -382,7 +387,7 @@ def _search(symbol, capo):
 
     def key(item):
         frets, _ = item
-        canonical_bonus = 0.0 if frets in canonical else 2.0
+        canonical_bonus = 0.0 if frets in canonical else 2.8
         return canonical_bonus + _ergonomic_voicing_cost(list(frets), parsed, capo)
 
     return tuple(frets for frets, _ in sorted(found.items(), key=key))

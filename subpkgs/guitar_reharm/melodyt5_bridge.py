@@ -534,7 +534,7 @@ def generate_melodyt5_solo_cells(
 
     abc_in = notes_to_abc(best_span_notes, meter, key_str, origin_beat=best_origin)
     target_bars = max(2, min(8, int(num_bars)))
-    cache_id = hashlib.sha256(f"v1|{meter}|{key_str}|{target_bars}|{abc_in}".encode("utf-8")).hexdigest()[:24]
+    cache_id = hashlib.sha256(f"v2|{meter}|{key_str}|{target_bars}|{abc_in}".encode("utf-8")).hexdigest()[:24]
 
     with _MODEL_LOCK:
         if cache_id in _MEM_CACHE:
@@ -582,7 +582,7 @@ def generate_melodyt5_solo_cells(
             while len(tok_list) < _PATCH_SIZE - 1:
                 tok_tensor = torch.tensor(tok_list, dtype=torch.long, device=device)
                 probs = model.char_level_decoder.next_probs(enc_last, tok_tensor)
-                nxt = _sample_next_token(probs, top_p=0.82, top_k=8, temperature=1.35, rng=rng)
+                nxt = _sample_next_token(probs, top_p=0.78, top_k=5, temperature=0.85, rng=rng)
                 tok_list.append(nxt)
                 if nxt == patchilizer.eos_token_id:
                     break
@@ -617,8 +617,18 @@ def generate_melodyt5_solo_cells(
             for n in parsed_notes
             if b_s - 1e-4 <= n["start"] < b_e - 0.12
         ]
-        if len(b_notes) >= 2:
-            bar_cells.append(phrase_cells(b_notes, key_str, cumulative=False))
+        if 2 <= len(b_notes) <= 5:
+            cell = phrase_cells(b_notes, key_str, cumulative=False)
+            steps_only = [st for _o, _d, st in cell[1:]]
+            has_sawtooth = (
+                len(steps_only) >= 3
+                and all(
+                    steps_only[m] * steps_only[m + 1] < 0 and abs(steps_only[m]) >= 2
+                    for m in range(len(steps_only) - 1)
+                )
+            )
+            if not has_sawtooth and all(abs(st) <= 4 for st in steps_only):
+                bar_cells.append(cell)
 
     if not bar_cells:
         return []

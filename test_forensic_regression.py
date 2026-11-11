@@ -1268,6 +1268,66 @@ class ForensicRegressionTests(unittest.TestCase):
         self.assertIn("5.1 {sib}", tex_sl)
         self.assertNotIn("5.1 {sl}", tex_sl)
 
+        # 8. Anti-Boingy ('Q弹') Discrete Fretted Grace-Slide & Anti-Noodling ('xjb乱弹') Home-Position Intro Guard
+        from subpkgs.guitar_reharm.guitar_simulator import _slide_head
+        synth_base = np.sin(2.0 * np.pi * 440.0 * np.arange(22050, dtype=np.float64) / 22050.0).astype(np.float32)
+        sl_head, sl_d_int = _slide_head(synth_base, 0, -2, 0.060, 22050)
+        cont_idx = len(sl_head) + sl_d_int
+        self.assertGreaterEqual(cont_idx, 0)
+        # Verify sample-exact seam between end of _slide_head and base[cont_idx] (no step discontinuity)
+        expected_step = abs(float(synth_base[cont_idx]) - float(synth_base[cont_idx - 1]))
+        actual_step = abs(float(synth_base[cont_idx]) - float(sl_head[-1]))
+        self.assertAlmostEqual(actual_step, expected_step, places=5)
+
+        # Multi-bar intro with mid-bar vocal pickup in bar 4 (beat 14.5 in 6/8) must:
+        # (a) leave bar 4 free of CM solo licks so singer's pickup is clean,
+        # (b) keep Intro CM notes in warm home position (fret <= 6),
+        # (c) never attach slide_from_fret to a DS dyad, and emit <= 1 slide across the 4-bar Intro,
+        # (d) never machine-gun the exact same accompaniment note 3+ times in a row under a CM bar.
+        proj_intro_pickup = Project(
+            title="intro_pickup_68",
+            tonic="D",
+            meter="6/8",
+            bpm=91.0,
+            notes=[
+                Note(start=14.5, duration=0.5, pitch=57),
+                Note(start=15.0, duration=1.5, pitch=62),
+                Note(start=16.5, duration=1.5, pitch=66),
+            ],
+        )
+        arr_ip = arrange_advanced(
+            proj_intro_pickup,
+            chords=["Dadd9", "Bm7", "Gadd9", "Dadd9", "Dadd9", "Bm7"],
+            style="抒情琶音",
+            capo=2,
+            intro_mode="chord_melody",
+        )
+        bar4_cm = [e for e in arr_ip["events"] if e["bar"] == 4 and e.get("technique") in ("CM", "DS")]
+        self.assertEqual(bar4_cm, [])
+        intro_cm_frets = [e["fret"] for e in arr_ip["events"] if e["bar"] < 4 and e.get("technique") == "CM"]
+        self.assertTrue(intro_cm_frets)
+        self.assertLessEqual(max(intro_cm_frets), 6)
+        intro_ds_slides = [
+            e for e in arr_ip["events"]
+            if e.get("technique") == "DS" and e.get("slide_from_fret") is not None
+        ]
+        self.assertEqual(intro_ds_slides, [])
+        intro_slides = [e for e in arr_ip["events"] if e["bar"] < 4 and e.get("slide_from_fret") is not None]
+        self.assertLessEqual(len(intro_slides), 1)
+        for b_i in range(4):
+            acc_pitches = [
+                e["pitch"] for e in sorted(arr_ip["events"], key=lambda x: (x["start"], x["string"]))
+                if e["bar"] == b_i and e.get("technique", "") == "" and e["string"] <= 3
+            ]
+            for k_a in range(len(acc_pitches) - 2):
+                self.assertFalse(
+                    acc_pitches[k_a] == acc_pitches[k_a + 1] == acc_pitches[k_a + 2],
+                    f"Machine-gun repeated inner accompaniment pitch in bar {b_i}: {acc_pitches}",
+                )
+        # Canonical Dadd9 voicing must be monotonic without high-fret unison duplication
+        dadd9_v = generate_voicings("Dadd9", capo=0)[0]["frets"]
+        self.assertEqual(dadd9_v, [-1, 5, 4, 2, 3, 0])
+
 
 if __name__ == "__main__":
     unittest.main()

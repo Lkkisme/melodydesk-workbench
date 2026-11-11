@@ -822,6 +822,7 @@ def _adapt_cell_viterbi(
     allow_double_stops: bool = False,
     allow_slides: bool = False,
     role: int = 0,
+    prefer_home_position: bool = False,
 ) -> list[dict]:
     """Adapt ``[(beat, duration, step_deg), ...]`` via Joint Fingerboard Viterbi over (pitch, string, DS, slide)."""
     def _seg_at(b_pos: float):
@@ -880,10 +881,11 @@ def _adapt_cell_viterbi(
         slot_i = min(max(0, int(round(b_pos * 2.0))), n_slots - 1)
         depth_i = depths[slot_i]
 
-        max_fret_pref = min(14, 24 - capo)
+        max_fret_pref = min(max(5, base_fret + 3) if prefer_home_position else 12, 24 - capo)
         base_cands = []
+        fret_caps = (max_fret_pref, min(14, 24 - capo), 24 - capo) if prefer_home_position else (max_fret_pref, 24 - capo)
         for enforce_hand in (True, False):
-            for fret_cap in (max_fret_pref, 24 - capo):
+            for fret_cap in fret_caps:
                 for s in allowed_strings:
                     open_p = STANDARD_TUNING[6 - s] + capo
                     for f in range(0, fret_cap + 1):
@@ -938,8 +940,8 @@ def _adapt_cell_viterbi(
             + (0.40 if is_cadence_note else 0.0)
             + (0.20 if role == 2 else 0.0),
         )
-        can_ds_here = allow_double_stops and dur >= 0.5 - 1e-6 and (n_specs >= 3 or is_cadence_note)
-        can_slide_here = allow_slides and dur >= 0.75 - 1e-6 and (idx_i == 0 or dur >= 1.0 - 1e-6 or role == 2)
+        can_ds_here = allow_double_stops and dur >= 1.0 - 1e-6 and (n_specs >= 2 or is_cadence_note)
+        can_slide_here = allow_slides and dur >= 1.0 - 1e-6 and (idx_i > 0 or n_specs == 1 or role == 2)
 
         joint_cands = []
         for p, s, f, harm in base_cands:
@@ -980,33 +982,28 @@ def _adapt_cell_viterbi(
                 best_ds_for_lead.sort(key=lambda item: item[0])
                 for _b_sc, ds_tuple in best_ds_for_lead[:2]:
                     joint_cands.append((p, s, f, harm, ds_tuple, 0))
-                    if (
-                        can_slide_here
-                        and f - delta_s >= 1
-                        and ds_tuple[1] - delta_s >= 1
-                        and _is_playable_solo_hand(bass_info, (s, f - delta_s), (ds_tuple[0], ds_tuple[1] - delta_s), capo)
-                    ):
-                        joint_cands.append((p, s, f, harm, ds_tuple, delta_s))
 
         layers.append(joint_cands)
         meta.append((b_pos, dur, st_deg, bass_p, base_fret, depth_i, accent_i))
 
     n_n = len(layers)
+    pos_w = 0.18 if prefer_home_position else 0.04
+    has_interior_long = any(m_it[1] >= 1.0 - 1e-6 for m_it in meta[1:])
 
     def _run_viterbi(mu_ds: float) -> list[tuple]:
         dp = [[INF] * len(layer) for layer in layers]
         back = [[-1] * len(layer) for layer in layers]
         b_pos0, dur0, _, bass_p0, bf0, _, accent0 = meta[0]
         for k, (p, s, f, harm, ds_info, sl_d) in enumerate(layers[0]):
-            pos_pen0 = 0.04 * abs(f - bf0) if f > 0 else 0.0
+            pos_pen0 = pos_w * abs(f - bf0) if f > 0 else 0.0
             reg_pen = (
                 0.85 * max(0.0, low_floor - p)
-                + 0.14 * max(0.0, p - 79.0)
-                + 0.065 * abs(p - float(register_center))
+                + 0.16 * max(0.0, p - 77.0)
+                + 0.075 * abs(p - float(register_center))
             )
             cost = (
                 1.2 * harm
-                + 0.05 * max(0.0, f - 10.0)
+                + 0.06 * max(0.0, f - 9.0)
                 + pos_pen0
                 + _BASS_INTERVAL_COST[(p - bass_p0) % 12]
                 + reg_pen
@@ -1020,24 +1017,24 @@ def _adapt_cell_viterbi(
             if ds_info is not None:
                 cost += (mu_ds - 0.95 * accent0) + _BASS_INTERVAL_COST[(ds_info[2] - bass_p0) % 12] * 0.5
             if sl_d > 0:
-                leap0 = abs(p - prev_pitch_hint) if prev_pitch_hint is not None else 5
-                cost += 0.48 - (0.72 if (leap0 >= 4 or dur0 >= 1.0 - 1e-6) else 0.15) - (0.15 if role == 2 else 0.0)
+                can_open_slide = (not has_interior_long) and dur0 >= 1.25 - 1e-6 and (prev_pitch_hint is None or p > prev_pitch_hint)
+                cost += -0.14 if can_open_slide else 0.32
             dp[0][k] = cost
 
         for i in range(1, n_n):
             b_posi, duri, st_deg, bass_pi, bfi, _, accenti = meta[i]
             gap_prev = max(0.25, b_posi - meta[i - 1][0])
-            rc_i = float(register_center) + (1.0 if st_deg > 0 else (-0.5 if st_deg < 0 else 0.0))
+            rc_i = float(register_center) + (0.8 if st_deg > 0 else (-0.4 if st_deg < 0 else 0.0))
             for k, (p, s, f, harm, ds_info, sl_d) in enumerate(layers[i]):
-                pos_pen_i = 0.04 * abs(f - bfi) if f > 0 else 0.0
+                pos_pen_i = pos_w * abs(f - bfi) if f > 0 else 0.0
                 reg_pen = (
                     0.85 * max(0.0, low_floor - p)
-                    + 0.14 * max(0.0, p - 79.0)
-                    + 0.055 * abs(p - rc_i)
+                    + 0.16 * max(0.0, p - 77.0)
+                    + 0.065 * abs(p - rc_i)
                 )
                 emit_base = (
                     1.2 * harm
-                    + 0.05 * max(0.0, f - 10.0)
+                    + 0.06 * max(0.0, f - 9.0)
                     + pos_pen_i
                     + _BASS_INTERVAL_COST[(p - bass_pi) % 12]
                     + reg_pen
@@ -1049,7 +1046,7 @@ def _adapt_cell_viterbi(
                 best_j = 0
                 for j, (p_prev, s_prev, f_prev, _, ds_prev, sl_prev) in enumerate(layers[i - 1]):
                     if sl_d > 0:
-                        if sl_prev > 0:
+                        if sl_prev > 0 or p <= p_prev:
                             continue
                         if gap_prev < 0.5 - 1e-6 and (s == s_prev or (ds_prev is not None and s == ds_prev[0])):
                             continue
@@ -1057,7 +1054,7 @@ def _adapt_cell_viterbi(
                     step_cost = 0.95 * abs((deg_cur - deg_prev) - st_deg)
                     repeat_pen = (2.35 if st_deg != 0 else 1.15) if p == p_prev else 0.0
                     fret_jump = abs(f - f_prev) if (f > 0 and f_prev > 0) else 0
-                    shift_mult = 0.42 if sl_d > 0 else 1.0
+                    shift_mult = 0.45 if sl_d > 0 else 1.0
                     trans = (
                         0.24 * abs(p - p_prev)
                         + 0.55 * max(0, abs(s - s_prev) - 1)
@@ -1065,10 +1062,10 @@ def _adapt_cell_viterbi(
                         + repeat_pen
                     )
                     if ds_info is not None and ds_prev is not None:
-                        trans += 1.35 + (0.35 if ds_info[3] != ds_prev[3] else 0.0)
+                        trans += 1.65 + (0.35 if ds_info[3] != ds_prev[3] else 0.0)
                     if sl_d > 0:
-                        leap_i = abs(p - p_prev)
-                        trans += 0.52 - (0.82 if leap_i >= 5 else (0.45 if duri >= 1.0 - 1e-6 else 0.0)) - (0.18 if role == 2 else 0.0)
+                        leap_i = p - p_prev
+                        trans += 0.24 - (0.44 if (1 <= leap_i <= 5 and duri >= 1.0 - 1e-6) else 0.0) - (0.12 if role == 2 else 0.0)
                     c_tot = dp[i - 1][j] + step_cost + trans + emit_base
                     if c_tot < best_c:
                         best_c = c_tot
@@ -1089,23 +1086,23 @@ def _adapt_cell_viterbi(
         return path
 
     if allow_double_stops and n_n >= 2:
-        # Bisect mu in [0.08, 1.35] so ~25%-45% of bar solo notes bloom into 3rd/6th Double-Stops (1-2 per bar)
-        mu_lo, mu_hi = 0.08, 1.35
-        chosen = _run_viterbi(0.55)
-        for _ in range(4):
+        # Bisect mu in [0.15, 1.85] so at most 1 sustained note per bar blooms into a warm 3rd/6th Double-Stop
+        mu_lo, mu_hi = 0.15, 1.85
+        chosen = _run_viterbi(0.75)
+        max_ds_bar = 1 if n_n <= 4 else 2
+        for _ in range(5):
             mu_mid = 0.5 * (mu_lo + mu_hi)
             cand_path = _run_viterbi(mu_mid)
             ds_cnt = sum(1 for st in cand_path if st[4] is not None)
-            ratio = ds_cnt / float(n_n)
             chosen = cand_path
-            if 0.24 <= ratio <= 0.45 or (n_n <= 3 and ds_cnt == 1):
+            if 1 <= ds_cnt <= max_ds_bar:
                 break
-            if ratio > 0.45:
+            if ds_cnt > max_ds_bar:
                 mu_lo = mu_mid
             else:
                 mu_hi = mu_mid
     else:
-        chosen = _run_viterbi(0.65)
+        chosen = _run_viterbi(0.85)
 
     # Enforce at most 1 slide-in per bar (keep the strongest/longest one if backpointer picked >1 non-adjacent slides)
     slide_indices = [i for i, st in enumerate(chosen) if st[5] > 0]
@@ -1254,7 +1251,7 @@ def _solo_role_specs(
             elif specs:
                 specs[-1] = (specs[-1][0], specs[-1][1], ans_step if is_final_handoff or specs[-1][2] == 0 else specs[-1][2])
 
-        max_notes = (5 if measure >= 3.5 else 4) if role in (0, 2) else (4 if measure >= 3.5 else 3)
+        max_notes = (4 if measure >= 3.5 else 3) if role in (0, 2) else (3 if measure >= 3.5 else 2)
         while len(specs) > max_notes and len(specs) >= 2:
             idx_short = min(range(len(specs) - 1), key=lambda idx: specs[idx][1] + specs[idx + 1][1])
             o_a, d_a, st_a = specs[idx_short]
@@ -1262,9 +1259,9 @@ def _solo_role_specs(
             specs[idx_short : idx_short + 2] = [(o_a, d_a + d_b, max(-4, min(4, st_a + st_b)))]
 
         min_notes = (
-            (4 if role in (0, 2) else 3)
+            (3 if role in (0, 2) else 2)
             if eff_span >= 2.4
-            else (3 if eff_span >= 1.95 else (2 if eff_span >= 1.25 else 1))
+            else (2 if eff_span >= 1.45 else 1)
         )
         step_pool = (nz_tail + nz_head) if role == 3 else (nz_head + nz_tail)
         while len(specs) < min_notes:
@@ -1409,10 +1406,46 @@ def _build_motif_chord_melody(
 
     def _pickup_specs_for_measure(hi_b: float) -> list[tuple[float, float, int]]:
         if measure >= 3.5 and hi_b >= measure - 0.25:
-            return [(measure - 2.0, 1.0, 0), (measure - 1.0, 0.5, pk_step1), (measure - 0.5, 0.5, pk_step2)]
+            return [(measure - 2.0, 1.0, 0), (measure - 1.0, 1.0, pk_step1)]
         if measure >= 2.5 and hi_b >= measure - 0.25:
-            return [(measure - 1.5, 1.0, 0), (measure - 0.5, 0.5, pk_step1)]
-        return [(max(0.5, hi_b - 1.0), 0.5, 0)]
+            return [(measure - 1.5, 1.5, 0)]
+        return [(max(0.5, hi_b - 1.0), min(1.0, max(0.5, hi_b - max(0.5, hi_b - 1.0))), 0)]
+
+    def _intro_bell_specs(
+        j_idx: int,
+        n_wb_tot: int,
+        w_lo: float,
+        w_hi: float,
+    ) -> list[tuple[float, float, int]]:
+        """Calm, spacious home-position chord-melody bell phrases (1-3 sustained notes/bar) for song Intros."""
+        if j_idx == 0 and w_lo <= 1e-6:
+            return _pickup_specs_for_measure(w_hi)
+        is_end = (j_idx == n_wb_tot - 1)
+        is_comp_m = str(meter).strip().endswith('/8') and int(round(measure * 2.0)) % 3 == 0
+        if abs(measure - 3.0) < 0.25:
+            if is_end:
+                raw = [(0.0, 1.5, 0), (1.5, 1.5, -1)]
+            elif is_comp_m:
+                raw = [(0.0, 1.5, 0), (1.5, 1.0, 1), (2.5, 0.5, -1)] if (j_idx % 2 == 1) else [(0.0, 1.5, 0), (1.5, 1.5, -1)]
+            else:
+                raw = [(0.0, 2.0, 0), (2.0, 1.0, 1)] if (j_idx % 2 == 1) else [(0.0, 1.0, 0), (1.0, 2.0, -1)]
+        elif measure >= 3.5:
+            if is_end:
+                raw = [(0.0, 2.0, 0), (2.0, 2.0, -1)]
+            elif j_idx % 2 == 1:
+                raw = [(0.0, 1.5, 0), (1.5, 0.5, 1), (2.0, 2.0, -1)]
+            else:
+                raw = [(0.0, 2.0, 0), (2.0, 1.0, 1), (3.0, 1.0, -1)]
+        else:
+            half_m = max(0.5, round(measure * 0.5 * 2.0) / 2.0)
+            raw = [(0.0, half_m, 0), (half_m, max(0.5, measure - half_m), -1 if is_end else 1)]
+        out = []
+        for o_i, d_i, s_i in raw:
+            o_eff = max(w_lo, o_i)
+            if o_eff >= w_hi - 0.49:
+                continue
+            out.append((o_eff, min(d_i, w_hi - o_eff), s_i))
+        return out or [(w_lo, max(0.5, w_hi - w_lo), 0)]
 
     if not sorted_notes:
         # Purely instrumental project with no vocal notes: weave lyrical solo across all bars except final roll
@@ -1514,7 +1547,9 @@ def _build_motif_chord_melody(
                 adapted = _adapt_cell_viterbi(
                     bars[b], specs, capo, tonic_pc, diatonic, depths, measure,
                     v0_scale=v0, allowed_strings=(1, 2, 3), prev_pitch_hint=prev_p, register_center=rc,
-                    allow_double_stops=(b > 0 and n_wb >= 2), allow_slides=(b > 0), role=role,
+                    allow_double_stops=(b > 0 and n_wb >= 2),
+                    allow_slides=(b > 0 and ((n_wb >= 3 and role == 2) or (n_wb == 2 and j == 1))),
+                    role=role,
                 )
                 if adapted:
                     motif_cm_map[b] = adapted
@@ -1522,8 +1557,14 @@ def _build_motif_chord_melody(
             continue
 
         # Build valid solo windows (b, w_lo, w_hi) across [b_first..b_last]
+        # For multi-bar Intros where vocals enter mid-bar inside b_last, leave b_last as pure chordal accompaniment
+        intro_bar_end = (
+            b_last - 1
+            if (kind == 'intro' and b_last > b_first and g_e < (b_last + 1) * measure - 0.25)
+            else b_last
+        )
         win_bars = []
-        for b in range(b_first, b_last + 1):
+        for b in range(b_first, intro_bar_end + 1):
             if b in explicit_set or (count >= 2 and b == count - 1):
                 continue
             w_lo = 0.0 if g_s <= b * measure + 1e-6 else math.ceil((g_s - b * measure + 0.35) * 2.0 - 1e-6) / 2.0
@@ -1548,14 +1589,14 @@ def _build_motif_chord_melody(
         if kind == 'intro':
             if win_bars[0][0] == 0 and win_bars[0][1] <= 1e-6:
                 roll_slot0_bars.add(0)
-            # Strict 1-bar intro contract: Beat-0 rolled chord + concise pickup lead into Bar 1
+            # Strict 1-bar intro contract: Beat-0 rolled chord + concise home-position pickup lead into Bar 1
             if len(win_bars) == 1 and win_bars[0][0] == 0:
                 b0, _w0, w_hi0 = win_bars[0]
                 specs = _pickup_specs_for_measure(w_hi0)
                 notes_b0 = _adapt_cell_viterbi(
                     bars[b0], specs, capo, tonic_pc, diatonic, depths, measure,
-                    v0_scale=0.94, allowed_strings=(1, 2, 3), target_pitch=approach_target, register_center=69.5,
-                    allow_double_stops=False, allow_slides=False, role=0,
+                    v0_scale=0.90, allowed_strings=(1, 2, 3), target_pitch=approach_target, register_center=67.5,
+                    allow_double_stops=False, allow_slides=False, role=0, prefer_home_position=True,
                 )
                 if notes_b0:
                     motif_cm_map[b0] = notes_b0
@@ -1566,25 +1607,20 @@ def _build_motif_chord_melody(
             for j, (b, w_lo, w_hi) in enumerate(win_bars):
                 is_last = (j == n_wb - 1)
                 arch_pos = j / max(1, n_wb - 1)
-                v0 = 0.92 + 0.10 * math.sin(math.pi * arch_pos)
-                rc = 68.5 + 4.5 * math.sin(math.pi * arch_pos)
-                if j == 0 and w_lo <= 1e-6:
-                    role = 0
-                    specs = _pickup_specs_for_measure(w_hi)
-                else:
-                    role = 3 if is_last else ((j - 1) % 3)
-                    ch_m, ct_m = _select_bar_motifs(max(0, j - 1), role, is_last)
-                    specs = _solo_role_specs(role, measure, meter, ch_m, ct_m, w_lo, w_hi, is_last)
-                    specs = _apply_tasteful_anticipation(specs, role, measure, meter, w_lo, is_last, enable_syncopation=(len(sorted_notes) >= 12))
+                v0 = 0.88 + 0.06 * math.sin(math.pi * arch_pos)
+                rc = 66.5 + 2.0 * math.sin(math.pi * arch_pos)
+                role = 0 if j == 0 else (3 if is_last else (2 if j == n_wb // 2 else 1))
+                specs = _intro_bell_specs(j, n_wb, w_lo, w_hi)
                 adapted = _adapt_cell_viterbi(
                     bars[b], specs, capo, tonic_pc, diatonic, depths, measure,
                     v0_scale=v0, allowed_strings=(1, 2, 3),
                     target_pitch=(approach_target if is_last else None),
                     prev_pitch_hint=prev_p,
                     register_center=rc,
-                    allow_double_stops=(b > 0 and j > 0),
-                    allow_slides=(b > 0 or j > 0),
+                    allow_double_stops=(b > 0 and n_wb >= 2 and j in (n_wb // 2, n_wb - 1)),
+                    allow_slides=(b > 0 and n_wb >= 3 and j == 1),
                     role=role,
+                    prefer_home_position=True,
                 )
                 if adapted:
                     motif_cm_map[b] = adapted
@@ -1598,13 +1634,13 @@ def _build_motif_chord_melody(
                 is_last = (j == n_wb - 1)
                 if n_wb == 1:
                     role = 1
-                    rc = 70.5
-                    v0 = 0.98
+                    rc = 69.5
+                    v0 = 0.95
                 else:
                     role = 3 if is_last else (j % 4)
                     arch_pos = j / max(1, n_wb - 1)
-                    rc = 69.5 + 5.5 * math.sin(math.pi * arch_pos)
-                    v0 = 0.98 + 0.10 * math.sin(math.pi * arch_pos)
+                    rc = 68.0 + 3.8 * math.sin(math.pi * arch_pos)
+                    v0 = 0.94 + 0.08 * math.sin(math.pi * arch_pos)
                 if is_last and n_wb >= 3 and w_lo <= 1e-6 and w_hi >= measure - 1e-6:
                     roll_slot0_bars.add(b)
                 ch_m, ct_m = _select_bar_motifs(j, role, is_last)
@@ -1621,7 +1657,7 @@ def _build_motif_chord_melody(
                     prev_pitch_hint=prev_p,
                     register_center=rc,
                     allow_double_stops=(b > 0 and n_wb >= 2),
-                    allow_slides=(b > 0 and (j % 2 == 0 or role == 2)),
+                    allow_slides=(b > 0 and ((n_wb >= 3 and role == 2) or (n_wb == 2 and j == 1))),
                     role=role,
                 )
                 if adapted:
@@ -1866,8 +1902,9 @@ def arrange_advanced(
         ov_notes = _overlapping_notes(project.notes, index * measure, (index + 1) * measure) if not silent else []
 
         # Place Chord-Melody (CM) lead first so accompaniment respects string/register reservations.
-        cm_reservations: list[tuple[int, float, float, int]] = []
+        cm_reservations: list[tuple[int, float, float, int, int]] = []
         cm_onset_slots: set[int] = set()
+        ds_onset_slots: set[int] = set()
         if cm:
             lead = list(instrumental_melody[index]) if explicit_cm else list(motif_cm_map.get(index, []))
             for note in lead:
@@ -1916,18 +1953,25 @@ def arrange_advanced(
                 ):
                     sl_from = int(raw_sl_from)
                 insert(bar, float(beat_cm), eff_dur_cm, item_cm, vel_cm, tech_cm, True, slide_from_fret=sl_from)
-                cm_reservations.append((item_cm[0], float(beat_cm), float(beat_cm) + eff_dur_cm, int(pitch_cm)))
-                cm_onset_slots.add(min(max(0, int(round(float(beat_cm) * 2))), last_slot))
+                cm_reservations.append((item_cm[0], float(beat_cm), float(beat_cm) + eff_dur_cm, int(pitch_cm), int(item_cm[1])))
+                sl_idx = min(max(0, int(round(float(beat_cm) * 2))), last_slot)
+                cm_onset_slots.add(sl_idx)
+                if tech_cm == 'DS':
+                    ds_onset_slots.add(sl_idx)
 
         def is_cm_reserved(s_num: int, b_pos: float) -> bool:
-            return any(rs == s_num and rb0 - 1e-6 <= b_pos < rb1 - 1e-6 for rs, rb0, rb1, _rp in cm_reservations)
+            return any(rs == s_num and rb0 - 1e-6 <= b_pos < rb1 - 1e-6 for rs, rb0, rb1, _rp, _rf in cm_reservations)
+
+        def active_cm_at(b_pos: float) -> list[tuple[int, float, float, int, int]]:
+            return [item_r for item_r in cm_reservations if item_r[1] - 1e-6 <= b_pos < item_r[2] - 1e-6]
 
         def cm_ceiling_at(b_pos: float) -> int:
-            active_p = [rp for _rs, rb0, rb1, rp in cm_reservations if rb0 - 1e-6 <= b_pos < rb1 - 1e-6]
-            if active_p:
-                return min(active_p)
-            if cm_reservations:
-                return min(rp for _rs, _rb0, _rb1, rp in cm_reservations)
+            act_r = active_cm_at(b_pos)
+            if act_r:
+                return min(it[3] for it in act_r)
+            near_r = [it[3] for it in cm_reservations if it[1] - 0.26 <= b_pos < it[2] + 0.26]
+            if near_r:
+                return min(near_r)
             return 999
 
         # Plan entries are executed in order after the bar's treble DAG is solved:
@@ -1942,8 +1986,12 @@ def arrange_advanced(
             and vocal_counts.get(0, 0) == 0
             and (len(bars) == 1 or vocal_counts.get(1, 0) > 0 or 1 in explicit_cm_bars)
         )
-        max_cm_inner = 0 if is_1bar_intro else max(2, groove['n_slots'] - 2)
+        is_comp_bar = str(project.meter).strip().endswith('/8') and int(round(measure * 2.0)) % 3 == 0
+        first_cm_beat = min((it[1] for it in cm_reservations), default=0.0)
+        max_cm_inner = 0 if is_1bar_intro else (1 if is_comp_bar else 2)
         cm_inner_used = 0
+        last_cm_inner_beat = -99.0
+        last_cm_inner_pitch = None
 
         def request_treble(beat, candidates, bass_pitch, velocity, kind, direction=None):
             t_str = _default_target_string(beat, measure, style=style, kind=kind)
@@ -1998,25 +2046,60 @@ def arrange_advanced(
                 continue
 
             if cm:
+                # Let Beat-0 rolled chord ring undisturbed until the first pickup note enters
+                if index in roll_slot0_bars and beat < first_cm_beat - 1e-6:
+                    continue
+                if beat < first_cm_beat - 1e-6:
+                    if (slot == 0 or is_segment_boundary) and bass is not None:
+                        bass_pitch = bass[2]
+                        vel_b0 = max(1, min(127, round((76 if slot == 0 else 68) * phrase_vel_scale)))
+                        plan.append(('note', beat, max(step_dur, 1.0), bass, vel_b0, '', '↓', None))
+                    elif arpeggio_treble:
+                        vel_pre = max(48, min(64, round(slot_vels[slot] * 0.72 * phrase_vel_scale)))
+                        request_treble(beat, arpeggio_treble, bass_pitch, vel_pre, 'single', slot_dir)
+                    continue
+
                 ceil_p = cm_ceiling_at(beat)
-                is_cm_bass_slot = (not is_1bar_intro) and ((slot == 0) or is_segment_boundary or (slot == groove['bass_pivot']))
+                is_cm_bass_slot = (not is_1bar_intro) and (
+                    (slot == 0)
+                    or is_segment_boundary
+                    or (not is_comp_bar and slot == groove['bass_pivot'] and slot not in ds_onset_slots)
+                )
                 if is_cm_bass_slot and bass is not None and not is_cm_reserved(bass[0], beat) and bass[2] < ceil_p:
                     bass_pitch = bass[2]
                     technique = 'PM' if palm_mute and any(abs(beat - b) < 1e-9 for b in (0, measure / 2)) else ''
-                    bass_vel = 74 if slot == 0 else 68
+                    bass_vel = 74 if slot == 0 else 66
                     vel_b = max(1, min(127, round(bass_vel * phrase_vel_scale)))
-                    plan.append(('note', beat, max(step_dur, 1.0), bass, vel_b, technique, '↓', None))
-                if slot not in cm_onset_slots and cm_inner_used < max_cm_inner:
+                    bass_dur = max(step_dur, 1.5 if is_comp_bar else 1.0)
+                    plan.append(('note', beat, bass_dur, bass, vel_b, technique, '↓', None))
+
+                act_cm = active_cm_at(beat)
+                can_fill_hold = (
+                    bool(act_cm)
+                    and max(it[2] - it[1] for it in act_cm) >= 1.25 - 1e-6
+                    and beat >= min(it[1] for it in act_cm) + 0.5 - 1e-6
+                    and (beat - last_cm_inner_beat) >= 1.0 - 1e-6
+                )
+                if slot not in cm_onset_slots and cm_inner_used < max_cm_inner and can_fill_hold:
                     avail_inner = [
                         c for c in mid_treble
                         if not is_cm_reserved(c[0], beat)
-                        and c[2] < ceil_p
-                        and (bass_pitch is None or c[2] > bass_pitch)
+                        and c[2] <= ceil_p - 3
+                        and (bass_pitch is None or c[2] >= bass_pitch + 3)
+                        and all(_is_playable_solo_hand(bass, (it[0], it[4]), (c[0], c[1]), capo) for it in act_cm)
                     ]
+                    if len(avail_inner) == 1 and avail_inner[0][2] == last_cm_inner_pitch:
+                        avail_inner = []
+                    elif len(avail_inner) >= 2 and last_cm_inner_pitch is not None:
+                        filtered = [c for c in avail_inner if c[2] != last_cm_inner_pitch]
+                        if filtered:
+                            avail_inner = filtered
                     if avail_inner:
-                        vel_in = max(46, min(62, round(slot_vels[slot] * 0.64 * phrase_vel_scale)))
+                        vel_in = max(46, min(58, round(slot_vels[slot] * 0.60 * phrase_vel_scale)))
                         request_treble(beat, avail_inner, bass_pitch, vel_in, 'single', slot_dir)
                         cm_inner_used += 1
+                        last_cm_inner_beat = beat
+                        last_cm_inner_pitch = avail_inner[0][2] if len(avail_inner) == 1 else None
                 continue
 
             is_bass_slot = (slot == 0) or is_segment_boundary or is_pm_beat or (

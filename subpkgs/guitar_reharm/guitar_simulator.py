@@ -537,11 +537,11 @@ def _select_shiny_layer_and_gain(velocity: float, technique: str) -> tuple[int, 
     if technique == "PM":
         return 1, float(0.84 * (0.30 + 0.70 * vn))
     if technique in {"CM", "SL"}:
-        vl = 4 if v >= 104.0 else (3 if v >= 78.0 else 2)
-        return vl, float(1.08 + 0.26 * vn)
+        vl = 4 if v >= 108.0 else (3 if v >= 92.0 else 2)
+        return vl, float(0.98 + 0.24 * vn)
     if technique == "DS":
-        vl = 3 if v >= 86.0 else 2
-        return vl, float(0.94 + 0.22 * vn)
+        vl = 3 if v >= 96.0 else 2
+        return vl, float(0.86 + 0.20 * vn)
     vl = 1 + int(v > 46.0) + int(v > 76.0) + int(v > 104.0)
     db_offset = 20.0 * math.log10(0.32 + 0.68 * vn) + 1.2
     return vl, float(10.0 ** (np.clip(db_offset, -8.0, 3.2) / 20.0))
@@ -728,59 +728,75 @@ def _get_blended_studio_base(pitch: int, string: int, layer: int, sr: int, is_pm
 
 
 def _slide_head(base: np.ndarray, skip: int, delta_semi: int, tau_sec: float, sr: int) -> tuple[np.ndarray, int]:
-    """Formant-preserving, phase-continuous fret-slide head returning `(warped_head, int_offset_D)`."""
-    n_hold = max(2, round(0.014 * sr))
-    n_glide = max(8, round(tau_sec * sr))
-    n_xf = max(8, round(0.024 * sr))
+    """Discrete fretted grace-step slide head returning `(slide_head_wave, int_offset_D)`.
 
-    # Compute glide phase deviation first (zero outside n_hold + n_glide) so n_settle > |d_int| is exact for all delta_semi
-    n_active = n_hold + n_glide
-    n_act_arr = np.arange(n_active, dtype=np.float64)
-    u_act = np.clip((n_act_arr - n_hold) / float(n_glide), 0.0, 1.0)
-    g_act = float(delta_semi) * (1.0 - u_act * u_act * (3.0 - 2.0 * u_act))
-    semi_act = g_act - 0.70 * np.sin(2.0 * math.pi * g_act) / (2.0 * math.pi)
-    dev_act = np.exp2(semi_act / 12.0) - 1.0
-    d_tot = float(dev_act.sum())
-    d_int = int(round(d_tot))
-    if abs(d_tot) > 1e-9:
-        dev_act *= d_int / d_tot
+    Models a real fretted steel-string guitar grace slide without continuous microtonal rubber-band pitch bending:
+    1) Plucks the discrete origin fret (`pitch + delta_semi`, stepping cleanly through intermediate discrete frets
+       if `|delta_semi| >= 3`) with static wood-body formants preserved;
+    2) Crosses the fret wire with brief fingertip flesh damping into the legato body of `base` (past the initial
+       nail/pick transient so the string is never double-picked), connecting sample-exact into `base[cont_start:]`.
+    """
+    n_grace = max(12, round(float(np.clip(0.62 * tau_sec, 0.028, 0.048)) * sr))
+    n_xf = max(8, round(0.012 * sr))
+    n_post = max(8, round(0.016 * sr))
+    n_grace_tot = n_grace + n_xf
 
-    n_settle = max(round(0.030 * sr), abs(d_int) + 16)
-    n_head = n_active + n_settle + n_xf
-    n = np.arange(n_head, dtype=np.float64)
-    g = np.zeros(n_head, dtype=np.float64)
-    g[:n_active] = g_act
-    dev = np.zeros(n_head, dtype=np.float64)
-    dev[:n_active] = dev_act
-    phi = np.maximum(0.0, n + np.concatenate(([0.0], np.cumsum(dev)[:-1])))
+    # Build discrete fret-quantized playback-rate steps (zero continuous microtonal pitch sweep)
+    rates = np.empty(n_grace_tot, dtype=np.float64)
+    if abs(delta_semi) >= 3:
+        mid_semi = int(round(0.5 * float(delta_semi)))
+        n_first = n_grace // 2
+        rates[:n_first] = 2.0 ** (float(delta_semi) / 12.0)
+        rates[n_first:] = 2.0 ** (float(mid_semi) / 12.0)
+    else:
+        rates[:] = 2.0 ** (float(delta_semi) / 12.0)
 
-    need = n_head + max(d_int, 0) + 8
-    raw_slice = base[skip : min(len(base), skip + need)]
-    src = np.asarray(raw_slice, dtype=np.float64)
-    if len(src) < need:
-        src = np.pad(src, (0, need - len(src)))
+    phi_grace = np.concatenate(([0.0], np.cumsum(rates)[:-1]))
+    need_grace = int(math.ceil(float(phi_grace[-1]))) + 8
+    raw_grace = np.asarray(base[skip : min(len(base), skip + need_grace)], dtype=np.float64)
+    if len(raw_grace) < need_grace:
+        raw_grace = np.pad(raw_grace, (0, need_grace - len(raw_grace)))
 
-    # Whiten static wood-body formants -> warp string excitation -> restore static wood-body formants
-    exc = sosfilt(_body_sos(sr, -1), src)
-    idx = np.minimum(phi.astype(np.int64), len(exc) - 2)
-    frac = phi - idx
-    warped_exc = (1.0 - frac) * exc[idx] + frac * exc[idx + 1]
+    # Whiten static wood-body formants -> discrete fret-pitch resample -> restore static wood-body formants
+    exc_g = sosfilt(_body_sos(sr, -1), raw_grace)
+    idx_g = np.minimum(phi_grace.astype(np.int64), len(exc_g) - 2)
+    frac_g = phi_grace - idx_g
+    grace_exc = (1.0 - frac_g) * exc_g[idx_g] + frac_g * exc_g[idx_g + 1]
 
-    fret_gate = np.sin(math.pi * g) ** 4
-    warped_exc *= 1.0 - (0.20 if abs(delta_semi) >= 2 else 0.08) * fret_gate
-    if abs(delta_semi) >= 2:
-        sos_buzz = _cached_butter_sos(2, 1500.0, "highpass", sr)
-        if sos_buzz is not None:
-            warped_exc += 0.045 * fret_gate * sosfilt(sos_buzz, np.abs(warped_exc))
+    # Soft grace-note dynamics + brief fingertip damping dip right across the fret wire
+    grace_env = np.full(n_grace_tot, 0.58, dtype=np.float64)
+    n_dip = min(n_grace_tot, max(4, round(0.008 * sr)))
+    dip_pos = max(0, n_grace - n_dip // 2)
+    dip_end = min(n_grace_tot, dip_pos + n_dip)
+    if dip_end > dip_pos:
+        u_dip = np.linspace(0.0, math.pi, dip_end - dip_pos)
+        grace_env[dip_pos:dip_end] *= 1.0 - 0.24 * (np.sin(u_dip) ** 2)
+    grace_exc *= grace_env
 
-    y = sosfilt(_body_sos(sr, +1), warped_exc)
+    if abs(delta_semi) >= 2 and dip_end > dip_pos:
+        sos_squeak = _cached_butter_sos(2, 1800.0, "highpass", sr)
+        if sos_squeak is not None:
+            sq = sosfilt(sos_squeak, np.abs(grace_exc))
+            sq_gate = np.zeros(n_grace_tot, dtype=np.float64)
+            sq_gate[dip_pos:dip_end] = np.sin(np.linspace(0.0, math.pi, dip_end - dip_pos)) ** 2
+            grace_exc += 0.016 * sq_gate * sq
+
+    grace_wave = sosfilt(_body_sos(sr, +1), grace_exc)
+
+    # Legato arrival on target fret skips initial pick click (~16ms) so arrival blooms without double-pluck
+    target_skip = min(max(skip + 1, round(0.016 * sr)), max(1, len(base) // 3))
+    need_target = n_xf + n_post
+    target_seg = np.asarray(base[target_skip : min(len(base), target_skip + need_target)], dtype=np.float64)
+    if len(target_seg) < need_target:
+        target_seg = np.pad(target_seg, (0, need_target - len(target_seg)))
+
     w = 0.5 - 0.5 * np.cos(math.pi * np.arange(1, n_xf + 1, dtype=np.float64) / (n_xf + 1))
-    splice_start = max(0, n_head - n_xf + d_int)
-    ref_tail = src[splice_start : splice_start + n_xf]
-    if len(ref_tail) < n_xf:
-        ref_tail = np.pad(ref_tail, (0, n_xf - len(ref_tail)))
-    y[-n_xf:] = (1.0 - w) * y[-n_xf:] + w * ref_tail
-    return y, d_int
+    xf_seg = (1.0 - w) * grace_wave[n_grace : n_grace + n_xf] + w * target_seg[:n_xf]
+    y = np.concatenate([grace_wave[:n_grace], xf_seg, target_seg[n_xf : n_xf + n_post]])
+
+    # Exact sample-continuity offset so `skip + len(y) + d_int == target_skip + need_target`
+    d_int = (target_skip + need_target) - (skip + len(y))
+    return y, int(d_int)
 
 
 def _fetch_studio_guitar_note(
@@ -817,14 +833,14 @@ def _fetch_studio_guitar_note(
     amp_human = float(10.0 ** (rng.uniform(-0.35, 0.35) / 20.0))
 
     is_solo_voice = technique in {"CM", "DS", "SL"}
-    use_cm_vib = technique in {"CM", "SL"} and string <= 3 and duration_samples >= round(0.36 * sr)
+    use_cm_vib = technique in {"CM", "SL"} and string <= 3 and duration_samples >= round(0.85 * sr)
     vib_pad = round(0.002 * sr) if use_cm_vib else 0
     need_samples = duration_samples + vib_pad
     skip = min(len(base) // 4, round(0.011 * sr)) if technique in {"H", "P"} else 0
 
-    do_slide = (slide_delta != 0) and (duration_samples >= round(0.085 * sr)) and (technique not in {"X", "PM"})
+    do_slide = (slide_delta != 0) and (duration_samples >= round(0.11 * sr)) and (technique not in {"X", "PM"})
     if do_slide:
-        tau_eff = float(np.clip(slide_tau, 0.042, min(0.092, 0.38 * (duration_samples / float(sr)))))
+        tau_eff = float(np.clip(slide_tau, 0.044, min(0.076, 0.34 * (duration_samples / float(sr)))))
         head, d_int = _slide_head(base, skip, int(slide_delta), tau_eff, sr)
         if len(head) >= need_samples:
             seg = head[:need_samples].copy()
@@ -842,25 +858,25 @@ def _fetch_studio_guitar_note(
         else:
             seg = np.pad(np.asarray(base[skip:], dtype=np.float64), (0, need_samples - avail))
 
-    atk_s = 0.014 if technique in {"H", "P"} else (0.0022 if is_solo_voice else 0.0008)
+    atk_s = 0.014 if technique in {"H", "P"} else (0.0025 if is_solo_voice else 0.0008)
     attack = min(duration_samples, max(1, round(sr * atk_s)))
     if attack > 1:
         seg[:attack] *= np.sin(np.linspace(0.0, math.pi / 2.0, attack)) ** 2
 
     if is_solo_voice and string <= 3 and len(seg) >= 32:
-        sos_cm = _peaking_eq_sos(min(0.42 * sr, 1550.0), 1.4 if technique != "DS" else 0.9, 0.9, sr)
-        if pitch >= 69 and sr > 18000:
-            sos_lp_cm = _cached_butter_sos(1, 8600.0, "lowpass", sr)
+        sos_cm = _peaking_eq_sos(min(0.42 * sr, 980.0), 0.55 if technique != "DS" else 0.35, 0.85, sr)
+        if pitch >= 68 and sr > 18000:
+            sos_lp_cm = _cached_butter_sos(1, 7800.0, "lowpass", sr)
             if sos_lp_cm is not None:
                 sos_cm = np.vstack([sos_cm, sos_lp_cm])
         seg = sosfilt(sos_cm, seg)
         if use_cm_vib:
-            vib_start = 0.16 if do_slide else 0.12
+            vib_start = 0.30 if do_slide else 0.26
             t_v = np.arange(duration_samples, dtype=np.float64) / float(sr)
-            f_vib = 5.0 + 0.35 * (((seed % 7) / 6.0) - 0.5)
-            ramp = np.clip((t_v - vib_start) / 0.18, 0.0, 1.0)
+            f_vib = 4.8 + 0.30 * (((seed % 7) / 6.0) - 0.5)
+            ramp = np.clip((t_v - vib_start) / 0.24, 0.0, 1.0)
             ramp = ramp * ramp * (3.0 - 2.0 * ramp)
-            d_semi = 0.11 * ramp * np.sin(2.0 * math.pi * f_vib * np.maximum(0.0, t_v - vib_start))
+            d_semi = 0.045 * ramp * np.sin(2.0 * math.pi * f_vib * np.maximum(0.0, t_v - vib_start))
             tau = np.cumsum((2.0 ** (d_semi / 12.0)) - 1.0)
             r_pos = np.clip(np.arange(duration_samples, dtype=np.float64) + tau, 0.0, float(len(seg) - 1))
             r_idx = np.floor(r_pos).astype(np.int64)
