@@ -1631,6 +1631,166 @@ class ForensicRegressionTests(unittest.TestCase):
         self.assertFalse(r_pro_off["split_bar"])
         self.assertFalse(r_pro_off["use_detected_splits"])
 
+    def test_visual_score_engraving_and_60fps_follow_along_contracts(self):
+        import re
+        import xml.etree.ElementTree as ET
+        from fastapi.testclient import TestClient
+        from subpkgs.score_web import server as srv
+        from subpkgs.score_web.yoopu_svg_renderer import render_publication_score_html
+
+        svg_ns = "{http://www.w3.org/2000/svg}"
+
+        # 1. Deterministic engraving verification: rolled chord + slide lane clearance, 16th dual beam vs 8th-triplet
+        #    single beam, dotted-8th + 16th fractional stub, CM/DS lead ink, H/P slur, and intra/cross-bar Jianpu ties.
+        notes_eng = [
+            Note(pitch=60, start=0.0, duration=2.0),
+            Note(pitch=64, start=2.0, duration=3.0),  # spans beat 2..4 of Bar 0 and ties across barline into Bar 1 beat 0..1
+            Note(pitch=67, start=5.0, duration=3.0),
+        ]
+        proj_eng = Project(title="精雕六线与简谱测试", tonic="C", meter="4/4", bpm=96.0, notes=notes_eng)
+        arr_eng = {
+            "title": "精雕六线与简谱测试",
+            "tonic": "C",
+            "meter": "4/4",
+            "bpm": 96.0,
+            "style": "指弹律动",
+            "capo": 2,
+            "bar_count": 2,
+            "measure_beats": 4.0,
+            "chords": ["C", "G"],
+            "bars": [
+                {
+                    "bar": 0,
+                    "chord": "C",
+                    "roman": "I",
+                    "frets": [-1, 3, 2, 0, 1, 0],
+                    "split_segments": [{"beat": 0.0, "duration": 4.0, "chord": "C", "roman": "I", "frets": [-1, 3, 2, 0, 1, 0]}],
+                },
+                {
+                    "bar": 1,
+                    "chord": "G",
+                    "roman": "V",
+                    "frets": [3, 2, 0, 0, 0, 3],
+                    "split_segments": [{"beat": 0.0, "duration": 4.0, "chord": "G", "roman": "V", "frets": [3, 2, 0, 0, 0, 3]}],
+                },
+            ],
+            "events": [
+                # Beat 0.0: rolled chord stack with slide_from_fret on string 2 (lane shifts to x - 22)
+                {"bar": 0, "start": 0.0, "duration": 1.0, "string": 5, "fret": 3, "pitch": 48, "velocity": 86, "technique": "", "roll_step_sec": 0.022},
+                {"bar": 0, "start": 0.0, "duration": 1.0, "string": 3, "fret": 0, "pitch": 55, "velocity": 82, "technique": "", "roll_step_sec": 0.022},
+                {"bar": 0, "start": 0.0, "duration": 1.0, "string": 2, "fret": 3, "pitch": 62, "velocity": 88, "technique": "", "slide_from_fret": 1, "roll_step_sec": 0.022},
+                # Beat 1.0..1.75: four 16th notes -> 2 beam lines (primary + secondary)
+                {"bar": 0, "start": 1.00, "duration": 0.25, "string": 1, "fret": 0, "pitch": 64, "velocity": 80, "technique": ""},
+                {"bar": 0, "start": 1.25, "duration": 0.25, "string": 2, "fret": 1, "pitch": 60, "velocity": 78, "technique": ""},
+                {"bar": 0, "start": 1.50, "duration": 0.25, "string": 3, "fret": 0, "pitch": 55, "velocity": 76, "technique": ""},
+                {"bar": 0, "start": 1.75, "duration": 0.25, "string": 2, "fret": 1, "pitch": 60, "velocity": 78, "technique": ""},
+                # Beat 2.0..2.667: three 8th triplets (16 ticks each) -> single beam only
+                {"bar": 0, "start": 2.0, "duration": 1.0 / 3.0, "string": 3, "fret": 0, "pitch": 55, "velocity": 78, "technique": ""},
+                {"bar": 0, "start": 2.0 + 1.0 / 3.0, "duration": 1.0 / 3.0, "string": 2, "fret": 1, "pitch": 60, "velocity": 80, "technique": ""},
+                {"bar": 0, "start": 2.0 + 2.0 / 3.0, "duration": 1.0 / 3.0, "string": 1, "fret": 0, "pitch": 64, "velocity": 82, "technique": ""},
+                # Beat 3.0 (dotted 8th = 0.75) + Beat 3.75 (16th = 0.25) -> duration dot + fractional secondary stub
+                {"bar": 0, "start": 3.00, "duration": 0.75, "string": 4, "fret": 2, "pitch": 52, "velocity": 82, "technique": ""},
+                {"bar": 0, "start": 3.75, "duration": 0.25, "string": 3, "fret": 0, "pitch": 55, "velocity": 78, "technique": ""},
+                # Bar 1: CM + DS lead dyad at beat 4.0, followed by H legato on string 1 at beat 5.0
+                {"bar": 1, "start": 4.0, "duration": 1.0, "string": 1, "fret": 3, "pitch": 67, "velocity": 94, "technique": "CM"},
+                {"bar": 1, "start": 4.0, "duration": 1.0, "string": 2, "fret": 0, "pitch": 59, "velocity": 86, "technique": "DS"},
+                {"bar": 1, "start": 5.0, "duration": 1.0, "string": 1, "fret": 5, "pitch": 69, "velocity": 88, "technique": "H"},
+            ],
+        }
+        html_eng = render_publication_score_html(proj_eng, arr_eng, ["春", "风", "吹"], [{"bar": 0, "section": "Intro"}, {"bar": 1, "section": "Verse"}])
+        self.assertIn("@media print", html_eng)
+        self.assertIn(".score-playhead, .score-bar-highlight, .score-hover-guide { display: none !important; }", html_eng)
+
+        svgs_eng = re.findall(r"<svg\b[^>]*>.*?</svg>", html_eng, flags=re.S)
+        self.assertEqual(len(svgs_eng), 1)
+        root_eng = ET.fromstring(svgs_eng[0])
+        self.assertEqual(root_eng.attrib.get("data-bar-start"), "0")
+        self.assertEqual(root_eng.attrib.get("data-bar-end"), "2")
+        self.assertEqual(root_eng.attrib.get("data-measure-ticks"), "192")
+
+        bars_eng = [el for el in root_eng.findall(f"{svg_ns}g") if "score-bar" in el.attrib.get("class", "")]
+        self.assertEqual(len(bars_eng), 2)
+
+        # Verify Bar 0 engraving details & exact linear time<->x bijection
+        b0 = bars_eng[0]
+        x_left0 = float(b0.attrib["data-x-left"])
+        x_pad0 = float(b0.attrib["data-x-pad"])
+        w0 = float(b0.attrib["data-bar-width"])
+        hit0 = list(b0)[0]
+        self.assertIn("score-bar-hit", hit0.attrib.get("class", ""))
+        self.assertAlmostEqual(float(hit0.attrib["x"]), x_left0, places=4)
+        self.assertAlmostEqual(float(hit0.attrib["width"]), w0, places=4)
+
+        roll_arrows = [el for el in b0.iter(f"{svg_ns}path") if "tab-roll-arrow" in el.attrib.get("class", "")]
+        self.assertEqual(len(roll_arrows), 1)
+        # Beat 0 x is x_left0 + x_pad0; with slide present on beat 0, roll arrow starts at x0 - 22
+        m_roll_x = re.match(r"M([0-9.+-]+),", roll_arrows[0].attrib["d"])
+        self.assertIsNotNone(m_roll_x)
+        self.assertAlmostEqual(float(m_roll_x.group(1)), (x_left0 + x_pad0) - 22.0, places=2)
+
+        # Check tab-note bijection & slide data-tech fallback
+        tab_notes_b0 = [el for el in b0.findall(f"{svg_ns}g") if "tab-note" in el.attrib.get("class", "")]
+        self.assertEqual(len(tab_notes_b0), 12)
+        slide_tabs = [el for el in tab_notes_b0 if el.attrib.get("data-string") == "2" and el.attrib.get("data-ev-start") == "0"]
+        self.assertEqual(len(slide_tabs), 1)
+        self.assertEqual(slide_tabs[0].attrib.get("data-tech"), "SL")
+        for tn in tab_notes_b0:
+            ev_s = float(tn.attrib["data-ev-start"])
+            rect_el = tn.find(f"{svg_ns}rect")
+            expected_x = x_left0 + x_pad0 + (ev_s / 4.0) * (w0 - 2.0 * x_pad0)
+            self.assertAlmostEqual(float(rect_el.attrib["x"]) + 9.0, expected_x, places=2)
+
+        # Check beams in Bar 0:
+        # Beat 1 (four 16ths) -> 2 beams; Beat 2 (three 8th triplets) -> 1 beam ONLY; Beat 3 (dotted 8th + 16th) -> 2 beams + 1 dot
+        beams_b0 = [el for el in b0.iter(f"{svg_ns}line") if "tab-beam" in el.attrib.get("class", "")]
+        self.assertEqual(len(beams_b0), 5)  # 2 (beat 1) + 1 (beat 2 triplet) + 2 (beat 3 dotted+16th) = 5!
+        dots_b0 = [el for el in b0.iter(f"{svg_ns}circle") if "tab-dot" in el.attrib.get("class", "")]
+        self.assertEqual(len(dots_b0), 1)
+
+        # Check Bar 1 lead styling, H slur, and cross-barline incoming jp-tie
+        b1 = bars_eng[1]
+        lead_tabs_b1 = [el for el in b1.findall(f"{svg_ns}g") if "is-lead" in el.attrib.get("class", "")]
+        self.assertEqual(len(lead_tabs_b1), 2)
+        slurs_b1 = [el for el in b1.iter(f"{svg_ns}path") if "tab-slur" in el.attrib.get("class", "")]
+        self.assertEqual(len(slurs_b1), 1)
+        ties_b1 = [el for el in b1.iter(f"{svg_ns}path") if "jp-tie" in el.attrib.get("class", "")]
+        self.assertGreaterEqual(len(ties_b1), 1)
+
+        # 2. Parse every SVG system across live repertoire songs (4/4, 6/8, 3/4) to guarantee 100% XML validity
+        client_v = TestClient(srv.create_app())
+        for demo_id in ("mandarin_pop", "canon_in_d", "scarborough_fair", "regular_friends"):
+            r_d = client_v.post("/api/load_demo", json={"demo": demo_id})
+            self.assertEqual(r_d.status_code, 200)
+            pub_html = r_d.json()["publication_html"]
+            svg_blocks = re.findall(r"<svg\b[^>]*>.*?</svg>", pub_html, flags=re.S)
+            self.assertGreater(len(svg_blocks), 0, f"No SVG systems in {demo_id}")
+            for sb in svg_blocks:
+                parsed = ET.fromstring(sb)
+                self.assertIsNotNone(parsed.find(f".//*[@class='score-playhead']"))
+                self.assertIsNotNone(parsed.find(f".//*[@class='score-bar-highlight']"))
+
+        # 3. Verify static/index.html DOM hooks, 60fps sync functions, and concert-pitch playbackRate invariance
+        index_html = (ROOT_DIR / "static" / "index.html").read_text(encoding="utf-8")
+        for required_id in (
+            "btn-follow-toggle",
+            "btn-loop-a",
+            "btn-loop-b",
+            "btn-loop-clear",
+            "loop-readout",
+            "neck-tech",
+            "guitar-neck-viz",
+            "score-iframe",
+            "seek-bar",
+            "btn-play-toggle",
+            "slider-vol-vocal",
+            "slider-vol-guitar",
+        ):
+            self.assertIn(f'id="{required_id}"', index_html)
+        for fn_name in ("beatToSec", "secToBeat", "buildScoreCache", "syncVisuals", "updateNeck", "scoreHit", "effectiveDuration"):
+            self.assertIn(f"function {fn_name}(", index_html)
+        # Never mutate AudioBufferSourceNode.playbackRate (must stay strictly at concert pitch 1.0)
+        self.assertNotIn(".playbackRate", index_html)
+
 
 if __name__ == "__main__":
     unittest.main()

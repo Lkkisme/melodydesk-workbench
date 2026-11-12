@@ -234,8 +234,31 @@
     #neck-bar { font-family: var(--serif); font-size: 12px; color: var(--ink-2); }
     #neck-chord { font-family: var(--serif); font-size: 18px; font-weight: 700; color: var(--accent-deep); line-height: 1.2; }
     #guitar-neck-viz { flex: 1; min-width: 0; height: 68px; display: block; }
-    .paper { width: 100%; max-width: 1080px; flex: 1; min-height: calc(100vh - 195px); background: #FFFDF9; border-radius: 8px; border: 1px solid var(--hair); box-shadow: var(--purfling), 0 24px 48px -12px rgba(74,48,28,0.16); overflow: hidden; }
-    #score-iframe { width: 100%; height: 100%; min-height: calc(100vh - 195px); border: 0; display: block; background: #FFFDF9; }
+    .paper { width: 100%; max-width: 1080px; flex: 1; min-height: 0; display: flex; flex-direction: column; background: #FFFDF9; border-radius: 8px; border: 1px solid var(--hair); box-shadow: var(--purfling), 0 24px 48px -12px rgba(74,48,28,0.16); overflow: hidden; }
+    #score-iframe { flex: 1; width: 100%; height: 100%; min-height: 0; border: 0; display: block; background: #FFFDF9; }
+
+    /* Single-viewport salon: only the score iframe scrolls */
+    .score-area { height: calc(100vh - 58px); overflow: hidden; padding: 10px 16px 14px 10px; }
+    .doc-bar { position: relative; top: auto; flex-shrink: 0; }
+    .luthier-tools { display: flex; align-items: center; gap: 4px; padding-left: 8px; border-left: 1px solid var(--hair); }
+    .lt-btn { font-family: var(--mono); font-size: 11px; line-height: 1; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--hair); background: transparent; color: var(--ink-2); cursor: pointer; white-space: nowrap; }
+    .lt-btn:hover { background: var(--well); color: var(--ink); }
+    .lt-btn.active { background: var(--accent-soft); color: var(--accent-deep); border-color: var(--accent); font-weight: 700; }
+    #loop-readout { font-family: var(--mono); font-size: 11px; padding: 3px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-deep); border: 1px solid var(--accent); white-space: nowrap; }
+    .kbd-hint { font-size: 10px; color: var(--ink-3); white-space: nowrap; padding-left: 4px; }
+    .neck-info { width: 118px; }
+    #neck-chord .seg { font-size: 12px; font-weight: 600; color: var(--ink-3); }
+    #neck-chord .seg.on { font-size: 18px; font-weight: 700; color: var(--accent-deep); }
+    #neck-tech { display: inline-block; margin-top: 2px; font-family: var(--mono); font-size: 9.5px; padding: 1px 6px; border-radius: 999px; background: var(--well); color: var(--ink-2); white-space: nowrap; transition: background 0.15s, color 0.15s; }
+    #neck-tech.live { background: var(--accent-soft); color: var(--accent-deep); font-weight: 700; }
+    #guitar-neck-viz .str { fill: none; }
+    #guitar-neck-viz .str.on { stroke: #FFC766; filter: drop-shadow(0 0 2.5px rgba(245,176,72,0.95)); }
+    @media (max-width: 1240px) { .kbd-hint { display: none; } }
+    @media (max-width: 980px) {
+      .layout { grid-template-columns: 1fr; height: auto; }
+      .score-area { height: auto; overflow: visible; }
+      #score-iframe { min-height: 75vh; }
+    }
   </style>
 </head>
 <body>
@@ -482,11 +505,20 @@
           <span id="zoom-label" class="mono">100%</span>
           <button type="button" class="btn ghost sq" id="zoom-in" aria-label="放大"><svg class="i" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
         </div>
+        <div class="luthier-tools" role="group" aria-label="跟谱与 A–B 循环练习">
+          <button type="button" class="lt-btn active" id="btn-follow-toggle" aria-pressed="true" title="播放时乐谱自动滚动跟随">自动跟谱</button>
+          <button type="button" class="lt-btn" id="btn-loop-a" title="将当前小节设为循环起点（快捷键 [ ，或 Shift+点击乐谱）">[A</button>
+          <button type="button" class="lt-btn" id="btn-loop-b" title="将当前小节设为循环终点（快捷键 ] ）">B]</button>
+          <span id="loop-readout" hidden></span>
+          <button type="button" class="lt-btn" id="btn-loop-clear" title="清除循环（快捷键 \ ）" aria-label="清除循环" hidden>×</button>
+          <span class="kbd-hint">Space 播放 · ←/→ 小节 · [ ] 循环</span>
+        </div>
         <div class="neck-row">
           <div class="neck-info">
             <div class="lbl">Left Hand</div>
             <div id="neck-bar">第 — 小节</div>
             <div id="neck-chord">—</div>
+            <div id="neck-tech">开放把位</div>
           </div>
           <svg id="guitar-neck-viz" viewBox="0 0 560 96" preserveAspectRatio="xMidYMid meet" role="img" aria-label="六弦指板和弦按法"></svg>
         </div>
@@ -538,86 +570,241 @@
       return el;
     }
 
-    // frets[i] is string 6-i (index 0 = low E); negative = muted, 0 = open
-    function renderNeck(frets) {
-      const { x0, fretW, frets: nF, y0, gap } = NECK;
-      const x1 = x0 + nF * fretW, yTop = y0, yBot = y0 + 5 * gap;
-      const pressed = (frets || []).filter(f => f > 0);
-      const base = pressed.length && Math.max(...pressed) > nF ? Math.min(...pressed) : 1;
-      neckSvg.replaceChildren();
-      neckSvg.appendChild(svgEl('rect', { x: x0, y: yTop - 7, width: x1 - x0, height: yBot - yTop + 14, rx: 3, fill: '#2A1C14' }));
-      neckSvg.appendChild(svgEl('rect', { x: x0, y: yTop - 7, width: x1 - x0, height: 2, fill: 'rgba(245,199,126,0.35)' }));
-      [3, 5, 7, 9, 15, 17].forEach(n => {
-        const i = n - base;
-        if (i >= 0 && i < nF) neckSvg.appendChild(svgEl('circle', { cx: x0 + (i + 0.5) * fretW, cy: (yTop + yBot) / 2, r: 4.5, fill: '#E9E2D4', opacity: 0.85 }));
-      });
-      if (12 - base >= 0 && 12 - base < nF) {
-        const cx = x0 + (12 - base + 0.5) * fretW;
-        neckSvg.appendChild(svgEl('circle', { cx, cy: yTop + gap * 1.5, r: 4, fill: '#E9E2D4', opacity: 0.85 }));
-        neckSvg.appendChild(svgEl('circle', { cx, cy: yBot - gap * 1.5, r: 4, fill: '#E9E2D4', opacity: 0.85 }));
-      }
-      neckSvg.appendChild(svgEl('rect', { x: x0 - 4, y: yTop - 7, width: 5, height: yBot - yTop + 14, fill: base === 1 ? '#F3EAD8' : '#C9A26A' }));
-      for (let i = 1; i <= nF; i++) {
-        neckSvg.appendChild(svgEl('rect', { x: x0 + i * fretW - 1.2, y: yTop - 7, width: 2.4, height: yBot - yTop + 14, fill: '#C9A26A' }));
-        neckSvg.appendChild(svgEl('text', { x: x0 + (i - 0.5) * fretW, y: yBot + 20, 'text-anchor': 'middle', 'font-size': 9.5, fill: '#8A7360', 'font-family': 'ui-monospace, Menlo, monospace' }, String(base + i - 1)));
-      }
-      STRING_NAMES.forEach((name, s) => {
-        const y = yTop + s * gap;
-        neckSvg.appendChild(svgEl('line', { x1: x0, y1: y, x2: x1, y2: y, stroke: s < 2 ? '#E5E1D8' : '#D6B27A', 'stroke-width': 0.8 + s * 0.32 }));
-        neckSvg.appendChild(svgEl('text', { x: 2, y: y + 3.5, 'font-size': 9.5, fill: '#5A4638', 'font-family': 'ui-monospace, Menlo, monospace' }, name));
-      });
-      (frets || []).forEach((f, i) => {
-        const y = yTop + (5 - i) * gap;
-        if (f < 0) neckSvg.appendChild(svgEl('text', { x: x0 - 16, y: y + 3.5, 'text-anchor': 'middle', 'font-size': 10, 'font-weight': 700, fill: '#B91C1C' }, '×'));
-        else if (f === 0) neckSvg.appendChild(svgEl('circle', { cx: x0 - 16, cy: y, r: 3.6, fill: 'none', stroke: '#B45309', 'stroke-width': 1.4 }));
-        else {
-          const cx = x0 + (f - base + 0.5) * fretW;
-          neckSvg.appendChild(svgEl('circle', { cx, cy: y, r: 6.2, fill: '#B45309', stroke: '#FFF7EC', 'stroke-width': 1.2 }));
-          neckSvg.appendChild(svgEl('text', { x: cx, y: y + 3, 'text-anchor': 'middle', 'font-size': 8, 'font-weight': 700, fill: '#FFF7EC', 'font-family': 'ui-monospace, Menlo, monospace' }, String(f)));
-        }
-      });
-    }
-
-    function showNeckBar(idx) {
-      const bars = (currentState && currentState.bar_analysis) || [];
-      neckShownBar = idx;
-      if (!bars.length) {
-        document.getElementById('neck-bar').textContent = '第 — 小节';
-        document.getElementById('neck-chord').textContent = '—';
-        renderNeck([]);
-        return;
-      }
-      const clamped = Math.max(0, Math.min(bars.length - 1, idx));
-      const bar = bars[clamped];
-      document.getElementById('neck-bar').textContent = `第 ${clamped + 1} / ${bars.length} 小节`;
-      document.getElementById('neck-chord').textContent = (bar.split_segments || []).map(s => s.chord).join(' | ') || bar.chord;
-      renderNeck(bar.frets || []);
-      renderChordPills((currentState && currentState.chords) || [], clamped);
-      document.querySelectorAll('#bar-strip .bar-pill').forEach((p, i) => p.classList.toggle('playing', engine.playing && i === clamped));
-    }
+    // ───────── Exact piecewise sec <-> beat bijection (playbackRate always stays 1.0) ─────────
+    let measureBeats = 4;
+    let stateEventsByBar = [], stateNotes = [];
+    let gridFor = null, grid = null;
 
     function beatsPerBar(meter) {
       const [num, den] = String(meter || '4/4').split('/').map(Number);
       return num && den ? num * 4 / den : 4;
     }
 
-    function playheadBar() {
-      const bars = (currentState && currentState.bar_analysis) || [];
-      if (!bars.length || !currentState.bpm) return 0;
-      const pos = position();
+    const isStrictInc = a => Array.isArray(a) && a.length >= 2 && a.every((v, i) => Number.isFinite(v) && (i === 0 || v > a[i - 1]));
+
+    // { t: ascending seconds, u: beats per grid step } — beat_times first, then bar starts, else null (constant bpm)
+    function timeGrid() {
+      if (gridFor === currentState) return grid;
+      gridFor = currentState;
+      const bt = currentState && currentState.beat_times;
       const bss = currentState && (currentState.bar_start_seconds || (currentState.arrangement && currentState.arrangement.bar_start_seconds));
-      if (Array.isArray(bss) && bss.length >= 2) {
-        let lo = 0, hi = Math.min(bars.length - 1, bss.length - 2);
-        while (lo <= hi) {
-          const mid = (lo + hi) >> 1;
-          if (pos < bss[mid]) hi = mid - 1;
-          else if (pos >= bss[mid + 1]) lo = mid + 1;
-          else return mid;
-        }
-        return Math.max(0, Math.min(bars.length - 1, lo));
+      if (isStrictInc(bt)) grid = { t: bt, u: 1 };
+      else if (isStrictInc(bss)) grid = { t: bss, u: measureBeats };
+      else grid = null;
+      return grid;
+    }
+
+    function beatToSec(beatPos) {
+      const g = timeGrid();
+      if (!g) return beatPos * 60 / ((currentState && currentState.bpm) || 120);
+      const t = g.t, n = t.length, k = beatPos / g.u;
+      const btAvgDur = (t[n - 1] - t[0]) / Math.max(1, n - 1) || 0.5;
+      if (k <= 0) return t[0] + k * btAvgDur;
+      if (k >= n - 1) return t[n - 1] + (k - (n - 1)) * btAvgDur;
+      const i = Math.floor(k);
+      return t[i] + (k - i) * (t[i + 1] - t[i]);
+    }
+
+    function secToBeat(sec) {
+      const g = timeGrid();
+      if (!g) return sec * ((currentState && currentState.bpm) || 120) / 60;
+      const t = g.t, n = t.length;
+      const btAvgDur = (t[n - 1] - t[0]) / Math.max(1, n - 1) || 0.5;
+      if (sec <= t[0]) return (sec - t[0]) / btAvgDur * g.u;
+      if (sec >= t[n - 1]) return (n - 1 + (sec - t[n - 1]) / btAvgDur) * g.u;
+      let lo = 0, hi = n - 2;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (t[mid] <= sec) lo = mid; else hi = mid - 1;
       }
-      const secPerBar = beatsPerBar(currentState.meter) * 60 / currentState.bpm;
-      return Math.max(0, Math.min(bars.length - 1, Math.floor(pos / secPerBar)));
+      return (lo + (sec - t[lo]) / Math.max(1e-9, t[lo + 1] - t[lo])) * g.u;
+    }
+
+    function playheadBar() {
+      const n = ((currentState && currentState.bar_analysis) || []).length;
+      return n ? Math.max(0, Math.min(n - 1, Math.floor(secToBeat(position()) / measureBeats + 1e-9))) : 0;
+    }
+
+    function techLabel(t) {
+      t = String(t || '').trim().toLowerCase();
+      if (!t || t === 'none' || t === 'null') return '';
+      if (/^x$|slap|perc|打板/.test(t)) return 'X 打板';
+      if (/pm|palm|mute|闷/.test(t)) return 'PM 闷音';
+      if (/sl|滑|\//.test(t)) return 'SL 滑音';
+      if (/^h|^p$|pull|hammer|击|勾/.test(t)) return 'H/P 击勾';
+      if (/ds|double|双/.test(t)) return 'DS 双音对位';
+      if (/cm|melody|lead|主/.test(t)) return 'CM 主奏旋律';
+      return t.toUpperCase();
+    }
+
+    // start/end in absolute quarter-note beats; cap let-ring sustain highlight to 0.75 beats so arpeggio plucks illuminate cleanly
+    function mkEvent(start, dur, string, fret, tech, el) {
+      return {
+        start, end: start + Math.max(0.16, Math.min(dur || 0, 0.75)), sec: beatToSec(start),
+        string: parseInt(string, 10) || 0, fret: parseInt(fret, 10) || 0, label: techLabel(tech), el: el || null
+      };
+    }
+
+    // Pre-index the state once per render so the 60fps loop never searches raw arrays
+    function indexState(s) {
+      measureBeats = (s.arrangement && Number(s.arrangement.measure_beats)) || beatsPerBar(s.meter);
+      gridFor = null;
+      neck.key = '';
+      stateNotes = (s.notes_table || [])
+        .map(n => ({ index: n.index, start: Number(n.start), end: Number(n.start) + Number(n.duration) }))
+        .filter(n => isFinite(n.start) && isFinite(n.end))
+        .sort((a, b) => a.start - b.start);
+      stateEventsByBar = [];
+      const evs = s.events || s.tab_events || (s.arrangement && s.arrangement.events) || [];
+      if (Array.isArray(evs)) evs.forEach(ev => {
+        const st = Number(ev.start);
+        if (!isFinite(st)) return;
+        const b = Math.max(0, Math.floor(st / measureBeats + 1e-9));
+        (stateEventsByBar[b] = stateEventsByBar[b] || []).push(mkEvent(st, Number(ev.duration), ev.string, ev.fret, ev.technique || ev.tech));
+      });
+      updateLoopUI();
+    }
+
+    // ───────── Live fretboard: persistent layers, only strings/rings animate per frame ─────────
+    const NECK_FONT = 'ui-monospace, Menlo, monospace';
+    const NECK_X1 = NECK.x0 + NECK.frets * NECK.fretW;
+    const neckBarEl = document.getElementById('neck-bar');
+    const neckChordEl = document.getElementById('neck-chord');
+    const neckTechEl = document.getElementById('neck-tech');
+    const neck = { key: '', bgKey: '', base: 1, techUntil: 0, techText: '', shown: '' };
+    const stringY = s => NECK.y0 + s * NECK.gap; // s: 0 = string 1 (high e, top)
+    const flatPath = s => `M${NECK.x0} ${stringY(s)} L${NECK_X1} ${stringY(s)}`;
+    const fretX = (f, base) => f <= 0 ? NECK.x0 - 16 : Math.max(NECK.x0 + 6, Math.min(NECK_X1 - 6, NECK.x0 + (f - base + 0.5) * NECK.fretW));
+    const vis = (el, on) => { if (el) el.style.display = on ? '' : 'none'; };
+
+    const neckDefs = svgEl('defs', {});
+    const neckGrad = svgEl('linearGradient', { id: 'neck-wood', x1: 0, y1: 0, x2: 0, y2: 1 });
+    [['0', '#4A2C1C'], ['0.45', '#2E1B12'], ['1', '#1A100B']].forEach(([o, c]) => neckGrad.appendChild(svgEl('stop', { offset: o, 'stop-color': c })));
+    neckDefs.appendChild(neckGrad);
+    const bgLayer = svgEl('g', {}), stringLayer = svgEl('g', {}), chordLayer = svgEl('g', {}), pluckLayer = svgEl('g', {});
+    neckSvg.append(neckDefs, bgLayer, stringLayer, chordLayer, pluckLayer);
+    const stringEls = STRING_NAMES.map((_, s) => stringLayer.appendChild(svgEl('path', { class: 'str', d: flatPath(s), stroke: s < 2 ? '#E5E1D8' : '#D6B27A', 'stroke-width': 0.8 + s * 0.32 })));
+    const ringEls = STRING_NAMES.map(() => pluckLayer.appendChild(svgEl('circle', { r: 4, fill: 'none', stroke: '#F5B048', 'stroke-width': 1.6, opacity: 0 })));
+    const stringLive = STRING_NAMES.map(() => false);
+    const hitDt = new Float32Array(6), hitEv = new Array(6);
+
+    function renderNeckBg(base, capo) {
+      const { x0, fretW, frets: nF, y0, gap } = NECK;
+      const yTop = y0, yBot = y0 + 5 * gap, h = yBot - yTop + 14;
+      const add = (tag, attrs, text) => bgLayer.appendChild(svgEl(tag, attrs, text));
+      bgLayer.replaceChildren();
+      add('rect', { x: x0, y: yTop - 7, width: NECK_X1 - x0, height: h, rx: 3, fill: 'url(#neck-wood)' });
+      add('rect', { x: x0, y: yTop - 7, width: NECK_X1 - x0, height: 2, fill: 'rgba(245,199,126,0.35)' });
+      [3, 5, 7, 9, 15, 17].forEach(n => {
+        const i = n - base;
+        if (i >= 0 && i < nF) add('circle', { cx: x0 + (i + 0.5) * fretW, cy: (yTop + yBot) / 2, r: 4.5, fill: '#E9E2D4', opacity: 0.85 });
+      });
+      if (12 - base >= 0 && 12 - base < nF) {
+        const cx = x0 + (12 - base + 0.5) * fretW;
+        add('circle', { cx, cy: yTop + gap * 1.5, r: 4, fill: '#E9E2D4', opacity: 0.85 });
+        add('circle', { cx, cy: yBot - gap * 1.5, r: 4, fill: '#E9E2D4', opacity: 0.85 });
+      }
+      add('rect', { x: x0 - 4, y: yTop - 7, width: 5, height: h, fill: base === 1 ? '#F3EAD8' : '#C9A26A' });
+      for (let i = 1; i <= nF; i++) {
+        add('rect', { x: x0 + i * fretW - 1.2, y: yTop - 7, width: 2.4, height: h, fill: '#C9A26A' });
+        add('text', { x: x0 + (i - 0.5) * fretW, y: yBot + 17, 'text-anchor': 'middle', 'font-size': 9.5, fill: '#8A7360', 'font-family': NECK_FONT }, String(base + i - 1));
+      }
+      STRING_NAMES.forEach((name, s) => add('text', { x: 2, y: stringY(s) + 3.5, 'font-size': 9.5, fill: '#5A4638', 'font-family': NECK_FONT }, name));
+      if (capo > 0) {
+        if (base === 1) add('rect', { x: x0 - 8, y: yTop - 10, width: 10, height: h + 6, rx: 4, fill: '#33302E', stroke: '#E0A04A', 'stroke-width': 1 });
+        add('text', { x: 2, y: yBot + 17, 'font-size': 8.5, 'font-weight': 700, fill: '#B45309', 'font-family': NECK_FONT }, 'Capo ' + capo);
+      }
+    }
+
+    // frets[i] is string 6-i (index 0 = low E); negative = muted, 0 = open
+    function renderNeckChord(frets, base) {
+      const x0 = NECK.x0;
+      chordLayer.replaceChildren();
+      (frets || []).forEach((f, i) => {
+        const y = stringY(5 - i);
+        if (f < 0) chordLayer.appendChild(svgEl('text', { x: x0 - 16, y: y + 3.5, 'text-anchor': 'middle', 'font-size': 10, 'font-weight': 700, fill: '#B91C1C' }, '×'));
+        else if (f === 0) chordLayer.appendChild(svgEl('circle', { cx: x0 - 16, cy: y, r: 3.6, fill: 'none', stroke: '#B45309', 'stroke-width': 1.4 }));
+        else if (f - base < NECK.frets) {
+          const cx = x0 + (f - base + 0.5) * NECK.fretW;
+          chordLayer.appendChild(svgEl('circle', { cx, cy: y, r: 6.2, fill: '#B45309', stroke: '#FFF7EC', 'stroke-width': 1.2 }));
+          chordLayer.appendChild(svgEl('text', { x: cx, y: y + 3, 'text-anchor': 'middle', 'font-size': 8, 'font-weight': 700, fill: '#FFF7EC', 'font-family': NECK_FONT }, String(f)));
+        }
+      });
+    }
+
+    function updateNeck(barIdx, localBeat, posSec, isPlaying) {
+      const bars = (currentState && currentState.bar_analysis) || [];
+      const bar = bars[barIdx], capo = Number(currentState && currentState.capo) || 0;
+      const segs = (bar && bar.split_segments) || [];
+      let segIdx = -1;
+      for (let i = 0; i < segs.length; i++) if (segs[i].beat <= localBeat + 1e-6) segIdx = i;
+      const seg = segIdx >= 0 ? segs[segIdx] : bar;
+      const frets = (seg && seg.frets) || (bar && bar.frets) || [];
+      const key = [barIdx, segIdx, capo, frets.join(','), bars.length, isPlaying, seg ? seg.chord : ''].join('|');
+      if (key !== neck.key) {
+        neck.key = key;
+        neckShownBar = barIdx;
+        const pressed = frets.filter(f => f > 0);
+        const base = pressed.length && Math.max(...pressed) > NECK.frets ? Math.min(...pressed) : 1;
+        if (neck.bgKey !== base + '|' + capo) { neck.bgKey = base + '|' + capo; neck.base = base; renderNeckBg(base, capo); }
+        renderNeckChord(frets, base);
+        neckBarEl.textContent = bar ? `第 ${barIdx + 1} / ${bars.length} 小节` : '第 — 小节';
+        if (bar && segs.length > 1) {
+          neckChordEl.replaceChildren();
+          segs.forEach((sg, i) => {
+            const sp = document.createElement('span');
+            sp.className = 'seg' + (i === segIdx ? ' on' : '');
+            sp.textContent = sg.chord;
+            neckChordEl.append(sp, i < segs.length - 1 ? ' ' : '');
+          });
+        } else neckChordEl.textContent = bar ? ((segs[0] && segs[0].chord) || bar.chord || '—') : '—';
+        if (bar) {
+          renderChordPills(currentState.chords || [], barIdx);
+          document.querySelectorAll('#bar-strip .bar-pill').forEach((p, i) => p.classList.toggle('playing', isPlaying && i === barIdx));
+        }
+      }
+
+      // String transverse waves + pluck ripples for events fired within the last 0.30 s
+      hitDt.fill(-1);
+      if (isPlaying) for (let b = Math.max(0, barIdx - 1); b <= barIdx; b++) {
+        const evs = stateEventsByBar[b];
+        if (!evs) continue;
+        for (let i = 0; i < evs.length; i++) {
+          const ev = evs[i], dt = posSec - ev.sec, s = ev.string - 1;
+          if (dt >= 0 && dt < 0.30 && s >= 0 && s < 6 && (hitDt[s] < 0 || dt < hitDt[s])) { hitDt[s] = dt; hitEv[s] = ev; }
+        }
+      }
+      let tech = '';
+      for (let s = 0; s < 6; s++) {
+        const dt = hitDt[s];
+        if (dt >= 0) {
+          const ev = hitEv[s], y = stringY(s), amp = Math.exp(-dt * 12) * Math.sin(dt * 95) * 2.6;
+          stringEls[s].setAttribute('d', `M${NECK.x0} ${y} Q${(NECK.x0 + NECK_X1) / 2} ${(y + 2 * amp).toFixed(2)} ${NECK_X1} ${y}`);
+          if (!stringLive[s]) { stringLive[s] = true; stringEls[s].classList.add('on'); }
+          const ring = ringEls[s];
+          ring.setAttribute('cx', fretX(ev.fret, neck.base));
+          ring.setAttribute('cy', y);
+          ring.setAttribute('r', (4 + dt * 40).toFixed(2));
+          ring.setAttribute('opacity', (1 - dt / 0.30).toFixed(3));
+          if (ev.label) tech = ev.label;
+        } else if (stringLive[s]) {
+          stringLive[s] = false;
+          stringEls[s].setAttribute('d', flatPath(s));
+          stringEls[s].classList.remove('on');
+          ringEls[s].setAttribute('opacity', 0);
+        }
+      }
+      const now = performance.now();
+      if (tech) { neck.techUntil = now + 900; neck.techText = tech; }
+      const live = isPlaying && now < neck.techUntil;
+      const text = live ? neck.techText : (capo > 0 ? `Capo ${capo} · 待命` : '开放把位');
+      if (text !== neck.shown) { neck.shown = text; neckTechEl.textContent = text; neckTechEl.classList.toggle('live', live); }
+    }
+
+    // Kept for existing call sites: always re-syncs fretboard + score to the transport position
+    function showNeckBar() {
+      neck.key = '';
+      syncVisuals(position(), engine.playing);
     }
 
     // ───────── Sample-accurate Web Audio 2-stem Vocal & Guitar engine ─────────
@@ -654,10 +841,16 @@
     }
     STEMS.forEach(k => sliders[k].addEventListener('input', () => { setScene(null); applyVolumes(); }));
 
+    function effectiveDuration() {
+      if (engine.duration > 0) return engine.duration;
+      const nBars = ((currentState && currentState.bar_analysis) || []).length;
+      return nBars ? Math.max(0.01, beatToSec(nBars * measureBeats)) : 0;
+    }
+
     function position() {
       if (engine.dragPos !== null) return engine.dragPos;
       const p = engine.playing ? engine.offset + (audioCtx.currentTime - engine.startedAt) : engine.offset;
-      return Math.max(0, Math.min(engine.duration, p));
+      return Math.max(0, Math.min(effectiveDuration(), p));
     }
 
     function stopSources() {
@@ -675,7 +868,7 @@
       await audioCtx.resume();
       stopSources();
       const offset = Math.max(0, Math.min(fromSec, engine.duration - 0.001));
-      const when = audioCtx.currentTime + 0.03; // one shared start instant for all three stems
+      const when = audioCtx.currentTime + 0.03; // one shared start instant for both stems
       STEMS.forEach(k => {
         const buf = engine.buffers[k];
         if (offset >= buf.duration) return;
@@ -695,53 +888,297 @@
     function pause() {
       engine.offset = position();
       engine.playing = false;
+      cancelAnimationFrame(engine.raf);
       stopSources();
       setPlayingUI(false);
       drawTimeline();
-      showNeckBar(neckShownBar);
+      syncVisuals(engine.offset, false);
     }
 
     function seek(sec) {
-      sec = Math.max(0, Math.min(engine.duration, sec));
-      if (engine.playing) play(sec);
-      else { engine.offset = sec; drawTimeline(); }
+      sec = Math.max(0, Math.min(effectiveDuration(), sec));
+      engine.offset = sec;
+      if (engine.playing) { engine.startedAt = audioCtx.currentTime; play(sec); } // position() is already correct while play() resumes
+      else { drawTimeline(); syncVisuals(sec, false); }
     }
 
     function tick() {
       cancelAnimationFrame(engine.raf);
+      const pos = position();
+      if (engine.playing && engine.dragPos === null && loopStartBar !== null && loopEndBar !== null) {
+        const end = Math.min(loopEndSec, engine.duration);
+        if (end - loopStartSec > 0.05 && pos >= end - 0.012) {
+          engine.offset = loopStartSec;
+          engine.startedAt = audioCtx.currentTime;
+          play(loopStartSec); // play() restarts the rAF loop
+          return;
+        }
+      }
       drawTimeline();
+      syncVisuals(pos, engine.playing);
       if (!engine.playing) return;
-      if (position() >= engine.duration) {
+      if (pos >= engine.duration) {
         engine.playing = false;
         engine.offset = 0;
         stopSources();
         setPlayingUI(false);
         drawTimeline();
-        showNeckBar(selectedBarIndex);
+        syncVisuals(0, false);
         return;
       }
-      const bar = playheadBar();
-      if (bar !== neckShownBar) showNeckBar(bar);
       engine.raf = requestAnimationFrame(tick);
     }
 
+    // ───────── A–B bar loop practice ─────────
+    let loopStartBar = null, loopEndBar = null, loopStartSec = 0, loopEndSec = 0;
+
+    function updateLoopUI() {
+      const n = ((currentState && currentState.bar_analysis) || []).length;
+      if (loopStartBar !== null && loopStartBar >= n) loopStartBar = loopEndBar = null;
+      if (loopEndBar !== null) loopEndBar = Math.min(loopEndBar, n - 1);
+      const hasA = loopStartBar !== null, on = hasA && loopEndBar !== null;
+      loopStartSec = hasA ? beatToSec(loopStartBar * measureBeats) : 0;
+      loopEndSec = on ? beatToSec((loopEndBar + 1) * measureBeats) : 0;
+      const readout = document.getElementById('loop-readout');
+      readout.hidden = !hasA;
+      readout.textContent = on ? `循环 ${loopStartBar + 1}–${loopEndBar + 1}节` : (hasA ? `A ${loopStartBar + 1}节 → 待设 B` : '');
+      document.getElementById('btn-loop-clear').hidden = !hasA;
+      document.getElementById('btn-loop-a').classList.toggle('active', hasA);
+      document.getElementById('btn-loop-b').classList.toggle('active', on);
+      drawTimeline();
+    }
+    function setLoopA(bar) {
+      loopStartBar = bar;
+      if (loopEndBar !== null && loopEndBar < bar) loopEndBar = null;
+      updateLoopUI();
+    }
+    function setLoopB(bar) {
+      const a = loopStartBar === null ? bar : loopStartBar;
+      loopStartBar = Math.min(a, bar);
+      loopEndBar = Math.max(a, bar);
+      updateLoopUI();
+    }
+    function clearLoop() { loopStartBar = loopEndBar = null; updateLoopUI(); }
+
+    // New song: stop, rewind and drop the loop
+    function resetTransport() {
+      if (engine.playing) pause();
+      engine.offset = 0;
+      clearLoop();
+      syncVisuals(0, false);
+    }
+
+    // Select a bar everywhere (inspector, fretboard, score) and move the transport there — never reloads audio
+    function selectBar(idx, localBeat, fromScore) {
+      const n = ((currentState && currentState.bar_analysis) || []).length;
+      if (!n) return;
+      selectedBarIndex = Math.max(0, Math.min(n - 1, idx));
+      if (!fromScore) forceScroll = true;
+      seek(beatToSec(selectedBarIndex * measureBeats + (localBeat || 0)));
+      renderBarInspector(currentState);
+    }
+
+    document.getElementById('btn-loop-a').addEventListener('click', () => setLoopA(playheadBar()));
+    document.getElementById('btn-loop-b').addEventListener('click', () => setLoopB(playheadBar()));
+    document.getElementById('btn-loop-clear').addEventListener('click', clearLoop);
+    document.getElementById('btn-follow-toggle').addEventListener('click', e => {
+      followScore = !followScore;
+      if (followScore) manualScrollUntil = 0;
+      e.currentTarget.classList.toggle('active', followScore);
+      e.currentTarget.setAttribute('aria-pressed', String(followScore));
+    });
+
+    // ───────── Score iframe: cached 60fps playhead, highlights, auto-scroll, click-to-seek ─────────
+    const scoreFrame = document.getElementById('score-iframe');
+    let scoreCache = null, followScore = true, manualScrollUntil = 0, nextScrollCheck = 0, forceScroll = false;
+    let activeTabs = [], activeMarks = [], activeNoteKey = '';
+
+    function buildScoreCache() {
+      scoreCache = null; activeTabs = []; activeMarks = []; activeNoteKey = '';
+      const doc = scoreFrame.contentDocument;
+      if (!doc || !doc.body) return;
+      const sc = { win: scoreFrame.contentWindow, systems: [], bars: [], noteElsByIndex: {}, lyricElsByIndex: {}, tabElsByBar: [], sys: null, bar: null, hover: null };
+      let tabCount = 0;
+      doc.querySelectorAll('svg.score-system').forEach(svg => {
+        const sys = {
+          svg, bars: [], start: Number(svg.dataset.barStart) || 0, end: Number(svg.dataset.barEnd) || 0,
+          hl: svg.querySelector('.score-bar-highlight'), ph: svg.querySelector('.score-playhead'), guide: svg.querySelector('.score-hover-guide')
+        };
+        svg.style.cursor = 'pointer';
+        svg.querySelectorAll('g.score-bar').forEach(g => {
+          const idx = parseInt(g.dataset.barIndex, 10);
+          if (!Number.isFinite(idx)) return;
+          const bar = { idx, sys, left: Number(g.dataset.xLeft) || 0, pad: Number(g.dataset.xPad) || 0, width: Number(g.dataset.barWidth) || 0 };
+          sys.bars.push(bar);
+          sc.bars[idx] = bar;
+          g.querySelectorAll('g.tab-note').forEach(el => {
+            const v = parseFloat(el.dataset.evStart), d = parseFloat(el.dataset.evDur) || 0;
+            if (!isFinite(v)) return;
+            (sc.tabElsByBar[idx] = sc.tabElsByBar[idx] || []).push(mkEvent(v, d, el.dataset.string, el.dataset.fret, el.dataset.tech, el));
+            tabCount++;
+          });
+        });
+        sc.systems.push(sys);
+      });
+      const indexMarks = (attr, prop, map) => doc.querySelectorAll('[' + attr + ']').forEach(el => {
+        const i = parseInt(el.dataset[prop], 10); // skips "None" / NaN
+        if (Number.isFinite(i)) (map[i] = map[i] || []).push(el);
+      });
+      indexMarks('data-note-index', 'noteIndex', sc.noteElsByIndex);
+      indexMarks('data-lyric-index', 'lyricIndex', sc.lyricElsByIndex);
+      if (tabCount) stateEventsByBar = sc.tabElsByBar; // the engraved TAB is the ground truth for string/fret/technique
+      scoreCache = sc;
+    }
+
+    function syncVisuals(posSec, isPlaying) {
+      const nBars = ((currentState && currentState.bar_analysis) || []).length;
+      const beatPos = secToBeat(posSec);
+      const barIdx = Math.max(0, Math.min(Math.max(0, nBars - 1), Math.floor(beatPos / measureBeats + 1e-9)));
+      const localBeat = Math.max(0, Math.min(measureBeats, beatPos - barIdx * measureBeats));
+      updateNeck(barIdx, localBeat, posSec, isPlaying);
+
+      const sc = scoreCache;
+      if (!sc) return;
+      const bar = sc.bars[barIdx] || null, sys = bar ? bar.sys : null;
+      if (sys !== sc.sys) {
+        if (sc.sys) { vis(sc.sys.ph, false); vis(sc.sys.hl, false); }
+        sc.sys = sys; sc.bar = null;
+        if (sys) { vis(sys.ph, true); vis(sys.hl, true); }
+      }
+      if (bar) {
+        if (bar !== sc.bar) {
+          sc.bar = bar;
+          if (sys.hl) { sys.hl.setAttribute('x', bar.left); sys.hl.setAttribute('width', bar.width); }
+        }
+        const svgX = bar.left + bar.pad + (localBeat / measureBeats) * (bar.width - 2 * bar.pad);
+        if (sys.ph) sys.ph.setAttribute('transform', 'translate(' + svgX.toFixed(2) + ',0)');
+      }
+
+      // TAB notes
+      const tabs = [];
+      for (let b = Math.max(0, barIdx - 1); b <= barIdx; b++) {
+        const list = sc.tabElsByBar[b];
+        if (list) for (let i = 0; i < list.length; i++) if (list[i].start <= beatPos && beatPos < list[i].end) tabs.push(list[i]);
+      }
+      activeTabs.forEach(t => { if (!tabs.includes(t)) t.el.classList.remove('tab-active'); });
+      tabs.forEach(t => { if (!activeTabs.includes(t)) t.el.classList.add('tab-active'); });
+      activeTabs = tabs;
+
+      // Jianpu notes + lyrics
+      let lo = 0, hi = stateNotes.length - 1, last = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (stateNotes[mid].start <= beatPos) { last = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+      let noteKey = '';
+      for (let i = last; i >= 0 && i > last - 4; i--) if (beatPos < stateNotes[i].end) noteKey += stateNotes[i].index + ',';
+      if (noteKey !== activeNoteKey) {
+        activeNoteKey = noteKey;
+        activeMarks.forEach(m => m[0].classList.remove(m[1]));
+        activeMarks = [];
+        noteKey.split(',').forEach(i => {
+          if (i === '') return;
+          (sc.noteElsByIndex[i] || []).forEach(el => { el.classList.add('jp-active'); activeMarks.push([el, 'jp-active']); });
+          (sc.lyricElsByIndex[i] || []).forEach(el => { el.classList.add('lyric-active'); activeMarks.push([el, 'lyric-active']); });
+        });
+      }
+
+      // Follow the active system (throttled so smooth scrolling never fights itself)
+      const now = Date.now();
+      if (sys && (forceScroll || (isPlaying && followScore && now > manualScrollUntil && now > nextScrollCheck))) {
+        forceScroll = false;
+        nextScrollCheck = now + 160;
+        const r = sys.svg.getBoundingClientRect(), H = sc.win.innerHeight;
+        if (H > 0 && (r.top < H * 0.14 || r.bottom > H * 0.80)) {
+          const dy = r.top - H * 0.22;
+          if (Math.abs(dy) > 8) { sc.win.scrollBy({ top: dy, behavior: 'smooth' }); nextScrollCheck = now + 700; }
+        }
+      }
+    }
+
+    // Zoom-invariant pointer -> (bar, beat): ratios of the live bounding box against the viewBox
+    function scoreHit(e) {
+      const sc = scoreCache, svg = sc && e.target && e.target.closest && e.target.closest('svg.score-system');
+      const sys = svg && sc.systems.find(s => s.svg === svg);
+      if (!sys || !sys.bars.length) return null;
+      const r = svg.getBoundingClientRect(), vb = svg.viewBox.baseVal;
+      const svgX = ((e.clientX - r.left) / Math.max(1, r.width)) * vb.width;
+      const svgY = ((e.clientY - r.top) / Math.max(1, r.height)) * vb.height;
+      const bar = sys.bars.find(b => svgX >= b.left && svgX < b.left + b.width)
+        || (svgX < sys.bars[0].left ? sys.bars[0] : sys.bars[sys.bars.length - 1]);
+      const frac = Math.max(0, Math.min(0.999, (svgX - bar.left - bar.pad) / Math.max(1, bar.width - 2 * bar.pad)));
+      return { sys, svgX, barIdx: bar.idx, localBeat: svgY < 105 ? 0 : frac * measureBeats };
+    }
+
+    function onGlobalKey(e) {
+      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+      const t = e.target, tag = (t && t.tagName) || '';
+      if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (t && t.isContentEditable) || (t && t.closest && t.closest('#seek-bar'))) return;
+      const bar = playheadBar();
+      if (e.key === ' ' || e.code === 'Space') {
+        if (tag === 'BUTTON' || tag === 'A' || tag === 'SUMMARY' || btnPlayToggle.disabled) return; // focused controls keep their native Space
+        btnPlayToggle.click();
+      } else if (e.key === 'ArrowLeft') selectBar(secToBeat(position()) - bar * measureBeats > 1 ? bar : bar - 1);
+      else if (e.key === 'ArrowRight') selectBar(bar + 1);
+      else if (e.key === '[') setLoopA(bar);
+      else if (e.key === ']') setLoopB(bar);
+      else if (e.key === '\\') clearLoop();
+      else return;
+      e.preventDefault();
+    }
+    document.addEventListener('keydown', onGlobalKey);
+
+    scoreFrame.addEventListener('load', () => {
+      applyZoom();
+      buildScoreCache();
+      const doc = scoreFrame.contentDocument;
+      if (doc && doc.documentElement) {
+        const hideGuide = () => { if (scoreCache && scoreCache.hover) { vis(scoreCache.hover.guide, false); scoreCache.hover = null; } };
+        doc.addEventListener('mousemove', e => {
+          const hit = scoreHit(e);
+          if (!hit || !hit.sys.guide) { hideGuide(); return; }
+          if (scoreCache.hover !== hit.sys) { hideGuide(); scoreCache.hover = hit.sys; vis(hit.sys.guide, true); }
+          hit.sys.guide.setAttribute('x1', hit.svgX.toFixed(1));
+          hit.sys.guide.setAttribute('x2', hit.svgX.toFixed(1));
+        });
+        doc.documentElement.addEventListener('mouseleave', hideGuide);
+        doc.addEventListener('click', e => {
+          const hit = scoreHit(e);
+          if (!hit) return;
+          if (e.shiftKey) {
+            if (loopStartBar === null || loopEndBar !== null) { loopEndBar = null; setLoopA(hit.barIdx); }
+            else setLoopB(hit.barIdx);
+            return;
+          }
+          selectBar(hit.barIdx, hit.localBeat, true);
+        });
+        const holdScroll = () => { manualScrollUntil = Date.now() + 4000; };
+        doc.addEventListener('wheel', holdScroll, { passive: true });
+        doc.addEventListener('touchmove', holdScroll, { passive: true });
+        doc.addEventListener('keydown', onGlobalKey); // shortcuts keep working after clicking into the score
+      }
+      forceScroll = true; // a re-rendered score reopens at the current bar, not the top
+      neck.key = '';
+      updateLoopUI();
+      syncVisuals(position(), engine.playing);
+    });
+
     function computePeaks(buffers, bins) {
-      const peaks = new Float32Array(bins);
+      const out = {};
       STEMS.forEach(k => {
-        const buf = buffers[k];
-        const data = buf.getChannelData(0);
+        const buf = buffers[k], data = buf.getChannelData(0), peaks = out[k] = new Float32Array(bins);
         const perBin = (engine.duration * buf.sampleRate) / bins;
+        let max = 0;
         for (let b = 0; b < bins; b++) {
           const s0 = Math.floor(b * perBin), s1 = Math.min(data.length, Math.floor((b + 1) * perBin));
           let m = 0;
           for (let i = s0; i < s1; i += 16) { const v = Math.abs(data[i]); if (v > m) m = v; }
-          peaks[b] = Math.max(peaks[b], m);
+          peaks[b] = m;
+          if (m > max) max = m;
         }
+        if (max > 0) for (let b = 0; b < bins; b++) peaks[b] /= max;
       });
-      let max = 0;
-      peaks.forEach(v => { if (v > max) max = v; });
-      if (max > 0) for (let b = 0; b < bins; b++) peaks[b] /= max;
-      return peaks;
+      return out;
     }
 
     function drawTimeline() {
@@ -758,16 +1195,44 @@
       const g = seekCanvas.getContext('2d');
       g.setTransform(dpr, 0, 0, dpr, 0, 0);
       g.clearRect(0, 0, w, h);
-      const ratio = engine.duration ? pos / engine.duration : 0;
-      const step = 3, barW = 2, mid = h / 2;
-      const count = Math.floor(w / step);
-      for (let i = 0; i < count; i++) {
-        const x = i * step;
-        const amp = engine.peaks ? engine.peaks[Math.min(engine.peaks.length - 1, Math.floor(i / count * engine.peaks.length))] : 0.04;
-        const bh = Math.max(1.5, amp * (h - 10));
-        g.fillStyle = (x + barW) / w <= ratio ? '#1E1612' : 'rgba(74,48,28,0.2)';
-        g.fillRect(x, mid - bh / 2, barW, bh);
+      const dur = engine.duration, ratio = dur ? pos / dur : 0;
+
+      // A–B loop band
+      if (dur && loopStartBar !== null) {
+        const on = loopEndBar !== null;
+        const xa = Math.min(w, loopStartSec / dur * w), xb = on ? Math.min(w, loopEndSec / dur * w) : xa;
+        if (on) { g.fillStyle = 'rgba(245,158,11,0.18)'; g.fillRect(xa, 0, xb - xa, h); }
+        g.fillStyle = '#D97706';
+        g.font = '700 9px ui-monospace, Menlo, monospace';
+        g.fillRect(xa, 0, 1.5, h);
+        g.fillText('A', xa + 3, 9);
+        if (on) { g.fillRect(xb - 1.5, 0, 1.5, h); g.fillText('B', xb - 9, 9); }
       }
+
+      // Mirrored dual envelope: vocal above the centre line, guitar below
+      const step = 3, barW = 2, mid = Math.round(h / 2), half = Math.max(2, mid - 5);
+      const count = Math.floor(w / step), pk = engine.peaks;
+      for (let i = 0; i < count; i++) {
+        const x = i * step, played = (x + barW) / w <= ratio;
+        const bin = pk ? Math.min(pk.vocal.length - 1, Math.floor(i / count * pk.vocal.length)) : 0;
+        const vh = Math.max(1, (pk ? pk.vocal[bin] : 0.04) * half), gh = Math.max(1, (pk ? pk.guitar[bin] : 0.04) * half);
+        g.fillStyle = played ? '#1E1612' : 'rgba(74,48,28,0.22)';
+        g.fillRect(x, mid - vh, barW, vh);
+        g.fillStyle = played ? '#B45309' : 'rgba(180,83,9,0.26)';
+        g.fillRect(x, mid + 1, barW, gh);
+      }
+
+      // Bar-start ticks along the bottom edge
+      const nBars = ((currentState && currentState.bar_analysis) || []).length;
+      if (dur && nBars) {
+        const every = Math.max(1, Math.ceil(nBars * 5 / w));
+        g.fillStyle = 'rgba(74,48,28,0.4)';
+        for (let b = 0; b < nBars; b += every) {
+          const x = beatToSec(b * measureBeats) / dur * w;
+          if (x >= 0 && x <= w) g.fillRect(Math.round(x), h - 3, 1, 3);
+        }
+      }
+
       const px = Math.round(ratio * w);
       g.fillStyle = '#B45309';
       g.fillRect(px - 1, 0, 2, h);
@@ -782,11 +1247,13 @@
       seekBar.setPointerCapture(e.pointerId);
       engine.dragPos = seekFromPointer(e);
       drawTimeline();
+      if (!engine.playing) syncVisuals(engine.dragPos, false);
     });
     seekBar.addEventListener('pointermove', e => {
       if (engine.dragPos === null) return;
       engine.dragPos = seekFromPointer(e);
       drawTimeline();
+      if (!engine.playing) syncVisuals(engine.dragPos, false);
     });
     seekBar.addEventListener('pointerup', e => {
       if (engine.dragPos === null) return;
@@ -794,7 +1261,7 @@
       engine.dragPos = null;
       seek(t);
     });
-    seekBar.addEventListener('pointercancel', () => { engine.dragPos = null; drawTimeline(); });
+    seekBar.addEventListener('pointercancel', () => { engine.dragPos = null; drawTimeline(); if (!engine.playing) syncVisuals(position(), false); });
     seekBar.addEventListener('keydown', e => {
       if (!engine.buffers) return;
       if (e.key === 'ArrowRight') { seek(position() + 2); e.preventDefault(); }
@@ -867,7 +1334,7 @@
       });
     });
 
-    // Export: offline-render the three stems at the current fader levels
+    // Export: offline-render both stems at the current fader levels
     function encodeWav(buffer) {
       const ch = buffer.numberOfChannels, len = buffer.length, sr = buffer.sampleRate;
       const out = new DataView(new ArrayBuffer(44 + len * ch * 2));
@@ -945,7 +1412,7 @@
         btn.className = 'bar-pill' + (idx === selectedBarIndex ? ' active' : '');
         const segChords = (b.split_segments || []).map(s => s.chord).join('→') || b.chord;
         btn.textContent = `${String(idx + 1).padStart(2, '0')} ${segChords}`;
-        btn.onclick = () => { selectedBarIndex = idx; renderBarInspector(currentState); };
+        btn.onclick = () => selectBar(idx);
         strip.appendChild(btn);
       });
 
@@ -1001,11 +1468,7 @@
         pill.style.cursor = 'pointer';
         pill.title = `点击跳转第 ${i + 1} 小节`;
         pill.textContent = chords[i];
-        pill.onclick = () => {
-          selectedBarIndex = i;
-          if (currentState) renderBarInspector(currentState);
-          showNeckBar(i);
-        };
+        pill.onclick = () => selectBar(i);
         box.appendChild(pill);
       }
     }
@@ -1052,6 +1515,7 @@
 
     function renderState(s, refreshAudio = true) {
       currentState = s;
+      indexState(s);
 
       document.getElementById('score-title-text').textContent = s.title || '艺术吉他曲谱';
       document.getElementById('pill-key').textContent = `1 = ${s.tonic}`;
@@ -1155,6 +1619,7 @@
       card.addEventListener('click', () => {
         activeDemo = card.dataset.demo;
         selectedBarIndex = 0;
+        resetTransport();
         selectTrack(activeDemo);
         document.getElementById('upload-panel').style.display = 'none';
         apiCall('load_demo', { demo: activeDemo }, true);
@@ -1197,6 +1662,7 @@
               document.getElementById('upload-panel').style.display = 'none';
               activeDemo = 'upload';
               selectedBarIndex = 0;
+              resetTransport();
               selectTrack(activeDemo);
               apiCall('state', undefined, true);
             } else if (sj.status === 'superseded') {
@@ -1306,11 +1772,10 @@
         iframe.contentDocument.body.style.zoom = (currentZoom / 100).toString();
       }
     }
-    document.getElementById('score-iframe').addEventListener('load', applyZoom);
     document.getElementById('zoom-in').addEventListener('click', () => { currentZoom = Math.min(150, currentZoom + 10); applyZoom(); });
     document.getElementById('zoom-out').addEventListener('click', () => { currentZoom = Math.max(70, currentZoom - 10); applyZoom(); });
 
-    renderNeck([]);
+    syncVisuals(0, false);
     applyVolumes();
     drawTimeline();
     apiCall('state', undefined, true);
