@@ -1762,16 +1762,26 @@ class ForensicRegressionTests(unittest.TestCase):
             r_d = client_v.post("/api/load_demo", json={"demo": demo_id})
             self.assertEqual(r_d.status_code, 200)
             pub_html = r_d.json()["publication_html"]
+            if demo_id == "mandarin_pop":
+                self.assertNotIn("90.909", pub_html)
+                self.assertIn("速度 91", pub_html)
             svg_blocks = re.findall(r"<svg\b[^>]*>.*?</svg>", pub_html, flags=re.S)
             self.assertGreater(len(svg_blocks), 0, f"No SVG systems in {demo_id}")
             for sb in svg_blocks:
                 parsed = ET.fromstring(sb)
                 self.assertIsNotNone(parsed.find(f".//*[@class='score-playhead']"))
                 self.assertIsNotNone(parsed.find(f".//*[@class='score-bar-highlight']"))
+                # Verify any Jianpu tuplet '3' stays strictly clear below TAB rhythm beams (y=216 -> top of 9.5px text > 217)
+                for txt_el in parsed.iter(f"{svg_ns}text"):
+                    if (txt_el.text or "").strip() == "3" and txt_el.attrib.get("font-style") == "italic":
+                        self.assertGreaterEqual(float(txt_el.attrib["y"]), 225.0)
 
         # 3. Verify static/index.html DOM hooks, 60fps sync functions, and concert-pitch playbackRate invariance
         index_html = (ROOT_DIR / "static" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<footer class="dock">', index_html)
         for required_id in (
+            "btn-zen-toggle",
+            "chord-range",
             "btn-follow-toggle",
             "btn-loop-a",
             "btn-loop-b",

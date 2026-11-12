@@ -321,7 +321,8 @@ def _render_jianpu_bar(project, spans, lyrics, x_at, lyric_y, baseline):
             for dot in range(part['dots']):
                 result.append(f'<circle cx="{x + 10 + dot * 4:g}" cy="{241 + shift:g}" r="1.5" fill="#1E1612"/>')
             if part['tuplet']:
-                result.append(_svg_text(x, 218 + shift, '3', 10, fill="#1E1612"))
+                tuplet_y = 223 + shift - max(0, octave) * 6
+                result.append(_svg_text(x, tuplet_y, '3', 9.5, fill="#5C4938", font_style="italic"))
             for offset in range(TICKS, part['ticks'], TICKS):
                 result.append(_svg_text(x_at(tick + offset), baseline, '—', 15, fill="#5C4938"))
             if pitch is not None and not continuation and lyrics:
@@ -339,30 +340,36 @@ DIAGRAM_Y_TOP = 42
 DIAGRAM_Y_BOTTOM = DIAGRAM_Y_TOP + 48
 TAB_Y_BASE = 122
 TAB_Y_BOTTOM = TAB_Y_BASE + 75
-STEM_BOTTOM = TAB_Y_BASE + 92
+STEM_BOTTOM = TAB_Y_BASE + 94
 
 
 SCORE_CSS = (
     'body{background:#FFFDF9;color:#1E1612;margin:0 auto;max-width:1040px;padding:14px 18px;'
     'font-family:"Noto Serif SC","Songti SC","Noto Sans SC","Microsoft YaHei",sans-serif;'
     'line-height:1.45}'
-    'h1{text-align:center;font-size:18px;font-weight:700;color:#1E1612;margin:0 0 6px}'
-    '.meta-bar{text-align:center;margin:0 0 6px;display:flex;flex-wrap:wrap;justify-content:center;gap:6px}'
-    '.pill{display:inline-block;padding:2px 10px;background:#F5EFE6;border:1px solid #D6C7B2;'
-    'border-radius:16px;font-size:11.5px;color:#5C4938;font-weight:600}'
-    '.legend{text-align:center;font-size:11px;color:#8C7A6B;margin:0 0 10px;'
-    'border-bottom:1px solid #E6DEC8;padding-bottom:8px}'
+    # Urtext title block: one serif hero title, a hairline-ruled metadata line, a whisper-quiet legend
+    'h1{text-align:center;font-family:"Noto Serif SC","Songti SC","Source Han Serif SC","STSong",Georgia,serif;'
+    'font-size:22px;font-weight:600;letter-spacing:.12em;text-indent:.12em;line-height:1.35;color:#1E1612;'
+    'margin:10px 0 12px}'
+    '.meta-bar{margin:0 0 10px;display:flex;flex-wrap:wrap;justify-content:center;row-gap:6px;'
+    'font-size:11.5px;letter-spacing:.08em;color:#5A4638;font-variant-numeric:tabular-nums}'
+    '.pill{display:inline-block;padding:0 13px;line-height:1.15;white-space:nowrap}'
+    '.pill+.pill{border-left:1px solid #CDBFA9}'
+    '.legend{text-align:center;font-size:10px;letter-spacing:.06em;color:#A08E7C;margin:0 0 12px;'
+    'border-bottom:1px solid #E6DEC8;padding-bottom:12px}'
     '.score-system{display:block;width:100%;max-width:1000px;margin:6px auto;overflow:visible}'
     # Interactive layer
     '.score-bar{cursor:pointer}'
     '.score-bar-hit{transition:fill .12s ease}'
     '.score-bar:hover .score-bar-hit{fill:rgba(180, 83, 9, 0.03)}'
-    '.score-bar-highlight{fill:rgba(217, 119, 6, 0.085);stroke:rgba(180, 83, 9, 0.28);stroke-width:1;'
+    '.score-bar-highlight{fill:rgba(203, 161, 82, 0.11);stroke:rgba(176, 134, 62, 0.2);stroke-width:0.6;'
     'pointer-events:none}'
     '.score-hover-guide{stroke:rgba(120, 90, 70, 0.35);stroke-width:1;stroke-dasharray:3,3;pointer-events:none}'
-    '.score-playhead{pointer-events:none}'
-    '.score-playhead-line{stroke:#C2410C;stroke-width:2.1;stroke-linecap:round}'
-    '.score-playhead-cap{fill:#C2410C;stroke:#FFFDF9;stroke-width:1}'
+    # Multiply blending keeps the black fret digits fully legible underneath the needle
+    '.score-playhead{pointer-events:none;mix-blend-mode:multiply}'
+    '.score-playhead-line{stroke:#C4472B;stroke-width:1.6;stroke-linecap:butt}'
+    '.score-playhead-cap{fill:#C4472B;stroke:none;transform-box:fill-box;transform-origin:center;'
+    'transform:scale(.62)}'
     '.jp-active{fill:#B45309 !important;font-weight:800}'
     '.lyric-active{fill:#9A3412 !important;font-weight:700}'
     '.tab-active rect{fill:#FEF3C7 !important}'
@@ -421,7 +428,8 @@ def render_publication_score_html(
                    for spans in timeline['bars'][first:end] for s in spans if s['pitch'] is not None), default=0)
         high = max((max(0, (s['pitch'] - (60 + NAMES.index(project.tonic))) // 12)
                     for spans in timeline['bars'][first:end] for s in spans if s['pitch'] is not None), default=0)
-        baseline = max(246, 232 + high * 6)
+        has_tuplet = any(p['tuplet'] for spans in timeline['bars'][first:end] for s in spans for p in duration_parts(s['duration_ticks']))
+        baseline = max(254 if has_tuplet else 248, 236 + high * 6 + (8 if has_tuplet else 0))
         lyric_y = max(baseline + 30, baseline + 22 + low * 6)
         height = lyric_y + 18
         total = clef_margin + sum(widths[first:end])
@@ -466,8 +474,10 @@ def render_publication_score_html(
                 content.append(f'<rect x="{left + 2:g}" y="2" width="{len(section) * 8 + 12}" height="14" rx="3" fill="#FEF3C7" stroke="#D97706" stroke-width="0.6"/>')
                 content.append(_svg_text(left + 8 + len(section) * 4, 11, section, 8.5, fill="#92400E", font_weight="700", text_anchor="middle"))
 
-            content.append(f'<rect x="{left + 4:g}" y="{TAB_Y_BASE - 18:g}" width="22" height="13" rx="3" fill="#F5EFE6"/>')
-            content.append(_svg_text(left + 15, TAB_Y_BASE - 8, f'#{index + 1}', 9, fill="#785A46", font_weight="700"))
+            # Classical bar-number engraving: a small italic numeral above the system, no box
+            content.append(_svg_text(left + 5, TAB_Y_BASE - 7, f'#{index + 1}', 9, fill="#A0785F",
+                                     font_style="italic", font_family="Georgia, Times New Roman, serif",
+                                     text_anchor="start"))
 
             if index < len(arrangement['bars']):
                 bar = arrangement['bars'][index]
@@ -512,10 +522,12 @@ def render_publication_score_html(
     capo_label = f'变调夹夹第 {capo} 品' if capo > 0 else '不夹变调夹 (原调)'
     style_label = arrangement.get('style', '')
 
+    # Detected tempi such as 90.909 read as a whole number; genuinely fractional ones keep one decimal
+    bpm_disp = f'{round(project.bpm)}' if abs(project.bpm - round(project.bpm)) < 0.15 else f'{project.bpm:.1f}'
     meta_pills = [
         f'1 = {project.tonic}',
         project.meter,
-        f'速度 {project.bpm:g}',
+        f'速度 {bpm_disp}',
         capo_label,
     ]
     if style_label:
