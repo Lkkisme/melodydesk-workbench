@@ -246,6 +246,13 @@ def _generate_preset_candidates(
     candidates: list[tuple[str, float]] = []
 
     ivs = parsed['intervals']
+    r_pc = int(parsed['root'])
+    scale_pcs = {(tonic_pc + s) % 12 for s in _SCALE}
+    has_diatonic_maj7 = (11 in ivs) or (((r_pc + 11) % 12) in scale_pcs and displacement != 7)
+    has_diatonic_b7 = (10 in ivs) or (((r_pc + 10) % 12) in scale_pcs)
+    has_diatonic_9 = (2 in ivs) or (14 in ivs) or (((r_pc + 2) % 12) in scale_pcs)
+    has_diatonic_6 = (9 in ivs) or (21 in ivs) or (((r_pc + 9) % 12) in scale_pcs)
+
     is_dim_q = (3 in ivs and 6 in ivs and 7 not in ivs)
     is_min_q = (3 in ivs and 4 not in ivs and not is_dim_q) or quality in _MINOR
     is_dom_q = (4 in ivs and 10 in ivs) or quality in {'7', '9', '11', '13'}
@@ -255,7 +262,10 @@ def _generate_preset_candidates(
     if preset == 'folk_easy':
         if is_maj_q:
             candidates.append((root, 1.0))
-            candidates.append((root + 'add9', 0.7))
+            if has_diatonic_9:
+                candidates.append((root + 'add9', 0.7))
+            elif has_diatonic_b7:
+                candidates.append((root + '7', 0.68))
         elif is_borrowed_minor_iv:
             candidates.append((root + 'm', 1.0))
             candidates.append((root + 'm6', 0.78))
@@ -271,13 +281,29 @@ def _generate_preset_candidates(
 
     elif preset == 'neosoul_jazz':
         if is_dom_q:
-            candidates.append((root + '9', 0.9))
-            candidates.append((root + '7', 0.85))
+            if has_diatonic_9:
+                candidates.append((root + '9', 0.9))
+                candidates.append((root + '7', 0.85))
+            else:
+                candidates.append((root + '7', 0.92))
             candidates.append((root + '7sus4', 0.75))
         elif is_maj_q:
-            candidates.append((root + ('9' if displacement == 7 else 'maj7'), 0.95))
-            candidates.append((root + '6', 0.8))
-            candidates.append((root + 'add9', 0.7))
+            if has_diatonic_maj7:
+                candidates.append((root + 'maj7', 0.95))
+                if has_diatonic_6:
+                    candidates.append((root + '6', 0.8))
+                if has_diatonic_9:
+                    candidates.append((root + 'add9', 0.7))
+                candidates.append((root, 0.65))
+            else:
+                if has_diatonic_b7 and has_diatonic_9:
+                    candidates.append((root + '9', 0.95))
+                    candidates.append((root + '7', 0.88))
+                    candidates.append((root + 'add9', 0.72))
+                elif has_diatonic_b7:
+                    candidates.append((root + '7', 0.94))
+                candidates.append((root, 0.82))
+                candidates.append((root + '7sus4', 0.72))
         elif is_borrowed_minor_iv:
             # Borrowed minor iv in major key: m6 (diatonic 2nd) avoids m7/m9's b3/#9 clash against major tonic 3rd
             candidates.append((root + 'm6', 0.96))
@@ -312,10 +338,19 @@ def _generate_preset_candidates(
                 candidates.append((root + 'add9', 0.88))
                 candidates.append((root, 0.85))
                 candidates.append((root + 'maj7', 0.82))
-            else:
+                candidates.append((root + 'sus2', 0.68))
+            elif has_diatonic_9:
                 candidates.append((root + 'add9', 0.9))
                 candidates.append((root, 0.78))
-            candidates.append((root + 'sus2', 0.68))
+                if has_diatonic_b7 and not has_diatonic_maj7:
+                    candidates.append((root + '7', 0.72))
+                candidates.append((root + 'sus2', 0.68))
+            else:
+                candidates.append((root, 0.9))
+                if has_diatonic_b7:
+                    candidates.append((root + '7', 0.86))
+                elif has_diatonic_maj7:
+                    candidates.append((root + 'maj7', 0.82))
         elif is_borrowed_minor_iv:
             candidates.append((root + 'm6', 0.92))
             candidates.append((root + 'm', 0.88))
@@ -337,23 +372,30 @@ def _generate_preset_candidates(
         if fifth_semis is not None:
             _bass_5th = _spell_from(root, fifth_semis, 4)
             candidates.append((root + quality + '/' + _bass_5th, 0.75))
-        if 10 in ivs or quality == 'm':
+        if 10 in ivs or quality == 'm' or (quality == '' and has_diatonic_b7 and not has_diatonic_maj7):
             _bass_b7 = _spell_from(root, 10, 6)
-            candidates.append((root + (quality if quality != 'm' else 'm7') + '/' + _bass_b7, 0.8))
-        elif 11 in ivs or quality == '':
+            _q_b7 = '7' if quality == '' else (quality if quality != 'm' else 'm7')
+            candidates.append((root + _q_b7 + '/' + _bass_b7, 0.8))
+        elif 11 in ivs or (quality == '' and has_diatonic_maj7):
             _bass_maj7 = _spell_from(root, 11, 6)
             candidates.append((root + (quality if quality else 'maj7') + '/' + _bass_maj7, 0.55))
 
     elif preset == 'suspend_dreamy':
         if is_dom_q:
             candidates.append((root + '7sus4', 0.9))
+        elif is_maj_q and not has_diatonic_9:
+            candidates.append((root + 'sus4', 0.92))
+            if has_diatonic_b7:
+                candidates.append((root + '7sus4', 0.85))
+            candidates.append((root, 0.78))
         elif is_maj_q or is_min_q:
             candidates.append((root + 'sus2', 0.95))
             candidates.append((root + 'add9', 0.75))
         else:
             candidates.append((original_sym, 0.8))
         candidates.append((root + 'sus4', 0.5))
-        candidates.append((root + 'm7', 0.4))
+        if is_min_q:
+            candidates.append((root + 'm7', 0.4))
 
     else:
         candidates.append((original_sym, 0.8))

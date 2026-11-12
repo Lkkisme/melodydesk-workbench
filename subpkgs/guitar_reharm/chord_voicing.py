@@ -589,3 +589,45 @@ def optimize_voice_leading(chord_sequence: list[str], capo: int = 0) -> list[dic
             raise ValueError(f'No voicings for chord {chord!r} at index {index}')
         layers.append(layer)
     return _optimize_candidates(layers)
+
+
+
+def select_ergonomic_capo(
+    chord_sequence: list[str] | None,
+    max_capo: int = 5,
+) -> int:
+    """Choose an ergonomic capo fret in ``[0, min(12, max_capo)]`` from chord playability and open-string resonance."""
+    counts: dict[str, int] = {}
+    for raw in (chord_sequence or ()):
+        sym = str(raw or '').strip()
+        if sym and sym != 'N.C.' and parse_extended_chord(sym) is not None:
+            counts[sym] = counts.get(sym, 0) + 1
+    if not counts:
+        return 0
+    total_w = float(sum(counts.values()))
+    hi_capo = max(0, min(12, int(max_capo)))
+    best_capo = 0
+    best_cost = float('inf')
+    for c in range(hi_capo + 1):
+        w_sum = 0.0
+        for sym, cnt in counts.items():
+            voicings = generate_voicings(sym, c)
+            if not voicings:
+                w_sum += cnt * 8.0
+                continue
+            v0 = voicings[0]
+            frets = v0['frets']
+            pos = [f for f in frets if f > 0]
+            open_cnt = sum(1 for f in frets if f == 0)
+            _, span_e, pair_strain, _, overflow = _fretboard_stretch_mm(frets, c)
+            barre_pen = 2.15 if v0.get('barre') else 0.0
+            rel_height = (sum(pos) / len(pos)) * 0.24 if pos else 0.0
+            open_bonus = -0.26 * min(3, open_cnt)
+            chord_cost = barre_pen + rel_height + span_e + pair_strain + 4.0 * overflow + open_bonus
+            w_sum += cnt * chord_cost
+        capo_prior = 0.22 * c + 0.12 * max(0, c - 3)
+        score = (w_sum / total_w) + capo_prior
+        if score < best_cost - 1e-6:
+            best_cost = score
+            best_capo = c
+    return best_capo

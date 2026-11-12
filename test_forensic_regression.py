@@ -700,8 +700,9 @@ class ForensicRegressionTests(unittest.TestCase):
         )
         b0_evs = [e for e in arr_1bar["events"] if e["bar"] == 0]
         self.assertTrue(any(e.get("technique") == "CM" for e in b0_evs))
+        self.assertTrue(any(abs(e["beat"]) < 1e-9 and "roll_step_sec" in e for e in b0_evs))
+        self.assertTrue(any(e["beat"] > 1e-6 and e.get("technique", "") == "" for e in b0_evs))
         self.assertTrue(all(e.get("technique") not in ("PB", "X", "H", "P") for e in b0_evs))
-        self.assertTrue(all(abs(e["beat"]) < 1e-9 or e.get("technique") == "CM" for e in b0_evs))
         self.assertIn("function cmIntroMode(", idx_html)
 
         # lkktest Issue 3: custom_note_lyrics keyed by stable ref_idx survives note reorder + BPM resync
@@ -1480,6 +1481,155 @@ class ForensicRegressionTests(unittest.TestCase):
             bt = item.get("beat_times", [])
             if len(bt) >= 2:
                 self.assertGreaterEqual(min(np.diff(bt)), 0.30, f"Sub-0.30s beat glitch in {item.get('id')}")
+
+    def test_universal_anti_fable_generality_and_upload_parity(self):
+        import time
+        from unittest.mock import patch
+        from fastapi.testclient import TestClient
+        from subpkgs.guitar_reharm import ADVANCED_STYLES, select_ergonomic_capo
+        from subpkgs.score_web import server as srv
+
+        # 1. 1-bar intro accompaniment continuity across 4/4, 3/4, and 6/8 (no 2-second dead-air hole)
+        for meter_s, meas_b in (("4/4", 4.0), ("3/4", 3.0), ("6/8", 3.0)):
+            p_intro1 = Project(
+                title=f"intro1_{meter_s}",
+                tonic="C",
+                meter=meter_s,
+                bpm=88.0,
+                notes=[
+                    Note(pitch=64, start=meas_b, duration=1.0, raw_start=2.0, raw_duration=0.6),
+                    Note(pitch=67, start=meas_b + 1.0, duration=1.5, raw_start=2.6, raw_duration=0.9),
+                ],
+            )
+            arr_i1 = arrange_advanced(
+                p_intro1,
+                chords=["C", "G", "C"],
+                style="抒情琶音",
+                intro_mode="chord_melody",
+            )
+            b0_beats = sorted({round(float(e["beat"]), 3) for e in arr_i1["events"] if e["bar"] == 0})
+            self.assertGreaterEqual(len(b0_beats), 4, f"1-bar intro in {meter_s} must fill inner accompaniment: {b0_beats}")
+            gaps = [b0_beats[k + 1] - b0_beats[k] for k in range(len(b0_beats) - 1)] + [meas_b - b0_beats[-1]]
+            self.assertLessEqual(max(gaps), 1.0 + 1e-6, f"Dead-air gap in {meter_s} 1-bar intro: {b0_beats}")
+
+        # 2. Universal mid-song breathing across ALL 5 styles: phrase-endings & 1-bar vocal breaths keep pulse
+        notes_breath = [
+            Note(pitch=64, start=0.0, duration=2.0),
+            Note(pitch=67, start=2.0, duration=2.0),
+            Note(pitch=65, start=4.0, duration=1.5),   # Phrase 1 ends early in Bar 1 (V->I cadence G7->C)
+            # Bar 2 (beats 8..12) is a 1-bar inter-phrase vocal breath (silent, no CM turnaround)
+            Note(pitch=64, start=12.0, duration=2.0),  # Phrase 2 resumes in Bar 3
+            Note(pitch=60, start=14.0, duration=2.0),
+            # Bar 4 (beats 16..20) is the final bar -> full sustained rolled chord
+        ]
+        p_breath = Project(title="all_styles_breath", tonic="C", meter="4/4", bpm=92.0, notes=notes_breath)
+        for st_name in ADVANCED_STYLES:
+            arr_st = arrange_advanced(
+                p_breath,
+                chords=["C", "G7", "Am7", "F", "C"],
+                style=st_name,
+                intro_mode="chord_melody",
+            )
+            for mid_bar in (1, 2):
+                mid_onsets = sorted({round(float(e["beat"]), 3) for e in arr_st["events"] if e["bar"] == mid_bar})
+                self.assertGreaterEqual(
+                    len(mid_onsets), 5,
+                    f"Style {st_name} froze or starved mid-song bar {mid_bar}: onsets={mid_onsets}",
+                )
+            final_evs = [e for e in arr_st["events"] if e["bar"] == 4]
+            self.assertTrue(final_evs and all(abs(e["beat"]) < 1e-9 and "roll_step_sec" in e for e in final_evs))
+
+        # 3. Universal scale-consistent secondary dominants & harmonic-minor V across presets
+        proj_am = Project(title="am_sec_dom", tonic="C", meter="4/4", bpm=90.0, notes=[])
+        for preset_k in ("neosoul_jazz", "emotional_pop", "folk_easy", "walking_bass", "suspend_dreamy"):
+            res_am = reharmonize_progression(
+                ["Am", "Dm", "E", "Am", "E7", "Am"],
+                proj_am,
+                preset=preset_k,
+                tonic="C",
+                capo=0,
+            )
+            for b_dom in (2, 4):
+                pcs_e = set(parse_extended_chord(res_am[b_dom]["chord"])["pcs"])
+                self.assertNotIn(3, pcs_e, f"{preset_k} emitted D# (Emaj7) on V/vi in Am: {res_am[b_dom]['chord']}")
+                self.assertNotIn(6, pcs_e, f"{preset_k} emitted F# (E9/add9/sus2) on V/vi in Am: {res_am[b_dom]['chord']}")
+                self.assertNotIn(1, pcs_e, f"{preset_k} emitted C# (E6) on V/vi in Am: {res_am[b_dom]['chord']}")
+
+        res_sec_c = reharmonize_progression(
+            ["C", "A", "Dm", "D", "G", "Bb", "Ab", "C"],
+            proj_am,
+            preset="neosoul_jazz",
+            tonic="C",
+            capo=0,
+        )
+        self.assertNotIn(8, set(parse_extended_chord(res_sec_c[1]["chord"])["pcs"]))  # A (V/ii) -> no G# (Amaj7)
+        self.assertNotIn(1, set(parse_extended_chord(res_sec_c[3]["chord"])["pcs"]))  # D (V/V) -> no C# (Dmaj7)
+        self.assertIn(9, set(parse_extended_chord(res_sec_c[5]["chord"])["pcs"]))     # Bb (bVII) -> keeps diatonic A (Bbmaj7)
+        self.assertIn(7, set(parse_extended_chord(res_sec_c[6]["chord"])["pcs"]))     # Ab (bVI) -> keeps diatonic G (Abmaj7)
+
+        # 4. Ergonomic Capo selection across open vs barre-heavy keys
+        self.assertEqual(select_ergonomic_capo(["C", "G/B", "Am7", "F"] * 4), 0)
+        self.assertEqual(select_ergonomic_capo(["Em", "D", "C", "G"] * 4), 0)
+        self.assertEqual(select_ergonomic_capo(["Eb", "Bb/D", "Cm7", "Ab"] * 4), 3)
+        self.assertEqual(select_ergonomic_capo(["Ab", "Eb/G", "Fm7", "Db"] * 4), 1)
+        self.assertEqual(select_ergonomic_capo(["B", "F#", "G#m", "E"] * 4), 4)
+
+        # 5. /api/analyze_audio session reset (no stale capo=2 / slap_x / split_bar leak) & Pro-form split_bar toggle
+        app_u = srv.create_app()
+        client_u = TestClient(app_u)
+        with app_u.state.session_lock:
+            s0 = app_u.state.session
+            s0.capo = 2
+            s0.slap_x = True
+            s0.palm_mute = True
+            s0.split_bar = True
+        with tempfile.TemporaryDirectory() as td_u:
+            sr_u = 16000
+            t_u = np.arange(sr_u * 4, dtype=np.float32) / sr_u
+            wav_u = Path(td_u) / "upload_c.wav"
+            sf.write(str(wav_u), 0.15 * np.sin(2 * np.pi * 261.63 * t_u), sr_u)
+            voc_p = Path(td_u) / "vocals.wav"
+            acc_p = Path(td_u) / "no_vocals.wav"
+            sf.write(str(voc_p), 0.15 * np.sin(2 * np.pi * 261.63 * t_u), sr_u)
+            sf.write(str(acc_p), np.zeros_like(t_u), sr_u)
+
+            fake_notes = [
+                Note(pitch=60, start=4.0, duration=1.0, raw_start=2.0, raw_duration=0.5),
+                Note(pitch=64, start=5.0, duration=1.0, raw_start=2.5, raw_duration=0.5),
+                Note(pitch=67, start=6.0, duration=2.0, raw_start=3.0, raw_duration=0.9),
+            ]
+            with (
+                patch("subpkgs.stem_mir.separate_stems", return_value={"vocals": str(voc_p), "accompaniment": str(acc_p), "backend": "mock", "device": "cpu"}),
+                patch("subpkgs.singing_lyrics.transcribe_word_timestamps", return_value={"word_timestamps": [{"word": "hello", "start": 2.0, "end": 2.9, "probability": 0.95}], "raw_lyrics": "hello"}),
+                patch("subpkgs.stem_mir.track_beats_and_downbeats", return_value={"bpm": 120.0, "beat_origin": 0.0, "meter": "4/4", "beat_times": [0.5 * k for k in range(9)], "bar_start_seconds": [0.0, 2.0, 4.0]}),
+                patch("subpkgs.singing_lyrics.transcribe_vocal_notes", return_value={"notes": fake_notes, "word_boundaries_sec": [2.0], "backend": "mock"}),
+                patch("subpkgs.singing_lyrics.regulate_singing_notes_for_score", return_value=fake_notes),
+                patch("subpkgs.stem_mir.synthesize_melody_conditioned_harmony", return_value={"chords": ["C", "G"], "bar_start_seconds": [0.0, 2.0, 4.0], "bar_dynamics": [0.9, 0.95]}),
+            ):
+                resp_up = client_u.post("/api/analyze_audio", files={"file": ("upload_c.wav", wav_u.read_bytes(), "audio/wav")}, data={"lyrics": "hello"})
+                self.assertEqual(resp_up.status_code, 200)
+                jid = resp_up.json()["job_id"]
+                for _ in range(40):
+                    j_st = client_u.get(f"/api/job/{jid}").json()
+                    if j_st.get("status") in ("done", "error", "superseded"):
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(j_st.get("status"), "done", j_st)
+
+        st_after = client_u.get("/api/state").json()
+        self.assertEqual(st_after["capo"], 0)
+        self.assertFalse(st_after["slap_x"])
+        self.assertFalse(st_after["palm_mute"])
+        self.assertFalse(st_after["split_bar"])
+        self.assertTrue(st_after["use_detected_splits"])
+
+        # Switching to neosoul_jazz turns split_bar=True; unchecking split_bar via multi-field Pro-form turns use_detected_splits=False
+        r_ns = client_u.post("/api/reharmonize", json={"preset": "neosoul_jazz", "style": "Neo-Soul 律动", "split_bar": True}).json()
+        self.assertTrue(r_ns["split_bar"])
+        self.assertTrue(r_ns["use_detected_splits"])
+        r_pro_off = client_u.post("/api/reharmonize", json={"preset": "neosoul_jazz", "style": "Neo-Soul 律动", "capo": 0, "split_bar": False}).json()
+        self.assertFalse(r_pro_off["split_bar"])
+        self.assertFalse(r_pro_off["use_detected_splits"])
 
 
 if __name__ == "__main__":

@@ -309,7 +309,8 @@ def _compute_metrical_groove_profile(
 
     if rho >= 0.38 and not cm:
         eff_rho = min(1.0, max(0.0, (float(rho) - 0.25) / 0.75))
-        k_min = min(n_slots, max(2 if is_compound else 1, int(n_segments)))
+        groove_floor = max(n_beats + (1 if n_slots > n_beats else 0), n_slots - 2)
+        k_min = min(n_slots, max(groove_floor, int(n_segments)))
         budget = max(k_min, min(n_slots, k_min + int(round(max(0, budget - k_min) * ((1.0 - eff_rho) ** 1.5)))))
         t0 = max(1, int(tau_slot))
         denom = max(1, n_slots - t0)
@@ -1905,11 +1906,7 @@ def arrange_advanced(
 
         is_fingerpick_or_neosoul = style in _FINGERPICK_STYLES or style == _NEOSOUL_STYLE
         ov_notes = _overlapping_notes(project.notes, index * measure, (index + 1) * measure) if not silent else []
-        eff_groove_rho = (
-            0.0
-            if (style in _ARPEGGIO_STYLES and ov_notes and rho_b < 0.72 and not cm)
-            else rho_b
-        )
+        eff_groove_rho = 0.0 if (style in _ARPEGGIO_STYLES or cm) else rho_b
         groove = _compute_metrical_groove_profile(
             measure, style, state, fast_tempo, cm, project.meter,
             rho=eff_groove_rho, tau_slot=b_info['tau_slot'],
@@ -2024,14 +2021,6 @@ def arrange_advanced(
         # ('note', beat, duration, item, velocity, technique, direction, roll_step) or
         # ('treble', beat, request_index, velocity, kind, direction)
         plan, treble_requests, bass_pitch = [], [], None
-        is_1bar_intro = (
-            index == 0
-            and not explicit_cm
-            and index in roll_slot0_bars
-            and 1 not in motif_cm_map
-            and vocal_counts.get(0, 0) == 0
-            and (len(bars) == 1 or vocal_counts.get(1, 0) > 0 or 1 in explicit_cm_bars)
-        )
         is_comp_bar = str(project.meter).strip().endswith('/8') and int(round(measure * 2.0)) % 3 == 0
         first_cm_beat = min((it[1] for it in cm_reservations), default=0.0)
         cm_onset_beats = sorted({it[1] for it in cm_reservations})
@@ -2073,11 +2062,8 @@ def arrange_advanced(
             if not slot_in_active:
                 continue
 
-            # Rolled chord on beat 0 for silent/section-ending breathing bars (rho >= 0.55) or rolled CM intros/interludes.
-            if slot == 0 and abs(beat) < 1e-9 and (
-                (rho_b >= 0.55 and not cm and (style not in _ARPEGGIO_STYLES or not ov_notes))
-                or (cm and index in roll_slot0_bars)
-            ):
+            # Rolled chord on beat 0 for rolled CM intros/interludes (final song bar is rolled earlier via is_final_roll).
+            if slot == 0 and abs(beat) < 1e-9 and (cm and index in roll_slot0_bars):
                 roll_dur = segment['duration']
                 roll_items = sorted(played, key=lambda x: -x[0])
                 if cm:
@@ -2092,7 +2078,7 @@ def arrange_advanced(
                     bass_pitch = bass[2]
                 for r_idx, item in enumerate(roll_items):
                     item_roll_dur = roll_dur
-                    if cm and not is_1bar_intro and item != bass and item[0] >= 4 and item[1] > 0:
+                    if cm and item != bass and item[0] >= 4 and item[1] > 0:
                         for rb0 in cm_onset_beats:
                             if rb0 > 1e-6 and not is_playable_cm_inner(bass, active_cm_at(rb0), item):
                                 item_roll_dur = min(item_roll_dur, rb0)
@@ -2103,8 +2089,6 @@ def arrange_advanced(
                 continue
 
             if cm:
-                if is_1bar_intro:
-                    continue
                 ceil_p = cm_ceiling_at(beat)
                 dyn_div = max(1.0, float(dyn_scale)) if dyn_scale is not None else 1.0
                 is_cm_bass_slot = (

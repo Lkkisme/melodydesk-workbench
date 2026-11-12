@@ -40,12 +40,12 @@ _VOCAL_CAL_CACHE: dict[tuple, np.ndarray] = {}
 
 try:
     from subpkgs.guitar_reharm import (reharmonize_progression, arrange_advanced,
-        roman_numeral, check_melody_clash, generate_voicings, suggest_bar_substitutions,
+        roman_numeral, check_melody_clash, generate_voicings, select_ergonomic_capo, suggest_bar_substitutions,
         REHARMONIZE_PRESETS, ADVANCED_STYLES, synthesize_realistic_guitar, recommend_artistry)
 except ModuleNotFoundError as exc:
     if not (exc.name == 'subpkgs.guitar_reharm' or (exc.name and exc.name.startswith('subpkgs.guitar_reharm.'))):
         raise
-    reharmonize_progression = arrange_advanced = synthesize_realistic_guitar = suggest_bar_substitutions = recommend_artistry = None
+    reharmonize_progression = arrange_advanced = synthesize_realistic_guitar = suggest_bar_substitutions = recommend_artistry = select_ergonomic_capo = None
     REHARMONIZE_PRESETS, ADVANCED_STYLES = {}, ()
 try:
     from subpkgs.singing_lyrics import align_lyrics_to_notes, estimate_key_albrecht_shanahan
@@ -95,7 +95,7 @@ def _implemented(function) -> bool:
     return ok
 
 def _refresh_backends():
-    global reharmonize_progression, arrange_advanced, roman_numeral, check_melody_clash, generate_voicings, suggest_bar_substitutions
+    global reharmonize_progression, arrange_advanced, roman_numeral, check_melody_clash, generate_voicings, select_ergonomic_capo, suggest_bar_substitutions
     global REHARMONIZE_PRESETS, ADVANCED_STYLES, synthesize_realistic_guitar, recommend_artistry, align_lyrics_to_notes, estimate_key_albrecht_shanahan
     global beats_to_seconds_piecewise, seconds_to_beats_piecewise
     global NATIVE, PRESETS, STYLES
@@ -105,6 +105,7 @@ def _refresh_backends():
         reharmonize_progression, arrange_advanced = getattr(gr, 'reharmonize_progression', None), getattr(gr, 'arrange_advanced', None)
         roman_numeral, check_melody_clash = getattr(gr, 'roman_numeral', None), getattr(gr, 'check_melody_clash', None)
         generate_voicings, suggest_bar_substitutions = getattr(gr, 'generate_voicings', None), getattr(gr, 'suggest_bar_substitutions', None)
+        select_ergonomic_capo = getattr(gr, 'select_ergonomic_capo', None)
         REHARMONIZE_PRESETS, ADVANCED_STYLES = getattr(gr, 'REHARMONIZE_PRESETS', {}), getattr(gr, 'ADVANCED_STYLES', ())
         synthesize_realistic_guitar = getattr(gr, 'synthesize_realistic_guitar', None)
         recommend_artistry = getattr(gr, 'recommend_artistry', None)
@@ -1136,7 +1137,7 @@ def create_app() -> FastAPI:
             bpm_changed = 'bpm' in request.model_fields_set and request.bpm != candidate.project.bpm
             meter_changed = 'meter' in request.model_fields_set and request.meter != candidate.project.meter
             prev_use_det = bool(candidate.use_detected_splits)
-            if request.model_fields_set == {'split_bar'}:
+            if request.model_fields_set == {'split_bar'} or (split_changed and not preset_changed):
                 new_use_det = bool(request.split_bar)
             elif ('split_bar' in request.model_fields_set and bool(request.split_bar)) or preset_changed:
                 new_use_det = True
@@ -1656,14 +1657,16 @@ def create_app() -> FastAPI:
 
                 # Step 4 — Vocal Note Transcription & Regulation
                 from subpkgs.singing_lyrics import filter_pre_lyric_bleed_notes
+                first_lyric_sec = word_boundaries[0] if word_boundaries else None
+                word_boundaries = [t for t in word_boundaries if t >= beat_origin]
                 tx = transcribe_vocal_notes(stems['vocals'], bpm=bpm, beat_origin=beat_origin,
                                             word_boundaries_sec=word_boundaries or None, prefer_cuda=True,
                                             beat_times=beat_times_secs or None)
                 raw_notes = sorted(tx['notes'], key=lambda n: n.raw_start)
-                if word_boundaries:
+                if first_lyric_sec is not None:
                     pickup_tol_s = min(0.5, 0.5 * (60.0 / max(20.0, bpm)))
                     raw_notes = filter_pre_lyric_bleed_notes(
-                        raw_notes, stems['vocals'], word_boundaries[0], beat_origin, pickup_tol_s
+                        raw_notes, stems['vocals'], first_lyric_sec, beat_origin, pickup_tol_s
                     )
                 word_boundaries = sorted(set(word_boundaries) | set(tx.get('word_boundaries_sec') or []))
                 try:
@@ -1794,6 +1797,11 @@ def create_app() -> FastAPI:
                     if callable(recommend_artistry)
                     else None
                 )
+                auto_capo = (
+                    int(select_ergonomic_capo(base_chords))
+                    if callable(select_ergonomic_capo)
+                    else 0
+                )
 
                 def _apply(candidate):
                     candidate.demo_mode = 'upload'
@@ -1802,11 +1810,21 @@ def create_app() -> FastAPI:
                     candidate.custom_chords = {}
                     candidate.custom_segment_voicings = {}
                     candidate.custom_voicings = [None] * len(base_chords)
+                    preset_init = 'original'
+                    style_init = STYLES[0] if STYLES else '分解和弦'
                     if rec_init is not None:
                         if rec_init.get('preset') in PRESETS:
-                            candidate.preset = rec_init['preset']
+                            preset_init = rec_init['preset']
                         if rec_init.get('style') in STYLES:
-                            candidate.style = rec_init['style']
+                            style_init = rec_init['style']
+                    candidate.preset = preset_init
+                    candidate.style = style_init
+                    candidate.capo = auto_capo
+                    candidate.split_bar = False
+                    candidate.slap_x = False
+                    candidate.palm_mute = False
+                    candidate.passing_bass = bool(NATIVE and preset_init in ('emotional_pop', 'neosoul_jazz', 'walking_bass'))
+                    candidate.embellish_hp = bool(NATIVE and (preset_init in ('emotional_pop', 'neosoul_jazz') or style_init == '抒情琶音'))
                     candidate.intro_mode = 'chord_melody' if NATIVE else 'none'
                     candidate.bar_start_seconds = bar_start_secs
                     candidate.beat_times = beat_times_secs

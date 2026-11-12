@@ -770,7 +770,9 @@ def _get_blended_studio_base(
             if sos_hp is not None and len(f_seg) >= 16:
                 f_seg = sosfilt(sos_hp, f_seg)
             n_blend = min(len(seg), len(f_seg))
-            seg[:n_blend] = (1.0 - fss_mix) * seg[:n_blend] + fss_mix * (f_seg[:n_blend] * 0.46)
+            # Window FSS to the 240ms woody pluck-body transient so long sustain stays 100% single-take Meta phase-coherent
+            w_f = fss_mix * np.exp(-np.arange(n_blend, dtype=np.float64) / max(1.0, 0.24 * sr))
+            seg[:n_blend] = (1.0 - w_f) * seg[:n_blend] + w_f * (f_seg[:n_blend] * 0.46)
     elif fss_wave is not None:
         seg = fss_wave[: min(len(fss_wave), max_len)].astype(np.float64)
         seg = _pitch_shift_resample(seg, fss_shift) * 0.55

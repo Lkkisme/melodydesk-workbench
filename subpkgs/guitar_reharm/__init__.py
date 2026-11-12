@@ -4,6 +4,7 @@ from .chord_voicing import (
     parse_extended_chord,
     generate_voicings,
     optimize_voice_leading,
+    select_ergonomic_capo,
 )
 from .reharmonizer import (
     REHARMONIZE_PRESETS,
@@ -28,6 +29,7 @@ __all__ = [
     "parse_extended_chord",
     "generate_voicings",
     "optimize_voice_leading",
+    "select_ergonomic_capo",
     "REHARMONIZE_PRESETS",
     "roman_numeral",
     "check_melody_clash",
