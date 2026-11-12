@@ -53,6 +53,35 @@ def load_models(device='cpu'):
         return loaded
 
 
+def _trim_and_split_voiced_intervals(pitches, intervals, uv, probability, sr, hop, wav_len):
+    """Trim unvoiced margins and split intervals across breath silences (~0.26s unvoiced gap)."""
+    max_uv_bridge = max(1, round(0.26 * sr / hop))
+    tail_pad = max(1, round(0.025 * sr / hop))
+    notes = []
+    for index, (pitch, (a, b)) in enumerate(zip(pitches, intervals)):
+        if not 21 <= pitch <= 108 or b <= a:
+            continue
+        seg_voiced = np.flatnonzero(~uv[a:b])
+        if seg_voiced.size == 0:
+            continue
+        uv_gaps = np.where(np.diff(seg_voiced) > max_uv_bridge)[0]
+        v_starts = np.r_[0, uv_gaps + 1]
+        v_ends = np.r_[uv_gaps, len(seg_voiced) - 1]
+        for sv, ev in zip(v_starts, v_ends):
+            sub_a = a + int(seg_voiced[sv])
+            next_bound = b if ev == len(seg_voiced) - 1 else (a + int(seg_voiced[ev + 1]))
+            sub_b = min(next_bound, a + int(seg_voiced[ev]) + 1 + tail_pad)
+            start = sub_a * hop / sr
+            end = min(wav_len / sr, sub_b * hop / sr)
+            if end - start < 0.045:
+                continue
+            voiced_fraction = float(np.mean(~uv[sub_a:sub_b])) if sub_b > sub_a else 0.0
+            if voiced_fraction < 0.15:
+                continue
+            notes.append(Note(int(pitch), 0, 1, float(start), float(end - start), float(probability[index, pitch])))
+    return notes
+
+
 def predict_chunk(wav, models, word_boundaries_sec=None, return_dict=False):
     import torch
     from utils.audio.pitch_utils import norm_interp_f0, denorm_f0, f0_to_coarse, boundary2Interval
@@ -96,17 +125,7 @@ def predict_chunk(wav, models, word_boundaries_sec=None, return_dict=False):
         probability=torch.softmax(output['note_logits'][0,:size],dim=-1).detach().cpu().numpy()
         boundary_frames=torch.nonzero(word_bd[0,:real_length],as_tuple=False).flatten().detach().cpu().tolist()
         detected_boundaries=[float(frame*hop/sr) for frame in boundary_frames]
-    notes=[]
-    for index,(pitch,(a,b)) in enumerate(zip(pitches,intervals)):
-        start=a*hop/sr;end=min(len(wav)/sr,b*hop/sr)
-        if not 21<=pitch<=108 or end-start<.045:
-            continue
-        # A pitch-class prediction is insufficient if RMVPE found virtually no
-        # voicing in the interval. Never turn an all-unvoiced region into notes.
-        voiced_fraction=float(np.mean(~uv[a:b])) if b>a else 0
-        if voiced_fraction < .15:
-            continue
-        notes.append(Note(int(pitch),0,1,float(start),float(end-start),float(probability[index,pitch])))
+    notes=_trim_and_split_voiced_intervals(pitches,intervals,uv,probability,sr,hop,len(wav))
     if return_dict:
         return {'notes': notes, 'word_boundaries_sec': detected_boundaries}
     return notes

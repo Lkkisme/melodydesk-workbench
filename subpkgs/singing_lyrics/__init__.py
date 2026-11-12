@@ -8,6 +8,8 @@ from .lyric_aligner import (
     tokenize_lyrics,
     transcribe_word_timestamps,
     align_lyrics_to_notes,
+    detect_pre_lyric_vocalise_onsets,
+    filter_pre_lyric_bleed_notes,
 )
 
 __all__ = [
@@ -17,4 +19,6 @@ __all__ = [
     "tokenize_lyrics",
     "transcribe_word_timestamps",
     "align_lyrics_to_notes",
+    "detect_pre_lyric_vocalise_onsets",
+    "filter_pre_lyric_bleed_notes",
 ]

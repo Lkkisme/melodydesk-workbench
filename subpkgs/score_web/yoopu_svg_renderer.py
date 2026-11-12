@@ -1,13 +1,41 @@
-"""Chinese Publication-Grade ('Yoopu / 有谱么' Style) Combined Guitar Tab + Jianpu + Syllabic Lyric SVG/HTML Renderer."""
+"""Chinese Publication-Grade ('Yoopu / 有谱么' Style) Combined Guitar Tab + Jianpu + Syllabic Lyric SVG/HTML Renderer.
+
+SVG <-> JS interface contract (locked):
+
+* ``svg.score-system`` carries ``data-bar-start`` / ``data-bar-end`` / ``data-measure-ticks`` and owns the
+  interactive overlays ``rect.score-bar-highlight`` (background), ``line.score-hover-guide`` and
+  ``g.score-playhead`` (foreground; moved purely through ``transform="translate(x,0)"``).
+* ``g.score-bar`` carries ``data-bar-index`` / ``data-x-left`` / ``data-x-pad`` / ``data-bar-width`` and its first
+  child is ``rect.score-bar-hit``.  Inside a bar the time <-> x bijection is
+  ``x = left + pad + (localBeat / measureBeats) * (barWidth - 2 * pad)``.
+* ``g.tab-note`` wraps every guitar event (knockout rect + fret text) with ``data-ev-start`` / ``data-ev-dur`` /
+  ``data-string`` / ``data-fret`` / ``data-tech``; JS toggles ``.tab-active``.
+* Jianpu digits carry ``data-note-index`` (``.jp-active``), lyrics carry ``data-lyric-index`` (``.lyric-active``).
+"""
 from __future__ import annotations
 from html import escape
 from music import NAMES, DEGREES
 from ._score_timing import build_score_timeline, duration_parts, TICKS
 
 
+RHYTHM_INK = "#475569"
+LEAD_INK = "#9A3412"
+LEAD_KNOCKOUT = "#FFFBEB"
+ROLL_INK = "#785A46"
+TIE_INK = "#6B5340"
+LEAD_TECHNIQUES = ('CM', 'DS')
+# A sixteenth is 12 ticks at 48 ticks per quarter; the +2 tolerance absorbs grid rounding while keeping
+# eighth triplets (16 ticks) on a single beam.  Dotted sixteenths (18 ticks) are matched explicitly.
+_SIXTEENTH_MAX_TICKS = TICKS // 4 + 2
+_DOTTED_TICKS = (TICKS * 3 // 8, TICKS * 3 // 4, TICKS * 3 // 2, TICKS * 3)
+
+
 def _svg_text(x, y, text, size=16, **attributes):
-    attrs = ' '.join(f'{escape(k.replace("_", "-"), quote=True)}="{escape(str(v), quote=True)}"' for k, v in attributes.items())
-    return f'<text x="{x:g}" y="{y:g}" font-size="{size}" text-anchor="middle" {attrs}>{escape(str(text), quote=True)}</text>'
+    merged = {"text-anchor": "middle"}
+    for k, v in attributes.items():
+        merged[k.replace("_", "-")] = v
+    attrs = ' '.join(f'{escape(k, quote=True)}="{escape(str(v), quote=True)}"' for k, v in merged.items())
+    return f'<text x="{x:g}" y="{y:g}" font-size="{size}" {attrs}>{escape(str(text), quote=True)}</text>'
 
 
 def _line(x1, y1, x2, y2, width=1, color="#0f172a"):
@@ -55,6 +83,98 @@ def _chord_diagram(x, y_top, segment):
     return ''.join(result)
 
 
+def _has_slide(event):
+    slide_from = event.get('slide_from_fret')
+    return event.get('technique', '') == 'SL' or (slide_from is not None and int(slide_from) != int(event['fret']))
+
+
+def _roll_arrow(x, y_bottom, y_top):
+    """Vertical wavy arpeggio-roll line from the low string (bottom) up to the high string, with an upward arrowhead."""
+    span = y_bottom - y_top
+    waves = max(2, round(span / 5))
+    step = span / waves
+    d = [f'M{x:g},{y_bottom:g}']
+    for i in range(waves):
+        side = 2.3 if i % 2 == 0 else -2.3
+        d.append(f'Q{x + side:g},{y_bottom - (i + 0.5) * step:g} {x:g},{y_bottom - (i + 1) * step:g}')
+    d.append(f'M{x - 2.7:g},{y_top + 4:g} L{x:g},{y_top:g} L{x + 2.7:g},{y_top + 4:g}')
+    return (f'<path class="tab-roll-arrow" d="{" ".join(d)}" fill="none" stroke="{ROLL_INK}" '
+            f'stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"/>')
+
+
+def _rhythm_flag(x, y):
+    """Curved flag attached to the tip (bottom) of a TAB rhythm stem."""
+    return (f'<path class="tab-flag" d="M{x:g},{y:g} c0.5,-3.4 6.2,-4.2 5.4,-9.4" fill="none" '
+            f'stroke="{RHYTHM_INK}" stroke-width="1.3" stroke-linecap="round"/>')
+
+
+def _is_sixteenth(eff_ticks):
+    return eff_ticks <= _SIXTEENTH_MAX_TICKS or eff_ticks == _DOTTED_TICKS[0]
+
+
+def _render_tab_rhythm(onsets, measure_ticks, group_span, string_y_base):
+    """Stems, beams, flags and duration dots below the TAB staff.
+
+    ``onsets`` maps onset tick -> ``[x, min_event_duration_ticks]``.
+    """
+    result = []
+    stem_top = string_y_base + 80
+    stem_bottom = stem_top + 14
+    ticks_sorted = sorted(onsets)
+    groups: dict[int, list[tuple[float, int]]] = {}
+    for k, tick in enumerate(ticks_sorted):
+        x, min_ev_ticks = onsets[tick]
+        next_tick = ticks_sorted[k + 1] if k + 1 < len(ticks_sorted) else measure_ticks
+        eff_ticks = min(next_tick - tick, max(12, min_ev_ticks))
+        g_idx = int((tick / TICKS + 1e-6) // group_span)
+        groups.setdefault(g_idx, []).append((x, eff_ticks))
+
+    for g_idx in sorted(groups):
+        members = groups[g_idx]
+        if len(members) == 1:
+            x, eff = members[0]
+            if eff >= 2 * TICKS:
+                # Half / whole notes: short open stem
+                result.append(_line(x, stem_top, x, stem_top + 7, 1, RHYTHM_INK))
+            else:
+                result.append(_line(x, stem_top, x, stem_bottom, 1, RHYTHM_INK))
+                if eff <= TICKS * 0.6 or eff == _DOTTED_TICKS[1]:
+                    result.append(_rhythm_flag(x, stem_bottom))
+                    if _is_sixteenth(eff):
+                        result.append(_rhythm_flag(x, stem_bottom - 4.2))
+        else:
+            for x, _eff in members:
+                result.append(_line(x, stem_top, x, stem_bottom, 1, RHYTHM_INK))
+            xs = [x for x, _ in members]
+            result.append(f'<line class="tab-beam" x1="{xs[0] - 0.5:g}" y1="{stem_bottom:g}" x2="{xs[-1] + 0.5:g}" '
+                          f'y2="{stem_bottom:g}" stroke="{RHYTHM_INK}" stroke-width="2.0"/>')
+            sixteenth = [_is_sixteenth(eff) for _, eff in members]
+            y2 = stem_bottom - 4.2
+            i, count = 0, len(members)
+            while i < count:
+                if not sixteenth[i]:
+                    i += 1
+                    continue
+                j = i
+                while j + 1 < count and sixteenth[j + 1]:
+                    j += 1
+                if j > i:
+                    xa, xb = xs[i] - 0.5, xs[j] + 0.5
+                else:
+                    # Lone sixteenth against a dotted eighth: fractional beam stub pointing into the group
+                    if i == 0:
+                        xa, xb = xs[i] - 0.5, xs[i] + min(7.0, (xs[i + 1] - xs[i]) * 0.6)
+                    else:
+                        xa, xb = xs[i] - min(7.0, (xs[i] - xs[i - 1]) * 0.6), xs[i] + 0.5
+                result.append(f'<line class="tab-beam" x1="{xa:g}" y1="{y2:g}" x2="{xb:g}" y2="{y2:g}" '
+                              f'stroke="{RHYTHM_INK}" stroke-width="1.8"/>')
+                i = j + 1
+        for x, eff in members:
+            if eff in _DOTTED_TICKS:
+                result.append(f'<circle class="tab-dot" cx="{x + 4.5:g}" cy="{stem_top + 3.5:g}" r="1.3" fill="{RHYTHM_INK}"/>')
+    return ''.join(result)
+
+
 def _render_tab_bar(arrangement, index, x_at, bar_width, left, string_y_base):
     result = []
     tab_right = left + bar_width
@@ -62,40 +182,102 @@ def _render_tab_bar(arrangement, index, x_at, bar_width, left, string_y_base):
         y = string_y_base + (string - 1) * 15
         result.append(_line(left, y, tab_right, y, 1, "#64748b"))
     result.append(_line(tab_right, string_y_base, tab_right, string_y_base + 75, 1.5, "#0f172a"))
-    beat_xs = set()
+    measure_beats = float(arrangement['measure_beats'])
+    measure_ticks = round(measure_beats * TICKS)
+    meter_str = str(arrangement.get('meter', '4/4')).strip()
+    is_compound = meter_str.endswith('/8') and round(measure_beats * 2) >= 6 and round(measure_beats * 2) % 3 == 0
+    group_span = 1.5 if is_compound else 1.0
+
+    # Events may carry only start/duration (no 'beat' key): always derive the bar-relative position.
+    in_bar = []
+    stacks: dict[int, list[tuple[float, float, dict]]] = {}
     for event in arrangement['events']:
-        relative = event['start'] - index * arrangement['measure_beats']
-        if not 0 <= relative < arrangement['measure_beats']:
+        relative = event['start'] - index * measure_beats
+        if not 0 <= relative < measure_beats:
             continue
+        tick = round(relative * TICKS)
         x = x_at(relative * TICKS)
         y = string_y_base + (event['string'] - 1) * 15
+        in_bar.append((tick, x, y, event))
+        stacks.setdefault(tick, []).append((x, y, event))
+
+    # Arpeggio roll arrows sit behind the fret numbers, left of the chord stack
+    for tick in sorted(stacks):
+        stack = stacks[tick]
+        if len({ev['string'] for _, _, ev in stack}) >= 2 and any(ev.get('roll_step_sec') for _, _, ev in stack):
+            ys = [y for _, y, _ in stack]
+            # Step further left when a slide marker (x-16 .. x-7) already occupies the default lane
+            lane = 22 if any(_has_slide(ev) for _, _, ev in stack) else 12
+            result.append(_roll_arrow(stack[0][0] - lane, max(ys) + 3, min(ys) - 4))
+
+    onsets: dict[int, list] = {}
+    pm_ticks = set()
+    for tick, x, y, event in in_bar:
         technique = event.get('technique', '')
+        has_slide = _has_slide(event)
+        tech_attr = technique or ('SL' if has_slide else '')
+        is_lead = technique in LEAD_TECHNIQUES
         label = 'X' if technique == 'X' else str(event['fret'])
-        result.append(f'<rect x="{x - 9:g}" y="{y - 10:g}" width="18" height="16" fill="white"/>')
+        knockout = LEAD_KNOCKOUT if is_lead else 'white'
+        result.append(
+            f'<g class="tab-note{" is-lead" if is_lead else ""}" data-ev-start="{event["start"]:g}" '
+            f'data-ev-dur="{event["duration"]:g}" data-string="{event["string"]}" data-fret="{event["fret"]}" '
+            f'data-tech="{escape(str(tech_attr), quote=True)}">'
+            f'<rect x="{x - 9:g}" y="{y - 10:g}" width="18" height="16" fill="{knockout}"/>')
         if technique == 'X':
             result.append(_svg_text(x, y + 5, label, 15, fill="#dc2626", font_weight="700"))
+        elif is_lead:
+            result.append(_svg_text(x, y + 5, label, 15, fill=LEAD_INK, font_weight="700"))
         else:
             result.append(_svg_text(x, y + 5, label, 15, fill="#0f172a"))
+        result.append('</g>')
+
         if technique == 'PM':
-            result.append(_svg_text(x, string_y_base - 14, 'PM', 10, fill="#b45309", font_weight="600"))
+            if tick not in pm_ticks:
+                pm_ticks.add(tick)
+                result.append(_svg_text(x, string_y_base - 14, 'PM', 10, fill="#b45309", font_weight="600"))
         elif technique in ('H', 'P'):
             tc = "#2563eb"
-            result.append(_svg_text(x + 14, y - 6, technique, 9, fill=tc, font_weight="600"))
-            result.append(f'<path d="M{x + 2:g},{y - 12:g} Q{x + 10:g},{y - 20:g} {x + 18:g},{y - 12:g}" fill="none" stroke="{tc}" stroke-width="1"/>')
-        beat_xs.add(x)
-    stem_top = string_y_base + 80
-    stem_bottom = stem_top + 14
-    sorted_xs = sorted(beat_xs)
-    for bx in sorted_xs:
-        result.append(_line(bx, stem_top, bx, stem_bottom, 1, "#475569"))
-    for i in range(0, len(sorted_xs) - 1, 2):
-        result.append(_line(sorted_xs[i], stem_bottom, sorted_xs[i + 1], stem_bottom, 1.5, "#475569"))
+            # Slur from the previous note on the same string (legato source) into this note
+            earlier = [(t, px) for t, px, _, ev in in_bar if ev['string'] == event['string'] and t < tick]
+            x_from = max(earlier)[1] + 6 if earlier else x - 20
+            x_to = x - 6
+            if x_to - x_from < 6:
+                x_from = x_to - 6
+            span = x_to - x_from
+            rise = min(9.0, 4.5 + span * 0.1)
+            ctrl = span * 0.28
+            y_slur = y - 10
+            result.append(
+                f'<path class="tab-slur" d="M{x_from:g},{y_slur:g} C{x_from + ctrl:g},{y_slur - rise:g} '
+                f'{x_to - ctrl:g},{y_slur - rise:g} {x_to:g},{y_slur:g}" fill="none" stroke="{tc}" '
+                f'stroke-width="1.1" stroke-linecap="round"/>')
+            result.append(_svg_text((x_from + x_to) / 2, y_slur - rise * 0.75 - 2, technique, 8.5,
+                                    fill=tc, font_weight="700"))
+        if has_slide:
+            slide_from = event.get('slide_from_fret')
+            sc = "#0f766e"
+            up_slide = True if slide_from is None else (int(slide_from) < int(event['fret']))
+            y0, y1 = (y + 5, y - 4) if up_slide else (y - 4, y + 5)
+            result.append(f'<line class="tab-slide" x1="{x - 16:g}" y1="{y0:g}" x2="{x - 7:g}" y2="{y1:g}" '
+                          f'stroke="{sc}" stroke-width="1.4" stroke-linecap="round"/>')
+            result.append(_svg_text(x - 12, y - 7, 'S', 8.5, fill=sc, font_weight="700"))
+
+        if 0 <= tick < measure_ticks:
+            ev_ticks = max(1, round(float(event['duration']) * TICKS))
+            if tick in onsets:
+                onsets[tick][1] = min(onsets[tick][1], ev_ticks)
+            else:
+                onsets[tick] = [x, ev_ticks]
+
+    result.append(_render_tab_rhythm(onsets, measure_ticks, group_span, string_y_base))
     return ''.join(result)
 
 
 def _render_jianpu_bar(project, spans, lyrics, x_at, lyric_y, baseline):
     result = []
     shift = baseline - 246
+    previous = None  # (x, note_index) of the last rendered pitched part in this bar
     for span in spans:
         tick = span['start_tick']
         for i, part in enumerate(duration_parts(span['duration_ticks'])):
@@ -106,6 +288,27 @@ def _render_jianpu_bar(project, spans, lyrics, x_at, lyric_y, baseline):
                 octave, semitone = divmod(pitch - (60 + NAMES.index(project.tonic)), 12)
                 degree = DEGREES[semitone]
             digit = '⌒' if continuation and pitch is not None else degree[-1]
+            if pitch is not None and continuation:
+                if previous is not None and previous[1] == span['note_index']:
+                    gap = x - previous[0]
+                    if gap > 4:
+                        # The arc starts/ends beside the digits (never over their centre column), so it stays
+                        # clear of the octave dots stacked above each digit.
+                        inset = min(6.0, gap / 4)
+                        xa, xb, ya = previous[0] + inset, x - inset, baseline - 14
+                        rise = min(8.0, 3.5 + (xb - xa) * 0.07)
+                        ctrl = (xb - xa) * 0.28
+                        result.append(
+                            f'<path class="jp-tie" d="M{xa:g},{ya:g} C{xa + ctrl:g},{ya - rise:g} '
+                            f'{xb - ctrl:g},{ya - rise:g} {xb:g},{ya:g}" fill="none" stroke="{TIE_INK}" '
+                            f'stroke-width="1.15" stroke-linecap="round"/>')
+                elif previous is None and i == 0:
+                    xa, xb, ya = x - 16.0, x - 5.0, baseline - 14
+                    result.append(
+                        f'<path class="jp-tie" d="M{xa:g},{ya:g} C{xa + 3.2:g},{ya - 4.5:g} '
+                        f'{xb - 3.2:g},{ya - 4.5:g} {xb:g},{ya:g}" fill="none" stroke="{TIE_INK}" '
+                        f'stroke-width="1.15" stroke-linecap="round"/>')
+            previous = (x, span['note_index']) if pitch is not None else None
             result.append(_svg_text(x, baseline, digit, 17, fill="#1E1612", **{'data-note-index': span['note_index']}))
             if len(degree) > 1 and not continuation:
                 result.append(_svg_text(x - 11, 240 + shift, degree[:-1], 11, fill="#1E1612"))
@@ -118,7 +321,8 @@ def _render_jianpu_bar(project, spans, lyrics, x_at, lyric_y, baseline):
             for dot in range(part['dots']):
                 result.append(f'<circle cx="{x + 10 + dot * 4:g}" cy="{241 + shift:g}" r="1.5" fill="#1E1612"/>')
             if part['tuplet']:
-                result.append(_svg_text(x, 218 + shift, '3', 10, fill="#1E1612"))
+                tuplet_y = 223 + shift - max(0, octave) * 6
+                result.append(_svg_text(x, tuplet_y, '3', 9.5, fill="#5C4938", font_style="italic"))
             for offset in range(TICKS, part['ticks'], TICKS):
                 result.append(_svg_text(x_at(tick + offset), baseline, '—', 15, fill="#5C4938"))
             if pitch is not None and not continuation and lyrics:
@@ -136,7 +340,49 @@ DIAGRAM_Y_TOP = 42
 DIAGRAM_Y_BOTTOM = DIAGRAM_Y_TOP + 48
 TAB_Y_BASE = 122
 TAB_Y_BOTTOM = TAB_Y_BASE + 75
-STEM_BOTTOM = TAB_Y_BASE + 92
+STEM_BOTTOM = TAB_Y_BASE + 94
+
+
+SCORE_CSS = (
+    'body{background:#FFFDF9;color:#1E1612;margin:0 auto;max-width:1040px;padding:14px 18px;'
+    'font-family:"Noto Serif SC","Songti SC","Noto Sans SC","Microsoft YaHei",sans-serif;'
+    'line-height:1.45}'
+    # Urtext title block: one serif hero title, a hairline-ruled metadata line, a whisper-quiet legend
+    'h1{text-align:center;font-family:"Noto Serif SC","Songti SC","Source Han Serif SC","STSong",Georgia,serif;'
+    'font-size:22px;font-weight:600;letter-spacing:.12em;text-indent:.12em;line-height:1.35;color:#1E1612;'
+    'margin:10px 0 12px}'
+    '.meta-bar{margin:0 0 10px;display:flex;flex-wrap:wrap;justify-content:center;row-gap:6px;'
+    'font-size:11.5px;letter-spacing:.08em;color:#5A4638;font-variant-numeric:tabular-nums}'
+    '.pill{display:inline-block;padding:0 13px;line-height:1.15;white-space:nowrap}'
+    '.pill+.pill{border-left:1px solid #CDBFA9}'
+    '.legend{text-align:center;font-size:10px;letter-spacing:.06em;color:#A08E7C;margin:0 0 12px;'
+    'border-bottom:1px solid #E6DEC8;padding-bottom:12px}'
+    '.score-system{display:block;width:100%;max-width:1000px;margin:6px auto;overflow:visible}'
+    # Interactive layer
+    '.score-bar{cursor:pointer}'
+    '.score-bar-hit{transition:fill .12s ease}'
+    '.score-bar:hover .score-bar-hit{fill:rgba(180, 83, 9, 0.03)}'
+    '.score-bar-highlight{fill:rgba(203, 161, 82, 0.11);stroke:rgba(176, 134, 62, 0.2);stroke-width:0.6;'
+    'pointer-events:none}'
+    '.score-hover-guide{stroke:rgba(120, 90, 70, 0.35);stroke-width:1;stroke-dasharray:3,3;pointer-events:none}'
+    # Multiply blending keeps the black fret digits fully legible underneath the needle
+    '.score-playhead{pointer-events:none;mix-blend-mode:multiply}'
+    '.score-playhead-line{stroke:#C4472B;stroke-width:1.6;stroke-linecap:butt}'
+    '.score-playhead-cap{fill:#C4472B;stroke:none;transform-box:fill-box;transform-origin:center;'
+    'transform:scale(.62)}'
+    '.jp-active{fill:#B45309 !important;font-weight:800}'
+    '.lyric-active{fill:#9A3412 !important;font-weight:700}'
+    '.tab-active rect{fill:#FEF3C7 !important}'
+    '.tab-active text{fill:#C2410C !important;font-weight:800}'
+    # Print: ink only, no interactive chrome
+    '@media print{body{margin:0;padding:12px;max-width:none}'
+    '.score-system{break-inside:avoid;max-width:none}h1{margin-top:0}'
+    '.score-playhead, .score-bar-highlight, .score-hover-guide { display: none !important; }'
+    '.score-bar{cursor:auto}'
+    '.score-bar-hit,.score-bar:hover .score-bar-hit{fill:transparent !important}'
+    '.jp-active,.lyric-active,.tab-active text{fill:#0f172a !important;font-weight:inherit !important}'
+    '.tab-active rect{fill:#ffffff !important}}'
+)
 
 
 def render_publication_score_html(
@@ -166,9 +412,11 @@ def render_publication_score_html(
                 width = max(width, ((wa + wb) / 2 + 14) * measure / dt + 2 * padding)
         if anchors:
             width = max(width, anchors[0][1] + 70, anchors[-1][1] + 70)
-        # Keep every bar width uniform and bounded so 4 bars per row display at crisp publication scale
-        widths.append(min(360.0, max(320.0, width)))
-        paddings.append(padding)
+        # Keep every bar width uniform and bounded so 4 bars per row display at crisp publication scale.
+        # Rounded to 2 decimals so the data-x-left / data-x-pad / data-bar-width attributes (":g") reproduce the
+        # exact geometry used for drawing — the JS time<->x mapping must be a true bijection.
+        widths.append(round(min(360.0, max(320.0, width)), 2))
+        paddings.append(round(padding, 2))
 
     clef_margin = 44
 
@@ -180,13 +428,17 @@ def render_publication_score_html(
                    for spans in timeline['bars'][first:end] for s in spans if s['pitch'] is not None), default=0)
         high = max((max(0, (s['pitch'] - (60 + NAMES.index(project.tonic))) // 12)
                     for spans in timeline['bars'][first:end] for s in spans if s['pitch'] is not None), default=0)
-        baseline = max(246, 232 + high * 6)
+        has_tuplet = any(p['tuplet'] for spans in timeline['bars'][first:end] for s in spans for p in duration_parts(s['duration_ticks']))
+        baseline = max(254 if has_tuplet else 248, 236 + high * 6 + (8 if has_tuplet else 0))
         lyric_y = max(baseline + 30, baseline + 22 + low * 6)
         height = lyric_y + 18
         total = clef_margin + sum(widths[first:end])
         # If the final row has fewer than bars_per_row bars, pad viewBox width to a full row so scale stays identical
         view_width = total if row_count == bars_per_row else clef_margin + sum(widths[first:end]) * (bars_per_row / max(1, row_count))
         content = []
+
+        # Background interactive layer (behind every bar group)
+        content.append(f'<rect class="score-bar-highlight" x="0" y="4" width="0" height="{height - 8:g}" rx="6" style="display:none"/>')
 
         content.append(_svg_text(14, CHORD_NAME_Y, '和弦', 10, fill="#785A46", font_weight="600", text_anchor="start"))
         content.append(_svg_text(10, TAB_Y_BASE + 12, 'T', 12, fill="#785A46", font_weight="700", text_anchor="start"))
@@ -202,6 +454,7 @@ def render_publication_score_html(
         content.append(_line(clef_margin, TAB_Y_BASE, clef_margin, TAB_Y_BASE + 75, 1.6, "#1E1612"))
 
         left = float(clef_margin)
+        arr_for_tab = dict(arrangement, meter=project.meter)
         for index in range(first, end):
             width = widths[index]
             spans = timeline['bars'][index]
@@ -210,7 +463,10 @@ def render_publication_score_html(
             def x_at(tick, _left=left, _padding=padding, _width=width):
                 return _left + _padding + tick / measure * (_width - 2 * _padding)
 
-            content.append(f'<g role="group" aria-label="Bar {index + 1}">')
+            content.append(
+                f'<g class="score-bar" role="group" aria-label="Bar {index + 1}" data-bar-index="{index}" '
+                f'data-x-left="{left:g}" data-x-pad="{padding:g}" data-bar-width="{width:g}">')
+            content.append(f'<rect class="score-bar-hit" x="{left:g}" y="0" width="{width:g}" height="{height:g}" fill="transparent"/>')
 
             bar_info = analysis.get(index, {})
             section = bar_info.get('section', '')
@@ -218,30 +474,44 @@ def render_publication_score_html(
                 content.append(f'<rect x="{left + 2:g}" y="2" width="{len(section) * 8 + 12}" height="14" rx="3" fill="#FEF3C7" stroke="#D97706" stroke-width="0.6"/>')
                 content.append(_svg_text(left + 8 + len(section) * 4, 11, section, 8.5, fill="#92400E", font_weight="700", text_anchor="middle"))
 
-            content.append(f'<rect x="{left + 4:g}" y="{TAB_Y_BASE - 18:g}" width="22" height="13" rx="3" fill="#F5EFE6"/>')
-            content.append(_svg_text(left + 15, TAB_Y_BASE - 8, f'#{index + 1}', 9, fill="#785A46", font_weight="700"))
+            # Classical bar-number engraving: a small italic numeral above the system, no box
+            content.append(_svg_text(left + 5, TAB_Y_BASE - 7, f'#{index + 1}', 9, fill="#A0785F",
+                                     font_style="italic", font_family="Georgia, Times New Roman, serif",
+                                     text_anchor="start"))
 
             if index < len(arrangement['bars']):
                 bar = arrangement['bars'][index]
                 segments = bar['split_segments'] if 'split_segments' in bar else [bar]
                 for part_idx, supplied in enumerate(segments):
                     segment = dict(supplied)
-                    center = left + (part_idx + 0.5) * width / len(segments)
+                    seg_x0 = left if part_idx == 0 else x_at(float(segment.get('beat', 0.0)) * TICKS)
+                    if part_idx + 1 < len(segments):
+                        seg_x1 = x_at(float(segments[part_idx + 1].get('beat', 0.0)) * TICKS)
+                    else:
+                        seg_x1 = left + width
+                    center = 0.5 * (seg_x0 + seg_x1)
                     content.append(_svg_text(center, CHORD_NAME_Y, segment['chord'], 16, fill="#1E1612", font_weight="700"))
                     content.append(_chord_diagram(center, DIAGRAM_Y_TOP, segment))
 
                     if len(segments) > 1 and part_idx < len(segments) - 1:
-                        div_x = left + (part_idx + 1) * width / len(segments)
-                        content.append(f'<line x1="{div_x:g}" y1="{ZONE1_TOP:g}" x2="{div_x:g}" y2="{DIAGRAM_Y_BOTTOM + 8:g}" stroke="#D6C7B2" stroke-width="1" stroke-dasharray="4,3"/>')
+                        content.append(f'<line x1="{seg_x1:g}" y1="{ZONE1_TOP:g}" x2="{seg_x1:g}" y2="{DIAGRAM_Y_BOTTOM + 8:g}" stroke="#D6C7B2" stroke-width="1" stroke-dasharray="4,3"/>')
 
-            content.append(_render_tab_bar(arrangement, index, x_at, width, left, TAB_Y_BASE))
+            content.append(_render_tab_bar(arr_for_tab, index, x_at, width, left, TAB_Y_BASE))
             content.append(_render_jianpu_bar(project, spans, note_lyrics, x_at, lyric_y, baseline))
             content.append('</g>')
             left += width
 
+        # Foreground interactive layer (above every bar group)
+        content.append(f'<line class="score-hover-guide" x1="0" y1="8" x2="0" y2="{height - 8:g}" style="display:none"/>')
+        content.append(
+            f'<g class="score-playhead" style="display:none">'
+            f'<line class="score-playhead-line" x1="0" y1="6" x2="0" y2="{height - 6:g}"/>'
+            f'<circle class="score-playhead-cap" cx="0" cy="8" r="3.8"/></g>')
+
         systems.append(
             f'<svg xmlns="http://www.w3.org/2000/svg" class="score-system" role="img" '
             f'aria-label="Score bars {first + 1}–{end}" '
+            f'data-bar-start="{first}" data-bar-end="{end}" data-measure-ticks="{measure}" '
             f'viewBox="0 0 {view_width:g} {height:g}" width="100%" '
             f'style="width:100%">'
             + ''.join(content) + '</svg>')
@@ -252,10 +522,12 @@ def render_publication_score_html(
     capo_label = f'变调夹夹第 {capo} 品' if capo > 0 else '不夹变调夹 (原调)'
     style_label = arrangement.get('style', '')
 
+    # Detected tempi such as 90.909 read as a whole number; genuinely fractional ones keep one decimal
+    bpm_disp = f'{round(project.bpm)}' if abs(project.bpm - round(project.bpm)) < 0.15 else f'{project.bpm:.1f}'
     meta_pills = [
         f'1 = {project.tonic}',
         project.meter,
-        f'速度 {project.bpm:g}',
+        f'速度 {bpm_disp}',
         capo_label,
     ]
     if style_label:
@@ -266,27 +538,12 @@ def render_publication_score_html(
     )
 
     legend = (
-        '依据人声主旋律生成 · 上方：左手和弦按法图 · 中间：艺术木吉他六线谱 · 下方：人声主唱简谱与唱词'
-    )
-
-    css = (
-        'body{background:#FFFDF9;color:#1E1612;margin:0 auto;max-width:1040px;padding:14px 18px;'
-        'font-family:"Noto Serif SC","Songti SC","Noto Sans SC","Microsoft YaHei",sans-serif;'
-        'line-height:1.45}'
-        'h1{text-align:center;font-size:18px;font-weight:700;color:#1E1612;margin:0 0 6px}'
-        '.meta-bar{text-align:center;margin:0 0 6px;display:flex;flex-wrap:wrap;justify-content:center;gap:6px}'
-        '.pill{display:inline-block;padding:2px 10px;background:#F5EFE6;border:1px solid #D6C7B2;'
-        'border-radius:16px;font-size:11.5px;color:#5C4938;font-weight:600}'
-        '.legend{text-align:center;font-size:11px;color:#8C7A6B;margin:0 0 10px;'
-        'border-bottom:1px solid #E6DEC8;padding-bottom:8px}'
-        '.score-system{display:block;width:100%;max-width:1000px;margin:6px auto;overflow:visible}'
-        '@media print{body{margin:0;padding:12px;max-width:none}'
-        '.score-system{break-inside:avoid;max-width:none}h1{margin-top:0}}'
+        '原曲和声基底与人声主旋律联合编配 · 上方：左手和弦按法图 · 中间：艺术木吉他六线谱 · 下方：人声主唱简谱与唱词'
     )
 
     return (
         '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>' + title
-        + '</title><style>' + css + '</style></head><body>'
+        + '</title><style>' + SCORE_CSS + '</style></head><body>'
         + '<h1>' + title + '</h1>'
         + '<div class="meta-bar">' + meta_html + '</div>'
         + '<p class="legend">' + escape(legend, quote=True) + '</p>'

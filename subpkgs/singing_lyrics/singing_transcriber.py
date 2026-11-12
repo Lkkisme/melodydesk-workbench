@@ -14,7 +14,7 @@ import singing_model
 
 
 AS_MAJOR = (0.238, 0.006, 0.111, 0.006, 0.137, 0.094, 0.016, 0.214, 0.009, 0.080, 0.008, 0.081)
-AS_MINOR = (0.220, 0.006, 0.104, 0.123, 0.019, 0.103, 0.012, 0.214, 0.062, 0.022, 0.061, 0.052)
+AS_MINOR = (0.220, 0.006, 0.104, 0.123, 0.019, 0.103, 0.012, 0.214, 0.062, 0.022, 0.072, 0.043)
 
 
 def estimate_key_albrecht_shanahan(notes: list) -> dict:
@@ -186,7 +186,7 @@ def _pitch_candidates(n, profile: list, tonic_k: int) -> list[int]:
     conf_i = max(0.35, float(getattr(n, 'confidence', 1.0)))
     rel0 = (p0 % 12 - tonic_k) % 12
     if (getattr(n, 'edited', False) or profile[rel0] > 0.05
-            or float(n.duration) > 1.25 or conf_i > 0.92):
+            or float(n.duration) > 1.25 or (conf_i > 0.92 and float(n.duration) > 0.55)):
         return [p0]
     return [p0] + [p for p in (p0 - 1, p0 + 1) if 21 <= p <= 108]
 
@@ -376,7 +376,7 @@ def regulate_singing_notes_for_score(
     merge_gap_tau = 0.05 * dur_scale * gap_scale
     merge_max_prev_dur = 0.16 * dur_scale
     scoop_gap_tau = 0.07 * dur_scale * gap_scale
-    scoop_max_prev_dur = 0.21 * dur_scale
+    scoop_max_prev_dur = max(0.21 * dur_scale, min(0.30, 0.42 * spb))
 
     merged: list = []
     for n in filtered:
@@ -525,16 +525,16 @@ def regulate_singing_notes_for_score(
             eff_grid *= 0.5
 
     phrases: list[list] = []
-    prev_end_sec = 0.0
+    prev_end_sec = -math.inf
+    cont_starts: dict[int, float] = {}
     for n in deduped:
-        s_sec = float(beats_to_seconds_piecewise(n.start + origin_beat, beat_times, bpm, beat_origin)) if use_piecewise else (beat_origin + n.start * spb)
-        e_sec = float(beats_to_seconds_piecewise(n.start + n.duration + origin_beat, beat_times, bpm, beat_origin)) if use_piecewise else (s_sec + n.duration * spb)
+        cont_starts[id(n)] = float(n.start)
+        s_sec = float(n.raw_start)
+        e_sec = float(n.raw_start + n.raw_duration)
         if not phrases or (s_sec - prev_end_sec) > 0.45:
             phrases.append([])
         phrases[-1].append(n)
-        prev_end_sec = max(s_sec, e_sec)
-        n.raw_start = max(0.0, n.start * spb)
-        n.raw_duration = max(0.065, n.duration * spb)
+        prev_end_sec = max(prev_end_sec, s_sec, e_sec)
         n.start = max(0.0, round(round(n.start / eff_grid) * eff_grid, 10))
         n.duration = max(eff_grid, round(round(n.duration / eff_grid) * eff_grid, 10))
 
@@ -544,22 +544,33 @@ def regulate_singing_notes_for_score(
         can_organize = (
             abs(eff_grid - 0.25) <= 1e-6
             and not any(getattr(x, 'edited', False) for x in phrase)
-            and all((b.raw_start - a.raw_start) >= 0.25 * spb - 1e-6 for a, b in zip(phrase, phrase[1:]))
+            and all((cont_starts[id(b)] - cont_starts[id(a)]) >= 0.25 - 1e-6 for a, b in zip(phrase, phrase[1:]))
         )
         if can_organize:
-            cand_org = score_cleanup.organize(phrase, bpm, 0.0, 'auto')
-            grid_ok = not any(
-                abs(round(x.start / eff_grid) * eff_grid - x.start) > 1e-6
-                or abs(round(x.duration / eff_grid) * eff_grid - x.duration) > 1e-6
-                for x in cand_org
-            )
-            clip_ok = True
-            if max_beats_early is not None:
-                in_before = sum(1 for x in phrase if x.start < max_beats_early - 1e-6)
-                in_after = sum(1 for x in cand_org if x.start < max_beats_early - 1e-6)
-                clip_ok = in_after >= in_before
-            if grid_ok and clip_ok:
-                organized = cand_org
+            try:
+                cand_org = score_cleanup.organize(
+                    phrase,
+                    bpm,
+                    beat_origin,
+                    'auto',
+                    beat_times=beat_times if use_piecewise else None,
+                    max_beat=max_beats_early,
+                )
+            except ValueError:
+                cand_org = None
+            if cand_org is not None:
+                grid_ok = not any(
+                    abs(round(x.start / eff_grid) * eff_grid - x.start) > 1e-6
+                    or abs(round(x.duration / eff_grid) * eff_grid - x.duration) > 1e-6
+                    for x in cand_org
+                )
+                clip_ok = True
+                if max_beats_early is not None:
+                    in_before = sum(1 for x in phrase if x.start < max_beats_early - 1e-6)
+                    in_after = sum(1 for x in cand_org if x.start < max_beats_early - 1e-6)
+                    clip_ok = in_after >= in_before
+                if grid_ok and clip_ok:
+                    organized = cand_org
         if organized is not None:
             raw_result.extend(organized)
         else:
@@ -596,19 +607,20 @@ def regulate_singing_notes_for_score(
                 beat_origin=beat_origin,
             )
 
+    _MIN_TICK_BEAT = 1.0 / 48.0
     max_beats = None
     if clip_duration > 0.0 and clip_duration > beat_origin:
         if use_piecewise:
-            max_beats = max(1e-4, float(seconds_to_beats_piecewise(clip_duration, beat_times, bpm, beat_origin)) - origin_beat)
+            max_beats = max(_MIN_TICK_BEAT, float(seconds_to_beats_piecewise(clip_duration, beat_times, bpm, beat_origin)) - origin_beat)
         else:
-            max_beats = max(1e-4, (clip_duration - beat_origin) / spb)
-        result = [n for n in result if n.start < max_beats - 1e-6]
+            max_beats = max(_MIN_TICK_BEAT, (clip_duration - beat_origin) / spb)
+        result = [n for n in result if round(max_beats * 48) - round(n.start * 48) >= 1 and n.start < max_beats - 1e-6]
 
     cleaned_result: list = []
     for i, n in enumerate(result):
         if i + 1 < len(result):
             max_dur = result[i + 1].start - n.start
-            if max_dur <= 1e-6:
+            if max_dur <= 1e-6 or round(result[i + 1].start * 48) <= round(n.start * 48):
                 continue
             if n.duration > max_dur:
                 n.duration = max_dur
@@ -619,16 +631,46 @@ def regulate_singing_notes_for_score(
             if n.duration > rem_beats:
                 n.duration = rem_beats
         n.duration = max(1e-4, float(n.duration))
-        if use_piecewise:
-            s_sec = float(beats_to_seconds_piecewise(n.start + origin_beat, beat_times, bpm, beat_origin))
-            e_sec = float(beats_to_seconds_piecewise(n.start + n.duration + origin_beat, beat_times, bpm, beat_origin))
-        else:
-            s_sec = beat_origin + n.start * spb
-            e_sec = s_sec + n.duration * spb
-        s_sec_c = max(0.0, s_sec)
-        e_sec_c = max(s_sec_c + 1e-4, e_sec)
-        n.raw_start = round(s_sec_c, 6)
-        n.raw_duration = round(max(1e-4, e_sec_c - s_sec_c), 6)
+        if round((n.start + n.duration) * 48) <= round(n.start * 48):
+            continue
         cleaned_result.append(n)
+
+    raw_starts_phys: list[float] = []
+    raw_ends_phys: list[float] = []
+    for n in cleaned_result:
+        if getattr(n, 'edited', False):
+            if use_piecewise:
+                s_sec = float(beats_to_seconds_piecewise(n.start + origin_beat, beat_times, bpm, beat_origin))
+                e_sec = float(beats_to_seconds_piecewise(n.start + n.duration + origin_beat, beat_times, bpm, beat_origin))
+            else:
+                s_sec = beat_origin + n.start * spb
+                e_sec = s_sec + n.duration * spb
+        else:
+            s_sec = float(n.raw_start)
+            e_sec = float(n.raw_start) + max(1e-4, float(n.raw_duration))
+        s_sec = max(0.0, s_sec)
+        if clip_duration > 0.0 and clip_duration > beat_origin:
+            s_sec = min(s_sec, max(0.0, clip_duration - 1e-4))
+            e_sec = min(e_sec, clip_duration)
+        raw_starts_phys.append(s_sec)
+        raw_ends_phys.append(max(s_sec + 1e-4, e_sec))
+
+    prev_end_r = 0.0
+    for i, n in enumerate(cleaned_result):
+        s_sec = max(prev_end_r, raw_starts_phys[i])
+        e_sec = max(s_sec + 1e-4, raw_ends_phys[i])
+        if i + 1 < len(cleaned_result) and raw_starts_phys[i + 1] > s_sec + 1e-4:
+            e_sec = min(e_sec, raw_starts_phys[i + 1])
+        s_r = round(s_sec, 6)
+        if s_r < prev_end_r:
+            s_r = prev_end_r
+        d_r = round(max(1e-4, e_sec - s_r), 6)
+        if i + 1 < len(cleaned_result):
+            next_s_r = round(raw_starts_phys[i + 1], 6)
+            if next_s_r > s_r + 1e-4 and s_r + d_r > next_s_r:
+                d_r = round(max(1e-4, next_s_r - s_r), 6)
+        n.raw_start = s_r
+        n.raw_duration = max(1e-4, d_r)
+        prev_end_r = round(s_r + n.raw_duration, 6)
 
     return cleaned_result

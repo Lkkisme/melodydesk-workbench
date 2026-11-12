@@ -17,14 +17,12 @@
       --accent: #B45309;
       --accent-deep: #7C2D12;
       --accent-soft: rgba(180, 83, 9, 0.10);
-      --led: #D97706;
       --danger: #B91C1C;
-      --shadow: 0 1px 3px rgba(74,48,28,0.05), 0 8px 24px -4px rgba(74,48,28,0.07);
-      --purfling: 0 0 0 1px var(--card), 0 0 0 2px rgba(124,45,18,0.55), 0 0 0 4px var(--card), 0 0 0 5px rgba(124,45,18,0.22);
+      --rail: #FAF6EF;
+      --rail-w: 312px;
+      --shadow: 0 1px 2px rgba(74,48,28,0.04), 0 14px 36px -18px rgba(74,48,28,0.16);
       --serif: "Noto Serif SC", "Songti SC", "Source Han Serif SC", "Playfair Display", Georgia, serif;
       --mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
-      --r-lg: 14px;
-      --r-md: 10px;
     }
     * { box-sizing: border-box; }
     html, body {
@@ -37,29 +35,27 @@
     svg.i { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
     .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; letter-spacing: 0.02em; }
 
-    /* Header */
+    /* Shell: top atelier bar · collapsible rail + concert stand · pinned transport dock */
+    body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
     .topbar {
-      height: 58px; padding: 0 20px;
-      display: flex; align-items: center; justify-content: space-between;
-      background: rgba(245, 239, 230, 0.9); backdrop-filter: blur(10px);
-      border-bottom: 1px solid var(--hair); box-shadow: 0 3px 0 -2px rgba(124,45,18,0.18);
+      height: 48px; flex-shrink: 0; padding: 0 14px 0 18px;
+      display: flex; align-items: center; gap: 20px;
+      background: var(--canvas); border-bottom: 1px solid var(--hair);
     }
-    .brand { display: flex; align-items: center; gap: 11px; }
-    .brand-mark { width: 36px; height: 36px; border-radius: 50%; background: radial-gradient(circle at 50% 50%, #3A2618 0 38%, #1E1612 39%); display: grid; place-items: center; box-shadow: 0 0 0 1px rgba(180,83,9,0.5), 0 2px 6px rgba(30,22,18,0.25); }
-    .brand-mark svg { width: 32px; height: 32px; }
-    .brand-title { font-family: var(--serif); font-size: 16px; font-weight: 700; letter-spacing: 0.04em; }
-    .brand-sub { font-family: var(--serif); font-style: italic; font-size: 11.5px; color: var(--ink-3); margin-left: 2px; }
-    .status-pill {
-      display: inline-flex; align-items: center; gap: 7px; margin-left: 8px;
-      padding: 3px 10px; border-radius: 999px; border: 1px solid var(--hair-strong);
-      background: var(--card); color: var(--accent-deep); font-size: 9.5px; letter-spacing: 0.06em;
+    .brand { display: flex; align-items: baseline; gap: 9px; min-width: 0; flex: 1 1 auto; }
+    .brand-mark { width: 22px; height: 22px; align-self: center; flex-shrink: 0; color: var(--ink); }
+    .brand-mark svg { display: block; width: 22px; height: 22px; }
+    .brand-title { font-family: var(--serif); font-size: 16px; font-weight: 700; letter-spacing: 0.16em; white-space: nowrap; }
+    .brand-sub { font-family: var(--serif); font-style: italic; font-size: 12px; color: var(--ink-3); white-space: nowrap; }
+    /* The loaded song is a quiet breadcrumb; the engraved title on the sheet is the only hero title */
+    #score-title-text {
+      min-width: 0; margin-left: 5px; padding-left: 14px; border-left: 1px solid var(--hair-strong);
+      font-family: var(--serif); font-size: 12px; color: var(--ink-2);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .led { width: 6px; height: 6px; border-radius: 50%; background: var(--led); box-shadow: 0 0 0 3px rgba(217,119,6,0.16), 0 0 6px rgba(217,119,6,0.65); }
-    .led.amber { background: var(--accent); box-shadow: 0 0 0 3px rgba(180,83,9,0.14), 0 0 6px rgba(180,83,9,0.6); }
-    .top-right { display: flex; align-items: center; gap: 8px; }
-    .readout { color: var(--ink-2); font-size: 11.5px; padding-right: 10px; margin-right: 2px; border-right: 1px solid var(--hair); }
-    .readout .sep { color: var(--ink-3); margin: 0 6px; }
-    .readout .k { color: var(--ink-3); margin-right: 4px; font-family: var(--serif); }
+    .top-right { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+    .readout { display: flex; align-items: baseline; gap: 18px; padding-right: 16px; margin-right: 8px; border-right: 1px solid var(--hair); color: var(--ink-2); font-size: 11px; white-space: nowrap; }
+    .btn.ghost.active { background: var(--accent-soft); color: var(--accent-deep); }
 
     .btn {
       display: inline-flex; align-items: center; justify-content: center; gap: 6px;
@@ -75,105 +71,129 @@
     .btn.ghost:hover { background: rgba(74,48,28,0.06); }
     .btn.sq { width: 30px; padding: 0; }
 
-    /* Layout */
-    .layout { display: grid; grid-template-columns: 400px 1fr; height: calc(100vh - 58px); }
-    .console { overflow-y: auto; padding: 16px 14px 24px 18px; display: flex; flex-direction: column; gap: 12px; }
-    .module { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); box-shadow: var(--shadow); padding: 14px; }
-    .mod-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 3px double rgba(124,45,18,0.18); }
-    .mod-idx { font-family: var(--serif); font-size: 12px; color: var(--accent); font-weight: 700; font-style: italic; }
-    .mod-title { font-family: var(--serif); font-size: 14px; font-weight: 700; letter-spacing: 0.02em; }
-    .mod-spec { margin-left: auto; font-family: var(--mono); font-size: 9px; color: var(--ink-3); letter-spacing: 0.1em; text-transform: uppercase; }
-
-    /* 01 Repertoire */
-    .track-list { display: flex; flex-direction: column; gap: 6px; }
-    .track {
-      display: flex; align-items: center; gap: 12px; width: 100%; padding: 10px 12px;
-      border: 1px solid var(--hair); border-radius: var(--r-md); background: var(--card);
-      text-align: left; cursor: pointer; transition: border-color .12s, background .12s, box-shadow .12s;
+    /* Layout: the rail collapses to 0 in focus mode; its inner column keeps a fixed width so nothing reflows mid-slide */
+    .layout {
+      flex: 1; min-height: 0; display: grid;
+      grid-template-columns: var(--rail-w) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr);
+      transition: grid-template-columns .34s cubic-bezier(.4, 0, .2, 1);
     }
-    .track:hover { background: #FBF6EE; border-color: var(--hair-strong); }
-    .track.active { border-color: transparent; background: #FFF9F0; box-shadow: var(--purfling); }
-    .track-ico { width: 30px; height: 30px; border-radius: 50%; background: var(--well); color: var(--ink-2); display: grid; place-items: center; font-family: var(--serif); font-weight: 700; font-size: 12px; flex-shrink: 0; }
-    .track.active .track-ico { background: var(--ink); color: #F5C77E; }
-    .track-body { flex: 1; min-width: 0; }
-    .track-name { font-family: var(--serif); font-size: 13px; font-weight: 700; display: flex; align-items: baseline; gap: 6px; }
-    .track-name .en { font-family: var(--serif); font-style: italic; font-weight: 400; font-size: 11px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .track-meta { font-size: 10.5px; color: var(--ink-3); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .track-tag { flex-shrink: 0; font-size: 9.5px; color: var(--accent-deep); background: var(--accent-soft); border: 1px solid rgba(180,83,9,0.18); padding: 1px 6px; border-radius: 4px; }
-    .track .led { opacity: 0; flex-shrink: 0; }
-    .track.active .led { opacity: 1; }
-    #song-upload-toggle { border-style: dashed; }
-    #upload-panel { margin-top: 10px; padding: 12px; border-radius: var(--r-md); background: var(--well); }
+    body.zen .layout { grid-template-columns: 0px minmax(0, 1fr); }
+    .console {
+      min-width: 0; overflow-x: hidden; overflow-y: auto; background: var(--rail); border-right: 1px solid var(--hair);
+      scrollbar-width: thin; scrollbar-color: var(--hair-strong) transparent; transition: opacity .2s ease, border-color .2s ease;
+    }
+    body.zen .console { opacity: 0; pointer-events: none; border-right-color: transparent; }
+    .rail-inner { width: var(--rail-w); padding: 2px 0 18px; }
+    .module { padding: 16px 16px 14px; border-bottom: 1px solid var(--hair); }
+    .mod-head { display: flex; align-items: baseline; gap: 8px; margin: 0 2px 10px; }
+    .mod-title { font-family: var(--serif); font-size: 13px; font-weight: 700; letter-spacing: 0.16em; color: var(--ink); }
+    .mod-spec { margin-left: auto; font-family: var(--serif); font-style: italic; font-size: 11px; color: var(--ink-3); }
+    .colophon { margin: 0; padding: 14px 18px 0; font-size: 10px; line-height: 1.7; color: var(--ink-3); }
+
+    /* I · Repertoire — liner-note rows: tabular index, one-line title, one-line credit, right-aligned duration */
+    .track-list { display: flex; flex-direction: column; }
+    .track {
+      display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; align-items: center; column-gap: 10px;
+      width: 100%; padding: 7px 8px 7px 6px; border: 0; border-top: 1px solid var(--hair); border-radius: 0;
+      background: transparent; text-align: left; cursor: pointer; transition: background .12s;
+    }
+    .track:first-child { border-top-color: transparent; }
+    .track:hover { background: rgba(74,48,28,0.04); }
+    .track.active { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+    .track-ico { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 10.5px; color: var(--ink-3); text-align: right; }
+    .track-ico svg.i { display: inline-block; vertical-align: -2px; width: 12px; height: 12px; }
+    .track.active .track-ico { color: var(--accent); }
+    .track-body { display: block; min-width: 0; }
+    .track-name { font-family: var(--serif); font-size: 13.5px; font-weight: 600; line-height: 1.35; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .track-meta { font-size: 10.5px; line-height: 1.45; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .track-tag { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 10.5px; color: var(--ink-3); text-align: right; white-space: nowrap; }
+    .track.active .track-tag { color: var(--accent-deep); }
+    #song-upload-toggle .track-name { font-size: 12.5px; font-weight: 500; color: var(--ink-2); }
+    #upload-panel { margin: 10px 2px 2px; padding: 12px; border-radius: 8px; background: var(--well); }
     #upload-status { display: none; margin-top: 8px; font-size: 11.5px; color: var(--accent-deep); font-weight: 550; }
 
-    /* 02 Artistry */
-    .aes-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    /* II · Artistry — airy 2 × 2 editorial cards */
+    .aes-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
     .aes {
-      position: relative; padding: 11px 12px 12px; border-radius: var(--r-md);
-      border: 1px solid var(--hair); background: var(--card); text-align: left; cursor: pointer;
-      display: flex; flex-direction: column; gap: 6px; min-height: 116px;
-      transition: border-color .12s, background .12s, box-shadow .12s;
+      min-width: 0; padding: 9px 11px 10px; border-radius: 6px;
+      border: 1px solid var(--hair); background: transparent; text-align: left; cursor: pointer;
+      display: flex; flex-direction: column; transition: border-color .12s, background .12s;
     }
-    .aes:hover { background: #FBF6EE; border-color: var(--hair-strong); }
-    .aes.active { border-color: transparent; background: #FFF9F0; box-shadow: var(--purfling); }
-    .aes-top { display: flex; align-items: center; gap: 6px; }
-    .aes-idx { font-family: var(--serif); font-size: 11px; font-weight: 700; width: 18px; height: 18px; border-radius: 50%; display: grid; place-items: center; background: var(--well); color: var(--ink-2); }
-    .aes.active .aes-idx { background: var(--ink); color: #F5C77E; }
-    .aes .led { margin-left: auto; opacity: 0; }
-    .aes.active .led { opacity: 1; }
-    .aes-title { font-family: var(--serif); font-size: 12.5px; font-weight: 700; line-height: 1.3; }
-    .aes-en { font-size: 10px; color: var(--ink-3); font-family: var(--serif); font-style: italic; }
-    .aes-chords { font-family: var(--mono); font-size: 10px; color: var(--accent-deep); background: var(--accent-soft); padding: 2px 6px; border-radius: 4px; align-self: stretch; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .aes-desc { font-size: 11px; color: var(--ink-2); line-height: 1.4; margin-top: auto; }
+    .aes > span { min-width: 0; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .aes:hover { border-color: var(--hair-strong); background: rgba(255,253,249,0.6); }
+    .aes.active { border-color: var(--ink); background: var(--card); }
+    .aes-top { display: flex; align-items: center; justify-content: space-between; gap: 6px; height: 14px; margin-bottom: 4px; }
+    .aes-idx { font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.1em; color: var(--ink-3); }
+    .aes.active .aes-idx { color: var(--accent); }
+    .aes-title { font-family: var(--serif); font-size: 13px; font-weight: 700; line-height: 1.35; }
+    .aes-en { font-family: var(--serif); font-style: italic; font-size: 10.5px; line-height: 1.4; color: var(--ink-3); }
+    .aes-chords { margin-top: 7px; padding-top: 6px; border-top: 1px solid var(--hair); font-family: var(--mono); font-size: 9.5px; color: var(--ink-2); }
+    .aes.active .aes-chords { color: var(--accent-deep); }
+    .aes-rec-badge { display: none; font-size: 9.5px; font-weight: 600; letter-spacing: 0.04em; color: var(--accent); white-space: nowrap; }
+    .aes.recommended .aes-rec-badge, .aes.recommended-alt .aes-rec-badge { display: inline; }
+    .aes.recommended-alt .aes-rec-badge { color: var(--ink-3); font-weight: 500; }
+    .rec-hint { display: none; margin: 0 2px 10px; padding-left: 10px; border-left: 2px solid var(--accent); font-size: 11px; line-height: 1.55; color: var(--ink-2); }
+    .rec-hint b { color: var(--accent-deep); font-weight: 600; }
 
-    /* 03 Mixer */
-    .transport { display: flex; align-items: center; gap: 12px; }
-    #btn-play-toggle {
-      width: 44px; height: 44px; border-radius: 50%; border: none; flex-shrink: 0;
-      background: radial-gradient(circle at 50% 40%, #3A2618, var(--ink)); color: #F5C77E; display: grid; place-items: center; cursor: pointer;
-      box-shadow: 0 0 0 2px var(--card), 0 0 0 3px rgba(180,83,9,0.55), 0 4px 12px -2px rgba(30,22,18,0.35); transition: transform .1s;
+    /* Bottom studio transport & duet console — always above the fold */
+    .dock {
+      position: relative; z-index: 4; flex-shrink: 0; min-height: 68px; padding: 10px 20px;
+      display: flex; flex-wrap: wrap; align-items: center; align-content: center; gap: 8px 20px;
+      background: var(--card); border-top: 1px solid var(--hair-strong);
     }
-    #btn-play-toggle:active { transform: scale(0.96); }
-    #btn-play-toggle:disabled { opacity: .45; cursor: wait; }
-    #btn-play-toggle svg { width: 18px; height: 18px; fill: currentColor; stroke: none; }
-    .transport-body { flex: 1; min-width: 0; }
-    .transport-meta { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
-    #play-text { font-size: 11.5px; color: var(--ink-2); font-weight: 550; }
-    .timecode { font-size: 11px; color: var(--ink-3); }
-    .timecode b { color: var(--ink); font-weight: 600; }
-    #seek-bar { position: relative; height: 36px; border-radius: 6px; background: var(--well); cursor: pointer; touch-action: none; overflow: hidden; }
+    .dock-group { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .dock-group.ruled { height: 40px; padding-left: 20px; border-left: 1px solid var(--hair); }
+    .transport { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+    #btn-play-toggle {
+      width: 40px; height: 40px; border-radius: 50%; border: 0; flex-shrink: 0;
+      background: var(--ink); color: #FFF7EC; display: grid; place-items: center; cursor: pointer;
+      transition: transform .1s, background .12s;
+    }
+    #btn-play-toggle:hover:not(:disabled) { background: var(--accent-deep); }
+    #btn-play-toggle:active { transform: scale(0.95); }
+    #btn-play-toggle:disabled { opacity: .4; cursor: wait; }
+    #btn-play-toggle svg { width: 16px; height: 16px; fill: currentColor; stroke: none; }
+    .transport-meta { width: 176px; min-width: 0; }
+    .timecode { display: block; font-size: 11.5px; line-height: 1.35; color: var(--ink-3); }
+    .timecode b { font-size: 14px; font-weight: 600; color: var(--ink); }
+    #play-text { display: block; font-size: 10.5px; line-height: 1.4; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #seek-bar { position: relative; flex: 1 1 180px; min-width: 140px; height: 40px; border-radius: 4px; background: rgba(74,48,28,0.055); cursor: pointer; touch-action: none; overflow: hidden; }
     #seek-bar canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
     #seek-bar:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-    .faders { margin-top: 14px; display: flex; flex-direction: column; gap: 12px; padding: 12px; border-radius: var(--r-md); background: var(--well); }
-    .fader-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 11.5px; font-weight: 600; }
-    .fader-head .tag { font-family: var(--mono); font-size: 9.5px; color: var(--ink-3); font-weight: 500; letter-spacing: 0.06em; }
-    .fader-val { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--ink-2); min-width: 34px; text-align: right; }
+    .faders { gap: 18px; }
+    .fader-cell { width: 112px; }
+    .fader-head { display: flex; align-items: baseline; gap: 6px; font-size: 10.5px; font-weight: 550; line-height: 1.3; color: var(--ink-2); white-space: nowrap; }
+    .fader-val { margin-left: auto; font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 10px; color: var(--ink-3); }
     input[type="range"].fader { -webkit-appearance: none; appearance: none; width: 100%; height: 18px; margin: 0; background: transparent; cursor: pointer; --pct: 50%; }
-    input[type="range"].fader::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: linear-gradient(to right, var(--ink) var(--pct), rgba(74,48,28,0.14) var(--pct)); }
-    input[type="range"].fader::-moz-range-track { height: 4px; border-radius: 2px; background: rgba(74,48,28,0.14); }
-    input[type="range"].fader::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--ink); }
-    input[type="range"].fader::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; margin-top: -6px; border-radius: 50%; background: #FFFDF9; border: 1px solid var(--hair-strong); box-shadow: 0 1px 3px rgba(30,22,18,0.22); }
-    input[type="range"].fader::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: #FFFDF9; border: 1px solid var(--hair-strong); box-shadow: 0 1px 3px rgba(30,22,18,0.22); }
+    input[type="range"].fader::-webkit-slider-runnable-track { height: 2px; border-radius: 1px; background: linear-gradient(to right, var(--ink) var(--pct), rgba(74,48,28,0.14) var(--pct)); }
+    input[type="range"].fader::-moz-range-track { height: 2px; border-radius: 1px; background: rgba(74,48,28,0.14); }
+    input[type="range"].fader::-moz-range-progress { height: 2px; border-radius: 1px; background: var(--ink); }
+    input[type="range"].fader::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; margin-top: -5px; border-radius: 50%; background: #FFFDF9; border: 1px solid var(--hair-strong); box-shadow: 0 1px 3px rgba(30,22,18,0.22); }
+    input[type="range"].fader::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #FFFDF9; border: 1px solid var(--hair-strong); box-shadow: 0 1px 3px rgba(30,22,18,0.22); }
     input[type="range"].fader.accent::-webkit-slider-runnable-track { background: linear-gradient(to right, var(--accent) var(--pct), rgba(74,48,28,0.14) var(--pct)); }
     input[type="range"].fader.accent::-moz-range-progress { background: var(--accent); }
 
-    .scene-row { display: flex; gap: 6px; margin-top: 10px; }
-    .scene { flex: 1; height: 28px; padding: 0 8px; border-radius: 999px; border: 1px solid var(--hair-strong); background: var(--card); font-size: 11.5px; font-weight: 550; color: var(--ink-2); cursor: pointer; }
-    .scene:hover { color: var(--ink); background: #FBF6EE; }
-    .scene.active { background: var(--ink); border-color: var(--ink); color: #F5C77E; }
-    .export-row { margin-top: 8px; }
-    .export-row .btn { width: 100%; }
+    .scene-row { display: flex; padding: 2px; border-radius: 8px; background: rgba(74,48,28,0.07); }
+    .scene { height: 26px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; font-size: 11px; font-weight: 550; color: var(--ink-2); cursor: pointer; white-space: nowrap; transition: background .12s, color .12s; }
+    .scene:hover { color: var(--ink); }
+    .scene.active { background: var(--card); color: var(--ink); box-shadow: 0 1px 2px rgba(30,22,18,0.14); }
 
-    #error-banner { display: none; padding: 9px 12px; border-radius: var(--r-md); background: #FEF2F2; border: 1px solid rgba(185,28,28,0.18); color: var(--danger); font-size: 12px; font-weight: 550; }
+    /* Floats over the stand so errors stay visible even when the rail is collapsed */
+    #error-banner {
+      display: none; position: fixed; z-index: 30; top: 58px; left: 50%; transform: translateX(-50%);
+      max-width: min(680px, calc(100vw - 32px)); padding: 9px 14px; border-radius: 8px;
+      background: #FFF8F6; border: 1px solid rgba(185,28,28,0.22); box-shadow: var(--shadow);
+      color: var(--danger); font-size: 12px; font-weight: 550;
+    }
 
     /* Pro drawer */
-    details.pro { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); box-shadow: var(--shadow); }
-    details.pro > summary { list-style: none; cursor: pointer; padding: 12px 14px; display: flex; align-items: center; gap: 10px; font-family: var(--serif); font-size: 12.5px; font-weight: 700; color: var(--ink-2); }
+    details.pro { border-bottom: 1px solid var(--hair); }
+    details.pro > summary { list-style: none; cursor: pointer; padding: 15px 18px; display: flex; align-items: baseline; gap: 8px; }
     details.pro > summary::-webkit-details-marker { display: none; }
-    details.pro > summary .chev { margin-left: auto; transition: transform .15s; color: var(--ink-3); }
+    details.pro > summary .chev { margin-left: 2px; align-self: center; width: 13px; height: 13px; transition: transform .15s; color: var(--ink-3); }
     details.pro[open] > summary .chev { transform: rotate(180deg); }
-    .pro-body { padding: 4px 14px 14px; display: flex; flex-direction: column; gap: 14px; border-top: 1px solid var(--hair); padding-top: 14px; }
+    .pro-body { padding: 0 18px 18px; display: flex; flex-direction: column; gap: 16px; }
     .sub-label { font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 6px; }
     .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
     .field label { display: block; font-size: 11px; font-weight: 550; color: var(--ink-2); margin-bottom: 4px; }
@@ -191,36 +211,91 @@
     .bar-pill, .cand-chip { height: 26px; padding: 0 9px; border-radius: 6px; border: 1px solid var(--hair-strong); background: #FFFDF9; font-size: 11px; cursor: pointer; font-family: var(--mono); }
     .bar-pill:hover, .cand-chip:hover { background: var(--well); }
     .bar-pill.active { background: var(--ink); border-color: var(--ink); color: #F5C77E; }
-    .bar-pill.playing { box-shadow: 0 0 0 2px var(--led); }
+    .bar-pill.playing { box-shadow: 0 0 0 1.5px var(--accent); }
     .cand-chip.active { border-color: var(--accent); color: var(--accent-deep); background: var(--accent-soft); font-weight: 600; }
     .inline-row { display: flex; gap: 6px; }
     #notes td { padding: 2px 4px; border-bottom: 1px solid var(--hair); }
     #notes input { height: 22px; font-size: 11px; border: 1px solid var(--hair-strong); border-radius: 4px; padding: 0 4px; }
     #simulations a { color: var(--accent-deep); }
 
-    /* Score salon */
-    .score-area { overflow-y: auto; padding: 12px 18px 20px 12px; display: flex; flex-direction: column; align-items: center; }
-    .doc-bar {
-      position: sticky; top: 0; z-index: 5; width: 100%; max-width: 1080px; margin-bottom: 10px;
-      display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 8px 10px 8px 16px;
-      background: rgba(255,253,249,0.96); backdrop-filter: blur(10px);
-      border: 1px solid var(--hair); border-radius: 12px; box-shadow: var(--shadow);
+    /* Concert stand: left-hand callout · fretboard · lead-sheet harmony ribbon, edge to edge above the sheet */
+    .score-area { container-type: inline-size; min-width: 0; min-height: 0; overflow: hidden; padding: 14px 20px 16px; display: flex; flex-direction: column; gap: 12px; }
+    .stand {
+      flex-shrink: 0; display: grid; grid-template-columns: 168px auto minmax(0, 1fr); align-items: center; column-gap: 24px;
+      padding: 10px 18px; background: var(--card); border: 1px solid var(--hair); border-radius: 6px;
     }
-    #score-title-text { font-family: var(--serif); font-size: 14px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 38%; }
-    #pill-chords { display: flex; align-items: center; gap: 4px; flex-wrap: nowrap; overflow: hidden; min-width: 0; flex: 1; }
-    .chord-pill { font-family: var(--mono); font-size: 11px; padding: 2px 7px; border-radius: 5px; background: var(--well); color: var(--ink); white-space: nowrap; flex-shrink: 0; }
-    .chord-pill.active { background: var(--accent-soft); color: var(--accent-deep); border: 1px solid var(--accent); font-weight: 700; }
-    .chord-arrow { color: var(--ink-3); font-size: 10px; flex-shrink: 0; }
-    .zoom { display: flex; align-items: center; gap: 2px; padding-left: 8px; border-left: 1px solid var(--hair); }
-    #zoom-label { font-size: 11px; color: var(--ink-2); min-width: 42px; text-align: center; }
-    .neck-row { flex-basis: 100%; display: flex; align-items: center; gap: 12px; padding-top: 6px; border-top: 3px double rgba(124,45,18,0.16); }
-    .neck-info { width: 92px; flex-shrink: 0; }
-    .neck-info .lbl { font-family: var(--mono); font-size: 9px; letter-spacing: 0.1em; color: var(--ink-3); text-transform: uppercase; }
-    #neck-bar { font-family: var(--serif); font-size: 12px; color: var(--ink-2); }
-    #neck-chord { font-family: var(--serif); font-size: 18px; font-weight: 700; color: var(--accent-deep); line-height: 1.2; }
-    #guitar-neck-viz { flex: 1; min-width: 0; height: 68px; display: block; }
-    .paper { width: 100%; max-width: 1080px; flex: 1; min-height: calc(100vh - 195px); background: #FFFDF9; border-radius: 8px; border: 1px solid var(--hair); box-shadow: var(--purfling), 0 24px 48px -12px rgba(74,48,28,0.16); overflow: hidden; }
-    #score-iframe { width: 100%; height: 100%; min-height: calc(100vh - 195px); border: 0; display: block; background: #FFFDF9; }
+    .lbl { font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; color: var(--ink-3); text-transform: uppercase; }
+    .harmony { align-self: stretch; min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 6px; padding-left: 24px; border-left: 1px solid var(--hair); }
+    .harmony-head { display: flex; align-items: center; gap: 10px; min-height: 22px; }
+    #chord-range { font-size: 10px; color: var(--ink-3); white-space: nowrap; }
+    /* Two systems of four bar cells, ruled like a lead sheet */
+    #pill-chords { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--hair); border-left: 1px solid var(--hair-strong); }
+    .chord-pill {
+      min-width: 0; padding: 3px 6px 4px 8px; border-right: 1px solid var(--hair-strong); border-bottom: 1px solid var(--hair);
+      font-family: var(--serif); font-size: 12.5px; font-weight: 600; line-height: 1.3; color: var(--ink-2);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; transition: background .12s, color .12s;
+    }
+    .chord-pill::before { content: attr(data-bar); display: block; font-family: var(--mono); font-size: 8.5px; font-weight: 400; line-height: 1.3; color: var(--ink-3); }
+    .chord-pill:hover { background: rgba(74,48,28,0.04); color: var(--ink); }
+    .chord-pill.active { background: var(--accent-soft); color: var(--accent-deep); box-shadow: inset 0 -2px 0 var(--accent); }
+    .zoom { display: flex; align-items: center; margin-left: auto; }
+    .zoom .btn.sq { width: 22px; height: 22px; border-radius: 5px; }
+    .zoom svg.i { width: 12px; height: 12px; }
+    #zoom-label { font-size: 10px; color: var(--ink-2); min-width: 38px; text-align: center; }
+    .neck-info { min-width: 0; }
+    #neck-chord { margin: 3px 0 4px; font-family: var(--serif); font-size: 26px; font-weight: 700; line-height: 1.15; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #neck-chord .seg { font-size: 13px; font-weight: 600; color: var(--ink-3); }
+    #neck-chord .seg.on { font-size: 22px; font-weight: 700; color: var(--ink); }
+    .neck-sub { display: flex; align-items: baseline; gap: 8px; white-space: nowrap; }
+    #neck-bar { font-size: 11px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+    #neck-tech { font-family: var(--mono); font-size: 9.5px; color: var(--ink-3); transition: color .15s; }
+    #neck-tech.live { color: var(--accent); font-weight: 700; }
+    /* Sized to the 560 × 96 viewBox so the fretboard fills its column with no letterboxing */
+    #guitar-neck-viz { display: block; width: 536px; height: 92px; }
+    .paper { flex: 1; min-height: 0; display: flex; flex-direction: column; background: #FFFDF9; border: 1px solid var(--hair); border-radius: 4px; box-shadow: var(--shadow); overflow: hidden; }
+    #score-iframe { flex: 1; width: 100%; height: 100%; min-height: 0; border: 0; display: block; background: #FFFDF9; }
+
+    /* Dock practice tools: auto-follow and A–B bar loop */
+    .lt-btn { height: 28px; padding: 0 10px; border-radius: 6px; border: 1px solid var(--hair-strong); background: transparent; color: var(--ink-2); font-family: var(--mono); font-size: 11px; line-height: 1; cursor: pointer; white-space: nowrap; transition: background .12s, color .12s, border-color .12s; }
+    .lt-btn:hover { background: var(--well); color: var(--ink); }
+    .lt-btn.active { background: var(--accent-soft); color: var(--accent-deep); border-color: rgba(180,83,9,0.4); }
+    #loop-readout { padding: 0 4px; font-family: var(--mono); font-size: 10.5px; color: var(--accent-deep); white-space: nowrap; }
+    #guitar-neck-viz .str { fill: none; }
+    #guitar-neck-viz .str.on { stroke: #FFC766; filter: drop-shadow(0 0 2.5px rgba(245,176,72,0.95)); }
+    /* The stand follows its own width, so it rebalances when the rail collapses */
+    @container (max-width: 1140px) {
+      .stand { column-gap: 20px; }
+      #guitar-neck-viz { width: 448px; height: 77px; }
+    }
+    @container (max-width: 900px) {
+      .stand { grid-template-columns: 132px auto minmax(0, 1fr); column-gap: 16px; }
+      .harmony { padding-left: 16px; }
+      #neck-chord { font-size: 21px; }
+      #guitar-neck-viz { width: 364px; height: 62px; }
+    }
+    @container (max-width: 720px) {
+      .stand { grid-template-columns: 132px minmax(0, 1fr); row-gap: 10px; }
+      .harmony { grid-column: 1 / -1; padding-left: 0; border-left: 0; }
+      #guitar-neck-viz { width: 100%; height: auto; aspect-ratio: 560 / 96; }
+    }
+    @media (max-width: 1360px) {
+      #play-text, .brand-sub, #link-download-mix span { display: none; }
+      .transport-meta { width: auto; }
+      .fader-cell { width: 96px; }
+    }
+    @media (max-width: 1120px) {
+      .readout { display: none; }
+      #seek-bar { order: -1; flex-basis: 100%; height: 30px; }
+      .dock-group.ruled { padding-left: 0; border-left: 0; }
+    }
+    @media (max-width: 980px) {
+      .layout { display: block; overflow-y: auto; }
+      .console { overflow: visible; border-right: 0; border-bottom: 1px solid var(--hair); }
+      .rail-inner { width: auto; }
+      body.zen .console { display: none; }
+      .score-area { overflow: visible; }
+      #score-iframe { min-height: 70vh; }
+    }
   </style>
 </head>
 <body>
@@ -231,81 +306,83 @@
 
   <header class="topbar">
     <div class="brand">
-      <div class="brand-mark" aria-hidden="true">
-        <!-- Soundhole rosette with six strings crossing to the bridge -->
-        <svg viewBox="0 0 32 32">
-          <circle cx="16" cy="16" r="13" fill="none" stroke="#B45309" stroke-width="1.2"/>
-          <circle cx="16" cy="16" r="11.2" fill="none" stroke="#F5C77E" stroke-width="1.6" stroke-dasharray="1.4 1.1"/>
-          <circle cx="16" cy="16" r="9.4" fill="none" stroke="#B45309" stroke-width="0.8"/>
-          <circle cx="16" cy="16" r="7.6" fill="#0E0A08"/>
-          <g stroke="#E8D9C0" stroke-width="0.55"><path d="M12.5 3v26M13.9 3v26M15.3 3v26M16.7 3v26M18.1 3v26M19.5 3v26"/></g>
-          <rect x="11" y="25.5" width="10" height="2.2" rx="0.6" fill="#7C2D12"/>
+      <span class="brand-mark" aria-hidden="true">
+        <!-- Geometric soundhole rosette: rim, purfling ring, soundhole -->
+        <svg viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="12" r="10.5" stroke="currentColor" stroke-width="1"/>
+          <circle cx="12" cy="12" r="7.7" stroke="#B45309" stroke-width="1.1" stroke-dasharray="1.1 1.5"/>
+          <circle cx="12" cy="12" r="4.7" fill="currentColor"/>
         </svg>
-      </div>
-      <span class="brand-title">弦语 · 艺术吉他工坊</span>
-      <span class="brand-sub">MelodyDesk Luthier Salon</span>
-      <span class="status-pill mono" id="backend-badge"><span class="led"></span>TORRES &amp; HAUSER CONCERT ACOUSTIC ENGINE</span>
+      </span>
+      <span class="brand-title">弦语</span>
+      <span class="brand-sub">MelodyDesk</span>
+      <span id="score-title-text">晴空叙事曲</span>
     </div>
     <div class="top-right">
-      <span class="readout mono">
-        <span class="k">调式</span><span id="pill-key">1 = C</span><span class="sep">·</span><span class="k">速度</span><span id="pill-bpm">78 BPM</span><span class="sep">·</span><span class="k">变调夹</span><span id="pill-capo">Capo 0</span><span class="sep">·</span><span id="pill-bars">— 小节全曲</span>
+      <span class="readout mono" aria-label="调式 · 速度 · 变调夹 · 小节数">
+        <span id="pill-key">1 = C</span><span id="pill-bpm">78 BPM</span><span id="pill-capo">Capo 0</span><span id="pill-bars">— 小节全曲</span>
       </span>
+      <button type="button" class="btn ghost" id="btn-zen-toggle" aria-pressed="false" title="收起左侧工坊栏，乐谱与指板铺满全屏（快捷键 F）">
+        <svg class="i" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg>专注看谱
+      </button>
+      <a class="btn ghost" href="/evolution_atlas" target="_blank" rel="noopener" title="查看 MelodyDesk 项目进化图鉴与 8s 交互声学演示">进化图鉴</a>
       <button type="button" class="btn ghost" id="btn-undo" title="退回上一步修改">
         <svg class="i" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>撤销
       </button>
       <button type="button" class="btn dark" id="btn-print">
-        <svg class="i" viewBox="0 0 24 24"><path d="M6 9V3h12v6"/><rect x="3" y="9" width="18" height="8" rx="2"/><path d="M7 14h10v7H7z"/></svg>典藏曲谱打印 / 导出
+        <svg class="i" viewBox="0 0 24 24"><path d="M6 9V3h12v6"/><rect x="3" y="9" width="18" height="8" rx="2"/><path d="M7 14h10v7H7z"/></svg>打印 / 导出曲谱
       </button>
     </div>
   </header>
 
+  <div id="error-banner" role="alert"></div>
+
   <div class="layout">
     <aside class="console">
-      <div id="error-banner" role="alert"></div>
+     <div class="rail-inner">
 
-      <!-- 01 · Concert repertoire -->
+      <!-- I · Repertoire -->
       <section class="module">
-        <div class="mod-head"><span class="mod-idx">I.</span><span class="mod-title">典藏艺术吉他名曲库</span><span class="mod-spec">Concert Repertoire</span></div>
+        <div class="mod-head"><span class="mod-title">曲目典藏</span><span class="mod-spec">Repertoire</span></div>
         <div class="track-list">
           <button type="button" class="track" id="song-canon" data-demo="canon_in_d">
-            <span class="track-ico">壹</span>
-            <span class="track-body"><div class="track-name">John Denver《Country Roads》<span class="en">3:16 真人原唱全曲</span></div><div class="track-meta">世界民谣木吉他圣经 · 真人主唱分离音轨 + 完整全曲木吉他编配 (3分16秒)</div></span>
-            <span class="track-tag">3:16 真人全曲</span><span class="led"></span>
+            <span class="track-ico">01</span>
+            <span class="track-body"><div class="track-name">Country Roads</div><div class="track-meta">John Denver · 美式民谣指弹</div></span>
+            <span class="track-tag">3:16</span>
           </button>
           <button type="button" class="track" id="song-romance" data-demo="romance_amor">
-            <span class="track-ico">贰</span>
-            <span class="track-body"><div class="track-name">Eric Clapton《Tears in Heaven》<span class="en">4:36 不插电真人全曲</span></div><div class="track-meta">殿堂级艺术木吉他不插电现场 · 真人主唱 + 完整全曲指弹伴奏 (4分36秒)</div></span>
-            <span class="track-tag">4:36 真人全曲</span><span class="led"></span>
+            <span class="track-ico">02</span>
+            <span class="track-body"><div class="track-name">Tears in Heaven</div><div class="track-meta">Eric Clapton · 不插电现场指弹</div></span>
+            <span class="track-tag">4:36</span>
           </button>
           <button type="button" class="track" id="song-scarborough" data-demo="scarborough_fair">
-            <span class="track-ico">叁</span>
-            <span class="track-body"><div class="track-name">Simon &amp; Garfunkel《Scarborough Fair》<span class="en">3:12 真人原唱全曲</span></div><div class="track-meta">英伦指弹民谣巅峰 · 3/4拍双声部真人原唱 + 完整全曲琶音对位 (3分12秒)</div></span>
-            <span class="track-tag">3:12 真人全曲</span><span class="led"></span>
+            <span class="track-ico">03</span>
+            <span class="track-body"><div class="track-name">Scarborough Fair</div><div class="track-meta">Simon &amp; Garfunkel · 3/4 英伦复调</div></span>
+            <span class="track-tag">3:12</span>
           </button>
           <button type="button" class="track" id="song-greensleeves" data-demo="greensleeves">
-            <span class="track-ico">肆</span>
-            <span class="track-body"><div class="track-name">The Brothers Four《Lady Greensleeves》<span class="en">3:05 真人原唱全曲</span></div><div class="track-meta">文艺复兴名曲《绿袖子》· 3/4拍真人美声合唱 + 古典木吉他全曲 (3分05秒)</div></span>
-            <span class="track-tag">3:05 真人全曲</span><span class="led"></span>
+            <span class="track-ico">04</span>
+            <span class="track-body"><div class="track-name">Lady Greensleeves</div><div class="track-meta">The Brothers Four · 3/4 古典民谣</div></span>
+            <span class="track-tag">3:05</span>
           </button>
           <button type="button" class="track active" id="song-mandarin" data-demo="mandarin_pop">
-            <span class="track-ico">伍</span>
-            <span class="track-body"><div class="track-name">赵雷《成都》<span class="en">5:28 华语真人原唱全曲</span></div><div class="track-meta">华语民谣木吉他代表作 · 真人原声主唱 + 完整全曲诗意木吉他弹唱 (5分28秒)</div></span>
-            <span class="track-tag">5:28 真人全曲</span><span class="led"></span>
+            <span class="track-ico">05</span>
+            <span class="track-body"><div class="track-name">成都</div><div class="track-meta">赵雷 · 6/8 叙事木吉他弹唱</div></span>
+            <span class="track-tag">5:28</span>
           </button>
           <button type="button" class="track" id="song-vocal" data-demo="real_vocal">
-            <span class="track-ico">陆</span>
-            <span class="track-body"><div class="track-name">Karissa Hobbs《Let's Go Fishin'》<span class="en">2:13 真人女声全曲</span></div><div class="track-meta">录音室乡村民谣女声完整版 · 真人清唱 + 制琴师木吉他全曲合奏 (2分13秒)</div></span>
-            <span class="track-tag">2:13 真人全曲</span><span class="led"></span>
+            <span class="track-ico">06</span>
+            <span class="track-body"><div class="track-name">Let's Go Fishin'</div><div class="track-meta">Karissa Hobbs · 乡村清唱合奏</div></span>
+            <span class="track-tag">2:13</span>
           </button>
           <button type="button" class="track" id="song-david-tao" data-demo="regular_friends">
-            <span class="track-ico">柒</span>
-            <span class="track-body"><div class="track-name">陶喆《普通朋友》<span class="en">4:15 华语 R&amp;B 真人原唱全曲</span></div><div class="track-meta">华语 R&amp;B / Neo-Soul 木吉他教科书 · 陶喆真人原声主唱 + 完整全曲爵士七九和弦律动编配 (4分15秒)</div></span>
-            <span class="track-tag">4:15 真人全曲</span><span class="led"></span>
+            <span class="track-ico">07</span>
+            <span class="track-body"><div class="track-name">普通朋友</div><div class="track-meta">陶喆 · R&amp;B 爵士七九律动</div></span>
+            <span class="track-tag">4:15</span>
           </button>
           <button type="button" class="track" id="song-upload-toggle">
             <span class="track-ico"><svg class="i" viewBox="0 0 24 24"><path d="M12 15V3M7 8l5-5 5 5"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></svg></span>
-            <span class="track-body"><div class="track-name">上传自有曲目</div><div class="track-meta">导入音频自动扒谱与艺术吉他编配 (MP3 / WAV)</div></span>
-            <span class="led"></span>
+            <span class="track-body"><div class="track-name">上传自有曲目</div><div class="track-meta">导入音频 · 自动扒谱与编配</div></span>
           </button>
         </div>
         <div id="upload-panel" style="display:none;">
@@ -322,81 +399,43 @@
         </div>
       </section>
 
-      <!-- 02 · Guitar artistry presets -->
+      <!-- II · Voicing -->
       <section class="module">
-        <div class="mod-head"><span class="mod-idx">II.</span><span class="mod-title">四大吉他演奏美学</span><span class="mod-spec">Guitar Artistry</span></div>
+        <div class="mod-head"><span class="mod-title">演奏美学</span><span class="mod-spec">Voicing</span></div>
+        <div id="rec-banner" class="rec-hint"></div>
         <div class="aes-grid">
           <button type="button" class="aes active" data-vibe="original">
-            <span class="aes-top"><span class="aes-idx">A</span><span class="aes-en">Classical Fingerstyle</span><span class="led amber"></span></span>
+            <span class="aes-top"><span class="aes-idx">I</span><span class="aes-rec-badge">★ 本曲推荐</span></span>
             <span class="aes-title">古典/原版分解</span>
+            <span class="aes-en">Classical Fingerstyle</span>
             <span class="aes-chords">C → G/B → Am → F</span>
-            <span class="aes-desc">契合人声主旋律和声，古典指弹颗粒感分解拨弦</span>
           </button>
           <button type="button" class="aes" data-vibe="folk_easy">
-            <span class="aes-top"><span class="aes-idx">B</span><span class="aes-en">Open-Chord Strum</span><span class="led amber"></span></span>
+            <span class="aes-top"><span class="aes-idx">II</span><span class="aes-rec-badge">★ 本曲推荐</span></span>
             <span class="aes-title">民谣开放扫弦</span>
+            <span class="aes-en">Open-Chord Strum</span>
             <span class="aes-chords">C → G → Am → F</span>
-            <span class="aes-desc">第一把位开放和弦，温暖共鸣扫弦伴奏</span>
           </button>
           <button type="button" class="aes" data-vibe="emotional_pop">
-            <span class="aes-top"><span class="aes-idx">C</span><span class="aes-en">Lyrical Arpeggio</span><span class="led amber"></span></span>
+            <span class="aes-top"><span class="aes-idx">III</span><span class="aes-rec-badge">★ 本曲推荐</span></span>
             <span class="aes-title">抒情琶音叙事</span>
+            <span class="aes-en">Lyrical Arpeggio</span>
             <span class="aes-chords">Cadd9 → G/B → Am7 → Fmaj7</span>
-            <span class="aes-desc">Add9/Maj7 泛音色彩，顺阶低音与圆滑音连奏</span>
           </button>
           <button type="button" class="aes" data-vibe="neosoul_jazz">
-            <span class="aes-top"><span class="aes-idx">D</span><span class="aes-en">Jazz Fingerstyle</span><span class="led amber"></span></span>
+            <span class="aes-top"><span class="aes-idx">IV</span><span class="aes-rec-badge">★ 本曲推荐</span></span>
             <span class="aes-title">爵士指弹律动</span>
+            <span class="aes-en">Jazz Fingerstyle</span>
             <span class="aes-chords">Cmaj9 → Em7 | A7 → Dm9</span>
-            <span class="aes-desc">Maj9/m9 爵士延伸音，一节双和弦对位律动</span>
           </button>
-        </div>
-      </section>
-
-      <!-- 03 · 2-stem vocal & guitar duet mixer -->
-      <section class="module">
-        <div class="mod-head"><span class="mod-idx">III.</span><span class="mod-title">制琴工坊人声与木吉他双轨混音台</span><span class="mod-spec">Vocal &amp; Guitar Mixer</span></div>
-        <div class="transport">
-          <button type="button" id="btn-play-toggle" aria-label="播放 / 暂停" disabled>
-            <svg id="play-icon"><use href="#i-play"/></svg>
-          </button>
-          <div class="transport-body">
-            <div class="transport-meta">
-              <span id="play-text">正在载入人声与木吉他音轨…</span>
-              <span class="timecode mono"><b id="time-cur">00:00</b> / <span id="time-dur">00:00</span></span>
-            </div>
-            <div id="seek-bar" role="slider" tabindex="0" aria-label="播放位置" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"><canvas></canvas></div>
-          </div>
-        </div>
-
-        <div class="faders">
-          <div>
-            <div class="fader-head"><span id="label-vocal-track">真人主唱 (Lead Vocal)</span><span class="tag">STEM 1</span><span class="fader-val" id="val-vol-vocal">85%</span></div>
-            <input type="range" class="fader" id="slider-vol-vocal" min="0" max="100" value="85">
-          </div>
-          <div>
-            <div class="fader-head"><span>艺术木吉他伴奏 (Guitar)</span><span class="tag">STEM 2</span><span class="fader-val" id="val-vol-guitar">95%</span></div>
-            <input type="range" class="fader accent" id="slider-vol-guitar" min="0" max="100" value="95">
-          </div>
-        </div>
-
-        <div class="scene-row">
-          <button type="button" class="scene active" id="btn-mode-duet">弹唱合奏</button>
-          <button type="button" class="scene" id="btn-mode-guitar-only">纯享木吉他</button>
-          <button type="button" class="scene" id="btn-mode-reference">纯享真人声</button>
-        </div>
-        <div class="export-row">
-          <a class="btn" id="link-download-mix" href="#" role="button">
-            <svg class="i" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>导出混音 WAV（按当前推子电平）
-          </a>
         </div>
       </section>
 
       <!-- Pro drawer -->
       <details class="pro">
         <summary>
-          <svg class="i" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>
-          制琴师编配参数与逐小节精修
+          <span class="mod-title">编配精修</span>
+          <span class="mod-spec">Arrangement &amp; Bars</span>
           <svg class="i chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
         </summary>
         <div class="pro-body">
@@ -455,24 +494,29 @@
           </details>
         </div>
       </details>
+      <p class="colophon">Space 播放 · ←/→ 小节 · [ ] 循环 · F 专注看谱</p>
+     </div>
     </aside>
 
     <main class="score-area">
-      <div class="doc-bar">
-        <span id="score-title-text">晴空叙事曲</span>
-        <div id="pill-chords"></div>
-        <div class="zoom">
-          <button type="button" class="btn ghost sq" id="zoom-out" aria-label="缩小"><svg class="i" viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button>
-          <span id="zoom-label" class="mono">100%</span>
-          <button type="button" class="btn ghost sq" id="zoom-in" aria-label="放大"><svg class="i" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+      <div class="stand">
+        <div class="neck-info">
+          <div class="lbl">Left Hand</div>
+          <div id="neck-chord">—</div>
+          <div class="neck-sub"><span id="neck-bar">第 — 小节</span><span id="neck-tech">开放把位</span></div>
         </div>
-        <div class="neck-row">
-          <div class="neck-info">
-            <div class="lbl">Left Hand</div>
-            <div id="neck-bar">第 — 小节</div>
-            <div id="neck-chord">—</div>
+        <svg id="guitar-neck-viz" viewBox="0 0 560 96" preserveAspectRatio="xMidYMid meet" role="img" aria-label="六弦指板和弦按法"></svg>
+        <div class="harmony">
+          <div class="harmony-head">
+            <span class="lbl">Harmony</span>
+            <span id="chord-range" class="mono"></span>
+            <div class="zoom">
+              <button type="button" class="btn ghost sq" id="zoom-out" aria-label="缩小"><svg class="i" viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button>
+              <span id="zoom-label" class="mono">100%</span>
+              <button type="button" class="btn ghost sq" id="zoom-in" aria-label="放大"><svg class="i" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+            </div>
           </div>
-          <svg id="guitar-neck-viz" viewBox="0 0 560 96" preserveAspectRatio="xMidYMid meet" role="img" aria-label="六弦指板和弦按法"></svg>
+          <div id="pill-chords"></div>
         </div>
       </div>
       <div class="paper">
@@ -481,9 +525,51 @@
     </main>
   </div>
 
+  <!-- Pinned studio transport & duet console -->
+  <footer class="dock">
+    <div class="transport">
+      <button type="button" id="btn-play-toggle" aria-label="播放 / 暂停" disabled>
+        <svg id="play-icon"><use href="#i-play"/></svg>
+      </button>
+      <div class="transport-meta">
+        <span class="timecode mono"><b id="time-cur">00:00</b> / <span id="time-dur">00:00</span></span>
+        <span id="play-text">正在载入人声与木吉他音轨…</span>
+      </div>
+    </div>
+    <div id="seek-bar" role="slider" tabindex="0" aria-label="播放位置" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"><canvas></canvas></div>
+    <div class="dock-group ruled" role="group" aria-label="跟谱与 A–B 循环练习">
+      <button type="button" class="lt-btn active" id="btn-follow-toggle" aria-pressed="true" title="播放时乐谱自动滚动跟随">自动跟谱</button>
+      <button type="button" class="lt-btn" id="btn-loop-a" title="将当前小节设为循环起点（快捷键 [ ，或 Shift+点击乐谱）">[A</button>
+      <button type="button" class="lt-btn" id="btn-loop-b" title="将当前小节设为循环终点（快捷键 ] ）">B]</button>
+      <span id="loop-readout" hidden></span>
+      <button type="button" class="lt-btn" id="btn-loop-clear" title="清除循环（快捷键 \ ）" aria-label="清除循环" hidden>×</button>
+    </div>
+    <div class="dock-group ruled faders">
+      <div class="fader-cell">
+        <div class="fader-head"><span id="label-vocal-track">真人主唱</span><span class="fader-val" id="val-vol-vocal">90%</span></div>
+        <input type="range" class="fader" id="slider-vol-vocal" min="0" max="100" value="90" aria-label="人声音量">
+      </div>
+      <div class="fader-cell">
+        <div class="fader-head"><span>木吉他</span><span class="fader-val" id="val-vol-guitar">82%</span></div>
+        <input type="range" class="fader accent" id="slider-vol-guitar" min="0" max="100" value="82" aria-label="木吉他音量">
+      </div>
+    </div>
+    <div class="dock-group ruled">
+      <div class="scene-row">
+        <button type="button" class="scene active" id="btn-mode-duet">合奏</button>
+        <button type="button" class="scene" id="btn-mode-guitar-only">吉他</button>
+        <button type="button" class="scene" id="btn-mode-reference">人声</button>
+      </div>
+      <a class="btn" id="link-download-mix" href="#" role="button" title="按当前推子电平导出混音 WAV">
+        <svg class="i" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg><span>导出 WAV</span>
+      </a>
+    </div>
+  </footer>
+
   <script>
     let currentState = null;
     let selectedBarIndex = 0;
+    let selectedSegmentIndex = 0;
     let currentZoom = 100;
     let activeDemo = 'mandarin_pop';
 
@@ -522,86 +608,241 @@
       return el;
     }
 
-    // frets[i] is string 6-i (index 0 = low E); negative = muted, 0 = open
-    function renderNeck(frets) {
-      const { x0, fretW, frets: nF, y0, gap } = NECK;
-      const x1 = x0 + nF * fretW, yTop = y0, yBot = y0 + 5 * gap;
-      const pressed = (frets || []).filter(f => f > 0);
-      const base = pressed.length && Math.max(...pressed) > nF ? Math.min(...pressed) : 1;
-      neckSvg.replaceChildren();
-      neckSvg.appendChild(svgEl('rect', { x: x0, y: yTop - 7, width: x1 - x0, height: yBot - yTop + 14, rx: 3, fill: '#2A1C14' }));
-      neckSvg.appendChild(svgEl('rect', { x: x0, y: yTop - 7, width: x1 - x0, height: 2, fill: 'rgba(245,199,126,0.35)' }));
-      [3, 5, 7, 9, 15, 17].forEach(n => {
-        const i = n - base;
-        if (i >= 0 && i < nF) neckSvg.appendChild(svgEl('circle', { cx: x0 + (i + 0.5) * fretW, cy: (yTop + yBot) / 2, r: 4.5, fill: '#E9E2D4', opacity: 0.85 }));
-      });
-      if (12 - base >= 0 && 12 - base < nF) {
-        const cx = x0 + (12 - base + 0.5) * fretW;
-        neckSvg.appendChild(svgEl('circle', { cx, cy: yTop + gap * 1.5, r: 4, fill: '#E9E2D4', opacity: 0.85 }));
-        neckSvg.appendChild(svgEl('circle', { cx, cy: yBot - gap * 1.5, r: 4, fill: '#E9E2D4', opacity: 0.85 }));
-      }
-      neckSvg.appendChild(svgEl('rect', { x: x0 - 4, y: yTop - 7, width: 5, height: yBot - yTop + 14, fill: base === 1 ? '#F3EAD8' : '#C9A26A' }));
-      for (let i = 1; i <= nF; i++) {
-        neckSvg.appendChild(svgEl('rect', { x: x0 + i * fretW - 1.2, y: yTop - 7, width: 2.4, height: yBot - yTop + 14, fill: '#C9A26A' }));
-        neckSvg.appendChild(svgEl('text', { x: x0 + (i - 0.5) * fretW, y: yBot + 20, 'text-anchor': 'middle', 'font-size': 9.5, fill: '#8A7360', 'font-family': 'ui-monospace, Menlo, monospace' }, String(base + i - 1)));
-      }
-      STRING_NAMES.forEach((name, s) => {
-        const y = yTop + s * gap;
-        neckSvg.appendChild(svgEl('line', { x1: x0, y1: y, x2: x1, y2: y, stroke: s < 2 ? '#E5E1D8' : '#D6B27A', 'stroke-width': 0.8 + s * 0.32 }));
-        neckSvg.appendChild(svgEl('text', { x: 2, y: y + 3.5, 'font-size': 9.5, fill: '#5A4638', 'font-family': 'ui-monospace, Menlo, monospace' }, name));
-      });
-      (frets || []).forEach((f, i) => {
-        const y = yTop + (5 - i) * gap;
-        if (f < 0) neckSvg.appendChild(svgEl('text', { x: x0 - 16, y: y + 3.5, 'text-anchor': 'middle', 'font-size': 10, 'font-weight': 700, fill: '#B91C1C' }, '×'));
-        else if (f === 0) neckSvg.appendChild(svgEl('circle', { cx: x0 - 16, cy: y, r: 3.6, fill: 'none', stroke: '#B45309', 'stroke-width': 1.4 }));
-        else {
-          const cx = x0 + (f - base + 0.5) * fretW;
-          neckSvg.appendChild(svgEl('circle', { cx, cy: y, r: 6.2, fill: '#B45309', stroke: '#FFF7EC', 'stroke-width': 1.2 }));
-          neckSvg.appendChild(svgEl('text', { x: cx, y: y + 3, 'text-anchor': 'middle', 'font-size': 8, 'font-weight': 700, fill: '#FFF7EC', 'font-family': 'ui-monospace, Menlo, monospace' }, String(f)));
-        }
-      });
-    }
-
-    function showNeckBar(idx) {
-      const bars = (currentState && currentState.bar_analysis) || [];
-      neckShownBar = idx;
-      if (!bars.length) {
-        document.getElementById('neck-bar').textContent = '第 — 小节';
-        document.getElementById('neck-chord').textContent = '—';
-        renderNeck([]);
-        return;
-      }
-      const clamped = Math.max(0, Math.min(bars.length - 1, idx));
-      const bar = bars[clamped];
-      document.getElementById('neck-bar').textContent = `第 ${clamped + 1} / ${bars.length} 小节`;
-      document.getElementById('neck-chord').textContent = (bar.split_segments || []).map(s => s.chord).join(' | ') || bar.chord;
-      renderNeck(bar.frets || []);
-      renderChordPills((currentState && currentState.chords) || [], clamped);
-      document.querySelectorAll('#bar-strip .bar-pill').forEach((p, i) => p.classList.toggle('playing', engine.playing && i === clamped));
-    }
+    // ───────── Exact piecewise sec <-> beat bijection (audio always plays at native speed) ─────────
+    let measureBeats = 4;
+    let stateEventsByBar = [], stateNotes = [];
+    let gridFor = null, grid = null;
 
     function beatsPerBar(meter) {
       const [num, den] = String(meter || '4/4').split('/').map(Number);
       return num && den ? num * 4 / den : 4;
     }
 
-    function playheadBar() {
-      const bars = (currentState && currentState.bar_analysis) || [];
-      if (!bars.length || !currentState.bpm) return 0;
-      const pos = position();
+    const isStrictInc = a => Array.isArray(a) && a.length >= 2 && a.every((v, i) => Number.isFinite(v) && (i === 0 || v > a[i - 1]));
+
+    // { t: ascending seconds, u: beats per grid step } — beat_times first, then bar starts, else null (constant bpm)
+    function timeGrid() {
+      if (gridFor === currentState) return grid;
+      gridFor = currentState;
+      const bt = currentState && currentState.beat_times;
       const bss = currentState && (currentState.bar_start_seconds || (currentState.arrangement && currentState.arrangement.bar_start_seconds));
-      if (Array.isArray(bss) && bss.length >= 2) {
-        let lo = 0, hi = Math.min(bars.length - 1, bss.length - 2);
-        while (lo <= hi) {
-          const mid = (lo + hi) >> 1;
-          if (pos < bss[mid]) hi = mid - 1;
-          else if (pos >= bss[mid + 1]) lo = mid + 1;
-          else return mid;
-        }
-        return Math.max(0, Math.min(bars.length - 1, lo));
+      if (isStrictInc(bt)) grid = { t: bt, u: 1 };
+      else if (isStrictInc(bss)) grid = { t: bss, u: measureBeats };
+      else grid = null;
+      return grid;
+    }
+
+    function beatToSec(beatPos) {
+      const g = timeGrid();
+      if (!g) return beatPos * 60 / ((currentState && currentState.bpm) || 120);
+      const t = g.t, n = t.length, k = beatPos / g.u;
+      const btAvgDur = (t[n - 1] - t[0]) / Math.max(1, n - 1) || 0.5;
+      if (k <= 0) return t[0] + k * btAvgDur;
+      if (k >= n - 1) return t[n - 1] + (k - (n - 1)) * btAvgDur;
+      const i = Math.floor(k);
+      return t[i] + (k - i) * (t[i + 1] - t[i]);
+    }
+
+    function secToBeat(sec) {
+      const g = timeGrid();
+      if (!g) return sec * ((currentState && currentState.bpm) || 120) / 60;
+      const t = g.t, n = t.length;
+      const btAvgDur = (t[n - 1] - t[0]) / Math.max(1, n - 1) || 0.5;
+      if (sec <= t[0]) return (sec - t[0]) / btAvgDur * g.u;
+      if (sec >= t[n - 1]) return (n - 1 + (sec - t[n - 1]) / btAvgDur) * g.u;
+      let lo = 0, hi = n - 2;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (t[mid] <= sec) lo = mid; else hi = mid - 1;
       }
-      const secPerBar = beatsPerBar(currentState.meter) * 60 / currentState.bpm;
-      return Math.max(0, Math.min(bars.length - 1, Math.floor(pos / secPerBar)));
+      return (lo + (sec - t[lo]) / Math.max(1e-9, t[lo + 1] - t[lo])) * g.u;
+    }
+
+    function playheadBar() {
+      const n = ((currentState && currentState.bar_analysis) || []).length;
+      return n ? Math.max(0, Math.min(n - 1, Math.floor(secToBeat(position()) / measureBeats + 1e-9))) : 0;
+    }
+
+    function techLabel(t) {
+      t = String(t || '').trim().toLowerCase();
+      if (!t || t === 'none' || t === 'null') return '';
+      if (/^x$|slap|perc|打板/.test(t)) return 'X 打板';
+      if (/pm|palm|mute|闷/.test(t)) return 'PM 闷音';
+      if (/sl|滑|\//.test(t)) return 'SL 滑音';
+      if (/^h|^p$|pull|hammer|击|勾/.test(t)) return 'H/P 击勾';
+      if (/ds|double|双/.test(t)) return 'DS 双音对位';
+      if (/cm|melody|lead|主/.test(t)) return 'CM 主奏旋律';
+      return t.toUpperCase();
+    }
+
+    // start/end in absolute quarter-note beats; cap let-ring sustain highlight to 0.75 beats so arpeggio plucks illuminate cleanly
+    function mkEvent(start, dur, string, fret, tech, el) {
+      return {
+        start, end: start + Math.max(0.16, Math.min(dur || 0, 0.75)), sec: beatToSec(start),
+        string: parseInt(string, 10) || 0, fret: parseInt(fret, 10) || 0, label: techLabel(tech), el: el || null
+      };
+    }
+
+    // Pre-index the state once per render so the 60fps loop never searches raw arrays
+    function indexState(s) {
+      measureBeats = (s.arrangement && Number(s.arrangement.measure_beats)) || beatsPerBar(s.meter);
+      gridFor = null;
+      neck.key = '';
+      stateNotes = (s.notes_table || [])
+        .map(n => ({ index: n.index, start: Number(n.start), end: Number(n.start) + Number(n.duration) }))
+        .filter(n => isFinite(n.start) && isFinite(n.end))
+        .sort((a, b) => a.start - b.start);
+      stateEventsByBar = [];
+      const evs = s.events || s.tab_events || (s.arrangement && s.arrangement.events) || [];
+      if (Array.isArray(evs)) evs.forEach(ev => {
+        const st = Number(ev.start);
+        if (!isFinite(st)) return;
+        const b = Math.max(0, Math.floor(st / measureBeats + 1e-9));
+        (stateEventsByBar[b] = stateEventsByBar[b] || []).push(mkEvent(st, Number(ev.duration), ev.string, ev.fret, ev.technique || ev.tech));
+      });
+      updateLoopUI();
+    }
+
+    // ───────── Live fretboard: persistent layers, only strings/rings animate per frame ─────────
+    const NECK_FONT = 'ui-monospace, Menlo, monospace';
+    const NECK_X1 = NECK.x0 + NECK.frets * NECK.fretW;
+    const neckBarEl = document.getElementById('neck-bar');
+    const neckChordEl = document.getElementById('neck-chord');
+    const neckTechEl = document.getElementById('neck-tech');
+    const neck = { key: '', bgKey: '', base: 1, techUntil: 0, techText: '', shown: '' };
+    const stringY = s => NECK.y0 + s * NECK.gap; // s: 0 = string 1 (high e, top)
+    const flatPath = s => `M${NECK.x0} ${stringY(s)} L${NECK_X1} ${stringY(s)}`;
+    const fretX = (f, base) => f <= 0 ? NECK.x0 - 16 : Math.max(NECK.x0 + 6, Math.min(NECK_X1 - 6, NECK.x0 + (f - base + 0.5) * NECK.fretW));
+    const vis = (el, on) => { if (el) el.style.display = on ? '' : 'none'; };
+
+    const neckDefs = svgEl('defs', {});
+    const neckGrad = svgEl('linearGradient', { id: 'neck-wood', x1: 0, y1: 0, x2: 0, y2: 1 });
+    [['0', '#4A2C1C'], ['0.45', '#2E1B12'], ['1', '#1A100B']].forEach(([o, c]) => neckGrad.appendChild(svgEl('stop', { offset: o, 'stop-color': c })));
+    neckDefs.appendChild(neckGrad);
+    const bgLayer = svgEl('g', {}), stringLayer = svgEl('g', {}), chordLayer = svgEl('g', {}), pluckLayer = svgEl('g', {});
+    neckSvg.append(neckDefs, bgLayer, stringLayer, chordLayer, pluckLayer);
+    const stringEls = STRING_NAMES.map((_, s) => stringLayer.appendChild(svgEl('path', { class: 'str', d: flatPath(s), stroke: s < 2 ? '#E5E1D8' : '#D6B27A', 'stroke-width': 0.8 + s * 0.32 })));
+    const ringEls = STRING_NAMES.map(() => pluckLayer.appendChild(svgEl('circle', { r: 4, fill: 'none', stroke: '#F5B048', 'stroke-width': 1.6, opacity: 0 })));
+    const stringLive = STRING_NAMES.map(() => false);
+    const hitDt = new Float32Array(6), hitEv = new Array(6);
+
+    function renderNeckBg(base, capo) {
+      const { x0, fretW, frets: nF, y0, gap } = NECK;
+      const yTop = y0, yBot = y0 + 5 * gap, h = yBot - yTop + 14;
+      const add = (tag, attrs, text) => bgLayer.appendChild(svgEl(tag, attrs, text));
+      bgLayer.replaceChildren();
+      add('rect', { x: x0, y: yTop - 7, width: NECK_X1 - x0, height: h, rx: 3, fill: 'url(#neck-wood)' });
+      add('rect', { x: x0, y: yTop - 7, width: NECK_X1 - x0, height: 2, fill: 'rgba(245,199,126,0.35)' });
+      [3, 5, 7, 9, 15, 17].forEach(n => {
+        const i = n - base;
+        if (i >= 0 && i < nF) add('circle', { cx: x0 + (i + 0.5) * fretW, cy: (yTop + yBot) / 2, r: 4.5, fill: '#E9E2D4', opacity: 0.85 });
+      });
+      if (12 - base >= 0 && 12 - base < nF) {
+        const cx = x0 + (12 - base + 0.5) * fretW;
+        add('circle', { cx, cy: yTop + gap * 1.5, r: 4, fill: '#E9E2D4', opacity: 0.85 });
+        add('circle', { cx, cy: yBot - gap * 1.5, r: 4, fill: '#E9E2D4', opacity: 0.85 });
+      }
+      add('rect', { x: x0 - 4, y: yTop - 7, width: 5, height: h, fill: base === 1 ? '#F3EAD8' : '#C9A26A' });
+      for (let i = 1; i <= nF; i++) {
+        add('rect', { x: x0 + i * fretW - 1.2, y: yTop - 7, width: 2.4, height: h, fill: '#C9A26A' });
+        add('text', { x: x0 + (i - 0.5) * fretW, y: yBot + 17, 'text-anchor': 'middle', 'font-size': 9.5, fill: '#8A7360', 'font-family': NECK_FONT }, String(base + i - 1));
+      }
+      STRING_NAMES.forEach((name, s) => add('text', { x: 2, y: stringY(s) + 3.5, 'font-size': 9.5, fill: '#5A4638', 'font-family': NECK_FONT }, name));
+      if (capo > 0) {
+        if (base === 1) add('rect', { x: x0 - 8, y: yTop - 10, width: 10, height: h + 6, rx: 4, fill: '#33302E', stroke: '#E0A04A', 'stroke-width': 1 });
+        add('text', { x: 2, y: yBot + 17, 'font-size': 8.5, 'font-weight': 700, fill: '#B45309', 'font-family': NECK_FONT }, 'Capo ' + capo);
+      }
+    }
+
+    // frets[i] is string 6-i (index 0 = low E); negative = muted, 0 = open
+    function renderNeckChord(frets, base) {
+      const x0 = NECK.x0;
+      chordLayer.replaceChildren();
+      (frets || []).forEach((f, i) => {
+        const y = stringY(5 - i);
+        if (f < 0) chordLayer.appendChild(svgEl('text', { x: x0 - 16, y: y + 3.5, 'text-anchor': 'middle', 'font-size': 10, 'font-weight': 700, fill: '#B91C1C' }, '×'));
+        else if (f === 0) chordLayer.appendChild(svgEl('circle', { cx: x0 - 16, cy: y, r: 3.6, fill: 'none', stroke: '#B45309', 'stroke-width': 1.4 }));
+        else if (f - base < NECK.frets) {
+          const cx = x0 + (f - base + 0.5) * NECK.fretW;
+          chordLayer.appendChild(svgEl('circle', { cx, cy: y, r: 6.2, fill: '#B45309', stroke: '#FFF7EC', 'stroke-width': 1.2 }));
+          chordLayer.appendChild(svgEl('text', { x: cx, y: y + 3, 'text-anchor': 'middle', 'font-size': 8, 'font-weight': 700, fill: '#FFF7EC', 'font-family': NECK_FONT }, String(f)));
+        }
+      });
+    }
+
+    function updateNeck(barIdx, localBeat, posSec, isPlaying) {
+      const bars = (currentState && currentState.bar_analysis) || [];
+      const bar = bars[barIdx], capo = Number(currentState && currentState.capo) || 0;
+      const segs = (bar && bar.split_segments) || [];
+      let segIdx = -1;
+      for (let i = 0; i < segs.length; i++) if (segs[i].beat <= localBeat + 1e-6) segIdx = i;
+      const seg = segIdx >= 0 ? segs[segIdx] : bar;
+      const frets = (seg && seg.frets) || (bar && bar.frets) || [];
+      const key = [barIdx, segIdx, capo, frets.join(','), bars.length, isPlaying, seg ? seg.chord : ''].join('|');
+      if (key !== neck.key) {
+        neck.key = key;
+        neckShownBar = barIdx;
+        const pressed = frets.filter(f => f > 0);
+        const base = pressed.length && Math.max(...pressed) > NECK.frets ? Math.min(...pressed) : 1;
+        if (neck.bgKey !== base + '|' + capo) { neck.bgKey = base + '|' + capo; neck.base = base; renderNeckBg(base, capo); }
+        renderNeckChord(frets, base);
+        neckBarEl.textContent = bar ? `第 ${barIdx + 1} / ${bars.length} 小节` : '第 — 小节';
+        if (bar && segs.length > 1) {
+          neckChordEl.replaceChildren();
+          segs.forEach((sg, i) => {
+            const sp = document.createElement('span');
+            sp.className = 'seg' + (i === segIdx ? ' on' : '');
+            sp.textContent = sg.chord;
+            neckChordEl.append(sp, i < segs.length - 1 ? ' ' : '');
+          });
+        } else neckChordEl.textContent = bar ? ((segs[0] && segs[0].chord) || bar.chord || '—') : '—';
+        if (bar) {
+          renderChordPills(currentState.chords || [], barIdx);
+          document.querySelectorAll('#bar-strip .bar-pill').forEach((p, i) => p.classList.toggle('playing', isPlaying && i === barIdx));
+        }
+      }
+
+      // String transverse waves + pluck ripples for events fired within the last 0.30 s
+      hitDt.fill(-1);
+      if (isPlaying) for (let b = Math.max(0, barIdx - 1); b <= barIdx; b++) {
+        const evs = stateEventsByBar[b];
+        if (!evs) continue;
+        for (let i = 0; i < evs.length; i++) {
+          const ev = evs[i], dt = posSec - ev.sec, s = ev.string - 1;
+          if (dt >= 0 && dt < 0.30 && s >= 0 && s < 6 && (hitDt[s] < 0 || dt < hitDt[s])) { hitDt[s] = dt; hitEv[s] = ev; }
+        }
+      }
+      let tech = '';
+      for (let s = 0; s < 6; s++) {
+        const dt = hitDt[s];
+        if (dt >= 0) {
+          const ev = hitEv[s], y = stringY(s), amp = Math.exp(-dt * 12) * Math.sin(dt * 95) * 2.6;
+          stringEls[s].setAttribute('d', `M${NECK.x0} ${y} Q${(NECK.x0 + NECK_X1) / 2} ${(y + 2 * amp).toFixed(2)} ${NECK_X1} ${y}`);
+          if (!stringLive[s]) { stringLive[s] = true; stringEls[s].classList.add('on'); }
+          const ring = ringEls[s];
+          ring.setAttribute('cx', fretX(ev.fret, neck.base));
+          ring.setAttribute('cy', y);
+          ring.setAttribute('r', (4 + dt * 40).toFixed(2));
+          ring.setAttribute('opacity', (1 - dt / 0.30).toFixed(3));
+          if (ev.label) tech = ev.label;
+        } else if (stringLive[s]) {
+          stringLive[s] = false;
+          stringEls[s].setAttribute('d', flatPath(s));
+          stringEls[s].classList.remove('on');
+          ringEls[s].setAttribute('opacity', 0);
+        }
+      }
+      const now = performance.now();
+      if (tech) { neck.techUntil = now + 900; neck.techText = tech; }
+      const live = isPlaying && now < neck.techUntil;
+      const text = live ? neck.techText : (capo > 0 ? `Capo ${capo} · 待命` : '开放把位');
+      if (text !== neck.shown) { neck.shown = text; neckTechEl.textContent = text; neckTechEl.classList.toggle('live', live); }
+    }
+
+    // Kept for existing call sites: always re-syncs fretboard + score to the transport position
+    function showNeckBar() {
+      neck.key = '';
+      syncVisuals(position(), engine.playing);
     }
 
     // ───────── Sample-accurate Web Audio 2-stem Vocal & Guitar engine ─────────
@@ -638,10 +879,16 @@
     }
     STEMS.forEach(k => sliders[k].addEventListener('input', () => { setScene(null); applyVolumes(); }));
 
+    function effectiveDuration() {
+      if (engine.duration > 0) return engine.duration;
+      const nBars = ((currentState && currentState.bar_analysis) || []).length;
+      return nBars ? Math.max(0.01, beatToSec(nBars * measureBeats)) : 0;
+    }
+
     function position() {
       if (engine.dragPos !== null) return engine.dragPos;
       const p = engine.playing ? engine.offset + (audioCtx.currentTime - engine.startedAt) : engine.offset;
-      return Math.max(0, Math.min(engine.duration, p));
+      return Math.max(0, Math.min(effectiveDuration(), p));
     }
 
     function stopSources() {
@@ -659,7 +906,7 @@
       await audioCtx.resume();
       stopSources();
       const offset = Math.max(0, Math.min(fromSec, engine.duration - 0.001));
-      const when = audioCtx.currentTime + 0.03; // one shared start instant for all three stems
+      const when = audioCtx.currentTime + 0.03; // one shared start instant for both stems
       STEMS.forEach(k => {
         const buf = engine.buffers[k];
         if (offset >= buf.duration) return;
@@ -679,53 +926,317 @@
     function pause() {
       engine.offset = position();
       engine.playing = false;
+      cancelAnimationFrame(engine.raf);
       stopSources();
       setPlayingUI(false);
       drawTimeline();
-      showNeckBar(neckShownBar);
+      syncVisuals(engine.offset, false);
     }
 
     function seek(sec) {
-      sec = Math.max(0, Math.min(engine.duration, sec));
-      if (engine.playing) play(sec);
-      else { engine.offset = sec; drawTimeline(); }
+      sec = Math.max(0, Math.min(effectiveDuration(), sec));
+      engine.offset = sec;
+      if (engine.playing) { engine.startedAt = audioCtx.currentTime; play(sec); } // position() is already correct while play() resumes
+      else { drawTimeline(); syncVisuals(sec, false); }
     }
 
     function tick() {
       cancelAnimationFrame(engine.raf);
+      const pos = position();
+      if (engine.playing && engine.dragPos === null && loopStartBar !== null && loopEndBar !== null) {
+        const end = Math.min(loopEndSec, engine.duration);
+        if (end - loopStartSec > 0.05 && pos >= end - 0.012) {
+          engine.offset = loopStartSec;
+          engine.startedAt = audioCtx.currentTime;
+          play(loopStartSec); // play() restarts the rAF loop
+          return;
+        }
+      }
       drawTimeline();
+      syncVisuals(pos, engine.playing);
       if (!engine.playing) return;
-      if (position() >= engine.duration) {
+      if (pos >= engine.duration) {
         engine.playing = false;
         engine.offset = 0;
         stopSources();
         setPlayingUI(false);
         drawTimeline();
-        showNeckBar(selectedBarIndex);
+        syncVisuals(0, false);
         return;
       }
-      const bar = playheadBar();
-      if (bar !== neckShownBar) showNeckBar(bar);
       engine.raf = requestAnimationFrame(tick);
     }
 
+    // ───────── A–B bar loop practice ─────────
+    let loopStartBar = null, loopEndBar = null, loopStartSec = 0, loopEndSec = 0;
+
+    function updateLoopUI() {
+      const n = ((currentState && currentState.bar_analysis) || []).length;
+      if (loopStartBar !== null && loopStartBar >= n) loopStartBar = loopEndBar = null;
+      if (loopEndBar !== null) loopEndBar = Math.min(loopEndBar, n - 1);
+      const hasA = loopStartBar !== null, on = hasA && loopEndBar !== null;
+      loopStartSec = hasA ? beatToSec(loopStartBar * measureBeats) : 0;
+      loopEndSec = on ? beatToSec((loopEndBar + 1) * measureBeats) : 0;
+      const readout = document.getElementById('loop-readout');
+      readout.hidden = !hasA;
+      readout.textContent = on ? `循环 ${loopStartBar + 1}–${loopEndBar + 1}节` : (hasA ? `A ${loopStartBar + 1}节 → 待设 B` : '');
+      document.getElementById('btn-loop-clear').hidden = !hasA;
+      document.getElementById('btn-loop-a').classList.toggle('active', hasA);
+      document.getElementById('btn-loop-b').classList.toggle('active', on);
+      drawTimeline();
+    }
+    function setLoopA(bar) {
+      loopStartBar = bar;
+      if (loopEndBar !== null && loopEndBar < bar) loopEndBar = null;
+      updateLoopUI();
+    }
+    function setLoopB(bar) {
+      const a = loopStartBar === null ? bar : loopStartBar;
+      loopStartBar = Math.min(a, bar);
+      loopEndBar = Math.max(a, bar);
+      updateLoopUI();
+    }
+    function clearLoop() { loopStartBar = loopEndBar = null; updateLoopUI(); }
+
+    // New song: stop, rewind and drop the loop
+    function resetTransport() {
+      if (engine.playing) pause();
+      engine.offset = 0;
+      clearLoop();
+      syncVisuals(0, false);
+    }
+
+    // Select a bar everywhere (inspector, fretboard, score) and move the transport there — never reloads audio
+    function selectBar(idx, localBeat, fromScore) {
+      const bars = (currentState && currentState.bar_analysis) || [];
+      const n = bars.length;
+      if (!n) return;
+      selectedBarIndex = Math.max(0, Math.min(n - 1, idx));
+      const segs = (bars[selectedBarIndex] && bars[selectedBarIndex].split_segments) || [];
+      if (localBeat === undefined) {
+        selectedSegmentIndex = 0;
+      } else {
+        let sIdx = 0;
+        for (let i = 0; i < segs.length; i++) if (segs[i].beat <= localBeat + 1e-6) sIdx = i;
+        selectedSegmentIndex = sIdx;
+      }
+      if (!fromScore) forceScroll = true;
+      seek(beatToSec(selectedBarIndex * measureBeats + (localBeat || 0)));
+      renderBarInspector(currentState);
+    }
+
+    document.getElementById('btn-loop-a').addEventListener('click', () => setLoopA(playheadBar()));
+    document.getElementById('btn-loop-b').addEventListener('click', () => setLoopB(playheadBar()));
+    document.getElementById('btn-loop-clear').addEventListener('click', clearLoop);
+    document.getElementById('btn-follow-toggle').addEventListener('click', e => {
+      followScore = !followScore;
+      if (followScore) manualScrollUntil = 0;
+      e.currentTarget.classList.toggle('active', followScore);
+      e.currentTarget.setAttribute('aria-pressed', String(followScore));
+    });
+
+    // ───────── Score iframe: cached 60fps playhead, highlights, auto-scroll, click-to-seek ─────────
+    const scoreFrame = document.getElementById('score-iframe');
+    let scoreCache = null, followScore = true, manualScrollUntil = 0, nextScrollCheck = 0, forceScroll = false;
+    let activeTabs = [], activeMarks = [], activeNoteKey = '';
+
+    function buildScoreCache() {
+      scoreCache = null; activeTabs = []; activeMarks = []; activeNoteKey = '';
+      const doc = scoreFrame.contentDocument;
+      if (!doc || !doc.body) return;
+      const sc = { win: scoreFrame.contentWindow, systems: [], bars: [], noteElsByIndex: {}, lyricElsByIndex: {}, tabElsByBar: [], sys: null, bar: null, hover: null };
+      let tabCount = 0;
+      doc.querySelectorAll('svg.score-system').forEach(svg => {
+        const sys = {
+          svg, bars: [], start: Number(svg.dataset.barStart) || 0, end: Number(svg.dataset.barEnd) || 0,
+          hl: svg.querySelector('.score-bar-highlight'), ph: svg.querySelector('.score-playhead'), guide: svg.querySelector('.score-hover-guide')
+        };
+        svg.style.cursor = 'pointer';
+        svg.querySelectorAll('g.score-bar').forEach(g => {
+          const idx = parseInt(g.dataset.barIndex, 10);
+          if (!Number.isFinite(idx)) return;
+          const bar = { idx, sys, left: Number(g.dataset.xLeft) || 0, pad: Number(g.dataset.xPad) || 0, width: Number(g.dataset.barWidth) || 0 };
+          sys.bars.push(bar);
+          sc.bars[idx] = bar;
+          g.querySelectorAll('g.tab-note').forEach(el => {
+            const v = parseFloat(el.dataset.evStart), d = parseFloat(el.dataset.evDur) || 0;
+            if (!isFinite(v)) return;
+            (sc.tabElsByBar[idx] = sc.tabElsByBar[idx] || []).push(mkEvent(v, d, el.dataset.string, el.dataset.fret, el.dataset.tech, el));
+            tabCount++;
+          });
+        });
+        sc.systems.push(sys);
+      });
+      const indexMarks = (attr, prop, map) => doc.querySelectorAll('[' + attr + ']').forEach(el => {
+        const i = parseInt(el.dataset[prop], 10); // skips "None" / NaN
+        if (Number.isFinite(i)) (map[i] = map[i] || []).push(el);
+      });
+      indexMarks('data-note-index', 'noteIndex', sc.noteElsByIndex);
+      indexMarks('data-lyric-index', 'lyricIndex', sc.lyricElsByIndex);
+      if (tabCount) stateEventsByBar = sc.tabElsByBar; // the engraved TAB is the ground truth for string/fret/technique
+      scoreCache = sc;
+    }
+
+    function syncVisuals(posSec, isPlaying) {
+      const nBars = ((currentState && currentState.bar_analysis) || []).length;
+      const beatPos = secToBeat(posSec);
+      const barIdx = Math.max(0, Math.min(Math.max(0, nBars - 1), Math.floor(beatPos / measureBeats + 1e-9)));
+      const localBeat = Math.max(0, Math.min(measureBeats, beatPos - barIdx * measureBeats));
+      updateNeck(barIdx, localBeat, posSec, isPlaying);
+
+      const sc = scoreCache;
+      if (!sc) return;
+      const bar = sc.bars[barIdx] || null, sys = bar ? bar.sys : null;
+      if (sys !== sc.sys) {
+        if (sc.sys) { vis(sc.sys.ph, false); vis(sc.sys.hl, false); }
+        sc.sys = sys; sc.bar = null;
+        if (sys) vis(sys.hl, true);
+      }
+      // At rest on 00:00 the needle stays hidden so it never slices bar 1's TAB digits; the bar frame still shows
+      if (sys) vis(sys.ph, Boolean(sys && (isPlaying || posSec > 0.001)));
+      if (bar) {
+        if (bar !== sc.bar) {
+          sc.bar = bar;
+          if (sys.hl) { sys.hl.setAttribute('x', bar.left); sys.hl.setAttribute('width', bar.width); }
+        }
+        const svgX = bar.left + bar.pad + (localBeat / measureBeats) * (bar.width - 2 * bar.pad);
+        if (sys.ph) sys.ph.setAttribute('transform', 'translate(' + svgX.toFixed(2) + ',0)');
+      }
+
+      // TAB notes
+      const tabs = [];
+      for (let b = Math.max(0, barIdx - 1); b <= barIdx; b++) {
+        const list = sc.tabElsByBar[b];
+        if (list) for (let i = 0; i < list.length; i++) if (list[i].start <= beatPos && beatPos < list[i].end) tabs.push(list[i]);
+      }
+      activeTabs.forEach(t => { if (!tabs.includes(t)) t.el.classList.remove('tab-active'); });
+      tabs.forEach(t => { if (!activeTabs.includes(t)) t.el.classList.add('tab-active'); });
+      activeTabs = tabs;
+
+      // Jianpu notes + lyrics
+      let lo = 0, hi = stateNotes.length - 1, last = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (stateNotes[mid].start <= beatPos) { last = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+      let noteKey = '';
+      for (let i = last; i >= 0 && i > last - 4; i--) if (beatPos < stateNotes[i].end) noteKey += stateNotes[i].index + ',';
+      if (noteKey !== activeNoteKey) {
+        activeNoteKey = noteKey;
+        activeMarks.forEach(m => m[0].classList.remove(m[1]));
+        activeMarks = [];
+        noteKey.split(',').forEach(i => {
+          if (i === '') return;
+          (sc.noteElsByIndex[i] || []).forEach(el => { el.classList.add('jp-active'); activeMarks.push([el, 'jp-active']); });
+          (sc.lyricElsByIndex[i] || []).forEach(el => { el.classList.add('lyric-active'); activeMarks.push([el, 'lyric-active']); });
+        });
+      }
+
+      // Follow the active system (throttled so smooth scrolling never fights itself)
+      const now = Date.now();
+      if (sys && (forceScroll || (isPlaying && followScore && now > manualScrollUntil && now > nextScrollCheck))) {
+        forceScroll = false;
+        nextScrollCheck = now + 160;
+        const r = sys.svg.getBoundingClientRect(), H = sc.win.innerHeight;
+        if (H > 0 && (r.top < H * 0.14 || r.bottom > H * 0.80)) {
+          const dy = r.top - H * 0.22;
+          if (Math.abs(dy) > 8) { sc.win.scrollBy({ top: dy, behavior: 'smooth' }); nextScrollCheck = now + 700; }
+        }
+      }
+    }
+
+    // Zoom-invariant pointer -> (bar, beat): ratios of the live bounding box against the viewBox
+    function scoreHit(e) {
+      const sc = scoreCache, svg = sc && e.target && e.target.closest && e.target.closest('svg.score-system');
+      const sys = svg && sc.systems.find(s => s.svg === svg);
+      if (!sys || !sys.bars.length) return null;
+      const r = svg.getBoundingClientRect(), vb = svg.viewBox.baseVal;
+      const svgX = ((e.clientX - r.left) / Math.max(1, r.width)) * vb.width;
+      const svgY = ((e.clientY - r.top) / Math.max(1, r.height)) * vb.height;
+      const bar = sys.bars.find(b => svgX >= b.left && svgX < b.left + b.width)
+        || (svgX < sys.bars[0].left ? sys.bars[0] : sys.bars[sys.bars.length - 1]);
+      const frac = Math.max(0, Math.min(0.999, (svgX - bar.left - bar.pad) / Math.max(1, bar.width - 2 * bar.pad)));
+      let localBeat = frac * measureBeats;
+      if (svgY < 105) {
+        const bInfo = currentState && currentState.bar_analysis && currentState.bar_analysis[bar.idx];
+        const segs = (bInfo && bInfo.split_segments) || [];
+        let snapBeat = 0;
+        for (let i = 0; i < segs.length; i++) if (segs[i].beat <= localBeat + 1e-6) snapBeat = segs[i].beat;
+        localBeat = snapBeat;
+      }
+      return { sys, svgX, barIdx: bar.idx, localBeat };
+    }
+
+    function onGlobalKey(e) {
+      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+      const t = e.target, tag = (t && t.tagName) || '';
+      if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (t && t.isContentEditable) || (t && t.closest && t.closest('#seek-bar'))) return;
+      const bar = playheadBar();
+      if (e.key === ' ' || e.code === 'Space') {
+        if (tag === 'BUTTON' || tag === 'A' || tag === 'SUMMARY' || btnPlayToggle.disabled) return; // focused controls keep their native Space
+        btnPlayToggle.click();
+      } else if (e.key === 'ArrowLeft') selectBar(secToBeat(position()) - bar * measureBeats > 1 ? bar : bar - 1);
+      else if (e.key === 'ArrowRight') selectBar(bar + 1);
+      else if (e.key === '[') setLoopA(bar);
+      else if (e.key === ']') setLoopB(bar);
+      else if (e.key === '\\') clearLoop();
+      else if (e.key === 'f' || e.key === 'F') document.getElementById('btn-zen-toggle').click();
+      else return;
+      e.preventDefault();
+    }
+    document.addEventListener('keydown', onGlobalKey);
+
+    scoreFrame.addEventListener('load', () => {
+      applyZoom();
+      buildScoreCache();
+      const doc = scoreFrame.contentDocument;
+      if (doc && doc.documentElement) {
+        const hideGuide = () => { if (scoreCache && scoreCache.hover) { vis(scoreCache.hover.guide, false); scoreCache.hover = null; } };
+        doc.addEventListener('mousemove', e => {
+          const hit = scoreHit(e);
+          if (!hit || !hit.sys.guide) { hideGuide(); return; }
+          if (scoreCache.hover !== hit.sys) { hideGuide(); scoreCache.hover = hit.sys; vis(hit.sys.guide, true); }
+          hit.sys.guide.setAttribute('x1', hit.svgX.toFixed(1));
+          hit.sys.guide.setAttribute('x2', hit.svgX.toFixed(1));
+        });
+        doc.documentElement.addEventListener('mouseleave', hideGuide);
+        doc.addEventListener('click', e => {
+          const hit = scoreHit(e);
+          if (!hit) return;
+          if (e.shiftKey) {
+            if (loopStartBar === null || loopEndBar !== null) { loopEndBar = null; setLoopA(hit.barIdx); }
+            else setLoopB(hit.barIdx);
+            return;
+          }
+          selectBar(hit.barIdx, hit.localBeat, true);
+        });
+        const holdScroll = () => { manualScrollUntil = Date.now() + 4000; };
+        doc.addEventListener('wheel', holdScroll, { passive: true });
+        doc.addEventListener('touchmove', holdScroll, { passive: true });
+        doc.addEventListener('keydown', onGlobalKey); // shortcuts keep working after clicking into the score
+      }
+      forceScroll = true; // a re-rendered score reopens at the current bar, not the top
+      neck.key = '';
+      updateLoopUI();
+      syncVisuals(position(), engine.playing);
+    });
+
     function computePeaks(buffers, bins) {
-      const peaks = new Float32Array(bins);
+      const out = {};
       STEMS.forEach(k => {
-        const buf = buffers[k];
-        const data = buf.getChannelData(0);
+        const buf = buffers[k], data = buf.getChannelData(0), peaks = out[k] = new Float32Array(bins);
         const perBin = (engine.duration * buf.sampleRate) / bins;
+        let max = 0;
         for (let b = 0; b < bins; b++) {
           const s0 = Math.floor(b * perBin), s1 = Math.min(data.length, Math.floor((b + 1) * perBin));
           let m = 0;
           for (let i = s0; i < s1; i += 16) { const v = Math.abs(data[i]); if (v > m) m = v; }
-          peaks[b] = Math.max(peaks[b], m);
+          peaks[b] = m;
+          if (m > max) max = m;
         }
+        if (max > 0) for (let b = 0; b < bins; b++) peaks[b] /= max;
       });
-      let max = 0;
-      peaks.forEach(v => { if (v > max) max = v; });
-      if (max > 0) for (let b = 0; b < bins; b++) peaks[b] /= max;
-      return peaks;
+      return out;
     }
 
     function drawTimeline() {
@@ -742,16 +1253,44 @@
       const g = seekCanvas.getContext('2d');
       g.setTransform(dpr, 0, 0, dpr, 0, 0);
       g.clearRect(0, 0, w, h);
-      const ratio = engine.duration ? pos / engine.duration : 0;
-      const step = 3, barW = 2, mid = h / 2;
-      const count = Math.floor(w / step);
-      for (let i = 0; i < count; i++) {
-        const x = i * step;
-        const amp = engine.peaks ? engine.peaks[Math.min(engine.peaks.length - 1, Math.floor(i / count * engine.peaks.length))] : 0.04;
-        const bh = Math.max(1.5, amp * (h - 10));
-        g.fillStyle = (x + barW) / w <= ratio ? '#1E1612' : 'rgba(74,48,28,0.2)';
-        g.fillRect(x, mid - bh / 2, barW, bh);
+      const dur = engine.duration, ratio = dur ? pos / dur : 0;
+
+      // A–B loop band
+      if (dur && loopStartBar !== null) {
+        const on = loopEndBar !== null;
+        const xa = Math.min(w, loopStartSec / dur * w), xb = on ? Math.min(w, loopEndSec / dur * w) : xa;
+        if (on) { g.fillStyle = 'rgba(245,158,11,0.18)'; g.fillRect(xa, 0, xb - xa, h); }
+        g.fillStyle = '#D97706';
+        g.font = '700 9px ui-monospace, Menlo, monospace';
+        g.fillRect(xa, 0, 1.5, h);
+        g.fillText('A', xa + 3, 9);
+        if (on) { g.fillRect(xb - 1.5, 0, 1.5, h); g.fillText('B', xb - 9, 9); }
       }
+
+      // Mirrored dual envelope: vocal above the centre line, guitar below
+      const step = 3, barW = 2, mid = Math.round(h / 2), half = Math.max(2, mid - 5);
+      const count = Math.floor(w / step), pk = engine.peaks;
+      for (let i = 0; i < count; i++) {
+        const x = i * step, played = (x + barW) / w <= ratio;
+        const bin = pk ? Math.min(pk.vocal.length - 1, Math.floor(i / count * pk.vocal.length)) : 0;
+        const vh = Math.max(1, (pk ? pk.vocal[bin] : 0.04) * half), gh = Math.max(1, (pk ? pk.guitar[bin] : 0.04) * half);
+        g.fillStyle = played ? '#1E1612' : 'rgba(74,48,28,0.22)';
+        g.fillRect(x, mid - vh, barW, vh);
+        g.fillStyle = played ? '#B45309' : 'rgba(180,83,9,0.26)';
+        g.fillRect(x, mid + 1, barW, gh);
+      }
+
+      // Bar-start ticks along the bottom edge
+      const nBars = ((currentState && currentState.bar_analysis) || []).length;
+      if (dur && nBars) {
+        const every = Math.max(1, Math.ceil(nBars * 5 / w));
+        g.fillStyle = 'rgba(74,48,28,0.4)';
+        for (let b = 0; b < nBars; b += every) {
+          const x = beatToSec(b * measureBeats) / dur * w;
+          if (x >= 0 && x <= w) g.fillRect(Math.round(x), h - 3, 1, 3);
+        }
+      }
+
       const px = Math.round(ratio * w);
       g.fillStyle = '#B45309';
       g.fillRect(px - 1, 0, 2, h);
@@ -766,11 +1305,13 @@
       seekBar.setPointerCapture(e.pointerId);
       engine.dragPos = seekFromPointer(e);
       drawTimeline();
+      if (!engine.playing) syncVisuals(engine.dragPos, false);
     });
     seekBar.addEventListener('pointermove', e => {
       if (engine.dragPos === null) return;
       engine.dragPos = seekFromPointer(e);
       drawTimeline();
+      if (!engine.playing) syncVisuals(engine.dragPos, false);
     });
     seekBar.addEventListener('pointerup', e => {
       if (engine.dragPos === null) return;
@@ -778,7 +1319,7 @@
       engine.dragPos = null;
       seek(t);
     });
-    seekBar.addEventListener('pointercancel', () => { engine.dragPos = null; drawTimeline(); });
+    seekBar.addEventListener('pointercancel', () => { engine.dragPos = null; drawTimeline(); if (!engine.playing) syncVisuals(position(), false); });
     seekBar.addEventListener('keydown', e => {
       if (!engine.buffers) return;
       if (e.key === 'ArrowRight') { seek(position() + 2); e.preventDefault(); }
@@ -835,7 +1376,7 @@
 
     // Mixer scenes
     const SCENES = {
-      'btn-mode-duet': { vocal: 85, guitar: 95 },
+      'btn-mode-duet': { vocal: 90, guitar: 82 },
       'btn-mode-guitar-only': { vocal: 0, guitar: 100 },
       'btn-mode-reference': { vocal: 100, guitar: 0 }
     };
@@ -851,7 +1392,7 @@
       });
     });
 
-    // Export: offline-render the three stems at the current fader levels
+    // Export: offline-render both stems at the current fader levels
     function encodeWav(buffer) {
       const ch = buffer.numberOfChannels, len = buffer.length, sr = buffer.sampleRate;
       const out = new DataView(new ArrayBuffer(44 + len * ch * 2));
@@ -929,32 +1470,63 @@
         btn.className = 'bar-pill' + (idx === selectedBarIndex ? ' active' : '');
         const segChords = (b.split_segments || []).map(s => s.chord).join('→') || b.chord;
         btn.textContent = `${String(idx + 1).padStart(2, '0')} ${segChords}`;
-        btn.onclick = () => { selectedBarIndex = idx; renderBarInspector(currentState); };
+        btn.onclick = () => selectBar(idx);
         strip.appendChild(btn);
       });
 
       const activeBar = bars[selectedBarIndex];
-      const cands = (activeBar.candidates && activeBar.candidates.length)
-        ? activeBar.candidates.map(c => c.chord)
-        : [activeBar.chord];
+      const segs = activeBar.split_segments || [];
+      const hasSplit = segs.length > 1;
+      if (selectedSegmentIndex >= segs.length) selectedSegmentIndex = 0;
+      const activeSeg = hasSplit ? segs[selectedSegmentIndex] : activeBar;
+
+      if (hasSplit) {
+        segs.forEach((sg, sIdx) => {
+          const segBtn = document.createElement('button');
+          segBtn.type = 'button';
+          segBtn.className = 'cand-chip' + (sIdx === selectedSegmentIndex ? ' active' : '');
+          segBtn.title = `选择本小节第 ${sIdx + 1} 拍段 (${sg.chord})`;
+          segBtn.textContent = `拍段${sIdx + 1}:${sg.chord}`;
+          segBtn.onclick = () => {
+            selectedSegmentIndex = sIdx;
+            seek(beatToSec(selectedBarIndex * measureBeats + (sg.beat || 0)));
+            renderBarInspector(currentState);
+          };
+          candStrip.appendChild(segBtn);
+        });
+      }
+
+      const rawCands = (activeSeg.candidates && activeSeg.candidates.length)
+        ? activeSeg.candidates
+        : (activeBar.candidates || []);
+      const cands = rawCands.length ? rawCands.map(c => c.chord) : [activeSeg.chord];
 
       cands.slice(0, 8).forEach(ch => {
         const chip = document.createElement('button');
         chip.type = 'button';
-        chip.className = 'cand-chip' + (ch === activeBar.chord ? ' active' : '');
+        chip.className = 'cand-chip' + (ch === activeSeg.chord ? ' active' : '');
         chip.textContent = ch;
-        chip.onclick = () => apiCall('bar_chord', { bar: selectedBarIndex, chord: ch }, true);
+        const payload = hasSplit
+          ? { bar: selectedBarIndex, segment: selectedSegmentIndex, chord: ch }
+          : { bar: selectedBarIndex, chord: ch };
+        chip.onclick = () => apiCall('bar_chord', payload, true);
         candStrip.appendChild(chip);
       });
 
-      (activeBar.voicings || []).slice(0, 4).forEach((v, vIdx) => {
+      const segVoicings = (activeSeg.voicings && activeSeg.voicings.length)
+        ? activeSeg.voicings
+        : (activeBar.voicings || []);
+      segVoicings.slice(0, 4).forEach((v, vIdx) => {
         const chip = document.createElement('button');
         chip.type = 'button';
         const fStr = v.frets.map(f => f < 0 ? 'X' : f).join('');
-        const curFStr = (activeBar.frets || []).map(f => f < 0 ? 'X' : f).join('');
+        const curFStr = (activeSeg.frets || activeBar.frets || []).map(f => f < 0 ? 'X' : f).join('');
         chip.className = 'cand-chip' + (fStr === curFStr ? ' active' : '');
         chip.textContent = `按法${vIdx + 1} ${fStr}`;
-        chip.onclick = () => apiCall('bar_chord', { bar: selectedBarIndex, frets: v.frets }, true);
+        const vPayload = hasSplit
+          ? { bar: selectedBarIndex, segment: selectedSegmentIndex, frets: v.frets }
+          : { bar: selectedBarIndex, frets: v.frets };
+        chip.onclick = () => apiCall('bar_chord', vPayload, true);
         voicingStrip.appendChild(chip);
       });
 
@@ -963,33 +1535,21 @@
 
     function renderChordPills(chords, activeIdx = 0) {
       const box = document.getElementById('pill-chords');
+      const range = document.getElementById('chord-range');
       box.replaceChildren();
-      if (!chords || !chords.length) return;
+      if (!chords || !chords.length) { range.textContent = ''; return; }
       const winSize = 8;
       const start = Math.floor(Math.max(0, activeIdx) / winSize) * winSize;
       const end = Math.min(chords.length, start + winSize);
-      const lbl = document.createElement('span');
-      lbl.className = 'chord-arrow';
-      lbl.style.marginRight = '4px';
-      lbl.textContent = `第${start + 1}–${end}小节:`;
-      box.appendChild(lbl);
+      range.textContent = `第 ${start + 1}–${end} 小节`;
+      // Only bar cells go into the 4-column lead-sheet grid; the bar number renders via ::before
       for (let i = start; i < end; i++) {
-        if (i > start) {
-          const arrow = document.createElement('span');
-          arrow.className = 'chord-arrow';
-          arrow.textContent = '→';
-          box.appendChild(arrow);
-        }
         const pill = document.createElement('span');
         pill.className = 'chord-pill' + (i === activeIdx ? ' active' : '');
-        pill.style.cursor = 'pointer';
+        pill.dataset.bar = String(i + 1).padStart(2, '0');
         pill.title = `点击跳转第 ${i + 1} 小节`;
         pill.textContent = chords[i];
-        pill.onclick = () => {
-          selectedBarIndex = i;
-          if (currentState) renderBarInspector(currentState);
-          showNeckBar(i);
-        };
+        pill.onclick = () => selectBar(i);
         box.appendChild(pill);
       }
     }
@@ -997,17 +1557,46 @@
     // The active aesthetic card previews the loaded song's real progression; the others keep their sample.
     function renderAestheticChords(s) {
       const progression = (s.chords || []).filter((c, i, arr) => i === 0 || c !== arr[i - 1]).slice(0, 4);
+      const recPreset = s.recommended_preset || '';
+      const secPreset = s.recommended_secondary_preset || '';
+      let recCardTitle = '';
       document.querySelectorAll('.aes').forEach(b => {
         const badge = b.querySelector('.aes-chords');
         if (!badge.dataset.sample) badge.dataset.sample = badge.textContent;
         badge.textContent = b.dataset.vibe === s.preset && progression.length
           ? progression.join(' → ') + ((s.chords || []).length > 4 ? ' …' : '')
           : badge.dataset.sample;
+        const isPrimary = Boolean(recPreset && b.dataset.vibe === recPreset);
+        const isSecondary = Boolean(!isPrimary && secPreset && b.dataset.vibe === secPreset);
+        b.classList.toggle('recommended', isPrimary);
+        b.classList.toggle('recommended-alt', isSecondary);
+        const recTag = b.querySelector('.aes-rec-badge');
+        if (recTag) {
+          recTag.textContent = isPrimary ? '★ 本曲推荐' : (isSecondary ? '★ 亦宜' : '★ 本曲推荐');
+        }
+        if (isPrimary) {
+          const tEl = b.querySelector('.aes-title');
+          recCardTitle = tEl ? tEl.textContent : recPreset;
+        }
       });
+      const banner = document.getElementById('rec-banner');
+      if (banner) {
+        if (recPreset && s.recommended_reason) {
+          banner.style.display = 'block';
+          banner.replaceChildren();
+          const strong = document.createElement('b');
+          strong.textContent = `★ 本曲推荐「${recCardTitle}」：`;
+          banner.appendChild(strong);
+          banner.appendChild(document.createTextNode(s.recommended_reason));
+        } else {
+          banner.style.display = 'none';
+        }
+      }
     }
 
     function renderState(s, refreshAudio = true) {
       currentState = s;
+      indexState(s);
 
       document.getElementById('score-title-text').textContent = s.title || '艺术吉他曲谱';
       document.getElementById('pill-key').textContent = `1 = ${s.tonic}`;
@@ -1019,7 +1608,30 @@
       if (activeDemo !== 'upload' && s.active_demo) activeDemo = s.active_demo;
       selectTrack(activeDemo);
 
+      if (s.repertoire) {
+        document.querySelectorAll('.track[data-demo]').forEach(btn => {
+          const info = s.repertoire[btn.dataset.demo];
+          if (!info) return;
+          const nameEl = btn.querySelector('.track-name');
+          const metaEl = btn.querySelector('.track-meta');
+          const tagEl = btn.querySelector('.track-tag');
+          if (nameEl && !nameEl.dataset.origHtml) nameEl.dataset.origHtml = nameEl.innerHTML;
+          if (metaEl && !metaEl.dataset.origText) metaEl.dataset.origText = metaEl.textContent;
+          if (tagEl && !tagEl.dataset.origText) tagEl.dataset.origText = tagEl.textContent;
+          if (!info.has_real_vocal) {
+            if (nameEl) nameEl.textContent = info.title || btn.dataset.demo;
+            if (metaEl) metaEl.textContent = info.subtitle || '';
+            if (tagEl) tagEl.textContent = '合成练习曲';
+          } else {
+            if (nameEl && nameEl.dataset.origHtml) nameEl.innerHTML = nameEl.dataset.origHtml;
+            if (metaEl && metaEl.dataset.origText) metaEl.textContent = metaEl.dataset.origText;
+            if (tagEl && tagEl.dataset.origText) tagEl.textContent = tagEl.dataset.origText;
+          }
+        });
+      }
       document.getElementById('label-vocal-track').textContent = s.has_real_vocal ? '真人主唱' : '主旋律领奏';
+      const refBtn = document.getElementById('btn-mode-reference');
+      if (refBtn) refBtn.textContent = s.has_real_vocal ? '人声' : '主旋律';
       document.querySelectorAll('.aes').forEach(b => b.classList.toggle('active', b.dataset.vibe === s.preset));
       renderAestheticChords(s);
 
@@ -1088,6 +1700,7 @@
       card.addEventListener('click', () => {
         activeDemo = card.dataset.demo;
         selectedBarIndex = 0;
+        resetTransport();
         selectTrack(activeDemo);
         document.getElementById('upload-panel').style.display = 'none';
         apiCall('load_demo', { demo: activeDemo }, true);
@@ -1115,20 +1728,34 @@
         const j = await r.json();
         if (!r.ok) throw new Error(j.detail || '上传失败');
         const poll = setInterval(async () => {
-          const sr = await fetch('/api/job/' + j.job_id);
-          const sj = await sr.json();
-          statusEl.textContent = sj.message || '处理中…';
-          if (sj.status === 'done') {
+          try {
+            const sr = await fetch('/api/job/' + j.job_id);
+            if (!sr.ok) {
+              clearInterval(poll);
+              showError('查询分析任务状态失败');
+              return;
+            }
+            const sj = await sr.json();
+            statusEl.textContent = sj.message || '处理中…';
+            if (sj.status === 'done') {
+              clearInterval(poll);
+              statusEl.textContent = '已生成艺术吉他编配谱与伴奏';
+              document.getElementById('upload-panel').style.display = 'none';
+              activeDemo = 'upload';
+              selectedBarIndex = 0;
+              resetTransport();
+              selectTrack(activeDemo);
+              apiCall('state', undefined, true);
+            } else if (sj.status === 'superseded') {
+              clearInterval(poll);
+              statusEl.textContent = sj.message || '分析请求已被新曲目切换取代';
+            } else if (sj.status === 'error') {
+              clearInterval(poll);
+              showError('分析出错：' + sj.message);
+            }
+          } catch (pollErr) {
             clearInterval(poll);
-            statusEl.textContent = '已生成艺术吉他编配谱与伴奏';
-            document.getElementById('upload-panel').style.display = 'none';
-            activeDemo = 'upload';
-            selectedBarIndex = 0;
-            selectTrack(activeDemo);
-            apiCall('state', undefined, true);
-          } else if (sj.status === 'error') {
-            clearInterval(poll);
-            showError('分析出错：' + sj.message);
+            showError('轮询分析进度中断：' + pollErr.message);
           }
         }, 1000);
       } catch (e) {
@@ -1136,27 +1763,46 @@
       }
     });
 
-    // 02 · Guitar artistry cards — each sends a distinct preset + style combination
+    // 02 · Guitar artistry cards — each sends a distinct preset + style combination by name
+    function pickStyle(styles, vibe, ...preferred) {
+      if (
+        currentState &&
+        currentState.recommended_preset === vibe &&
+        currentState.recommended_style &&
+        styles.includes(currentState.recommended_style)
+      ) {
+        return currentState.recommended_style;
+      }
+      for (const name of preferred) {
+        if (styles.includes(name)) return name;
+      }
+      return styles[0];
+    }
+
+    function cmIntroMode() {
+      return currentState?.accompaniment_backend === 'advanced' ? 'chord_melody' : 'none';
+    }
+
     const VIBE_CONFIGS = {
       original: styles => ({
-        preset: 'original', style: styles[0],
+        preset: 'original', style: pickStyle(styles, 'original', '分解和弦', '民谣分解'),
         split_bar: false, passing_bass: false, slap_x: false, palm_mute: false, embellish_hp: false,
-        intro_mode: 'chord_melody'
+        intro_mode: cmIntroMode()
       }),
       folk_easy: styles => ({
-        preset: 'folk_easy', style: styles[1] || styles[0],
+        preset: 'folk_easy', style: pickStyle(styles, 'folk_easy', '扫弦伴奏', '分解和弦', '民谣扫弦'),
         split_bar: false, passing_bass: false, slap_x: false, palm_mute: false, embellish_hp: false,
-        intro_mode: 'none'
+        intro_mode: cmIntroMode()
       }),
       emotional_pop: styles => ({
-        preset: 'emotional_pop', style: styles[4] || styles[0],
+        preset: 'emotional_pop', style: pickStyle(styles, 'emotional_pop', '抒情琶音', '分解和弦'),
         split_bar: false, passing_bass: true, slap_x: false, palm_mute: false, embellish_hp: true,
-        intro_mode: 'chord_melody'
+        intro_mode: cmIntroMode()
       }),
       neosoul_jazz: styles => ({
-        preset: 'neosoul_jazz', style: styles[3] || styles[1] || styles[0],
+        preset: 'neosoul_jazz', style: pickStyle(styles, 'neosoul_jazz', 'Neo-Soul 律动', '指弹律动', '流行扫弦'),
         split_bar: true, passing_bass: true, slap_x: false, palm_mute: false, embellish_hp: true,
-        intro_mode: 'chord_melody'
+        intro_mode: cmIntroMode()
       })
     };
 
@@ -1207,11 +1853,19 @@
         iframe.contentDocument.body.style.zoom = (currentZoom / 100).toString();
       }
     }
-    document.getElementById('score-iframe').addEventListener('load', applyZoom);
     document.getElementById('zoom-in').addEventListener('click', () => { currentZoom = Math.min(150, currentZoom + 10); applyZoom(); });
     document.getElementById('zoom-out').addEventListener('click', () => { currentZoom = Math.max(70, currentZoom - 10); applyZoom(); });
 
-    renderNeck([]);
+    // Focus mode: collapse the rail; redraw the seek canvas once the .34s grid transition has settled
+    document.getElementById('btn-zen-toggle').addEventListener('click', e => {
+      const on = document.body.classList.toggle('zen');
+      e.currentTarget.classList.toggle('active', on);
+      e.currentTarget.setAttribute('aria-pressed', String(on));
+      requestAnimationFrame(drawTimeline);
+      setTimeout(drawTimeline, 360);
+    });
+
+    syncVisuals(0, false);
     applyVolumes();
     drawTimeline();
     apiCall('state', undefined, true);

@@ -61,6 +61,7 @@ psutil==7.2.2
 pycparser==3.0
 pymupdf==1.28.2
 pyparsing==3.3.3
+pypinyin==0.55.0
 PySocks==1.7.1
 python-dateutil==2.9.0.post0
 pyworld==0.3.5

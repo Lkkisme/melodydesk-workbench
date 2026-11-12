@@ -4,6 +4,7 @@ from .chord_voicing import (
     parse_extended_chord,
     generate_voicings,
     optimize_voice_leading,
+    select_ergonomic_capo,
 )
 from .reharmonizer import (
     REHARMONIZE_PRESETS,
@@ -11,6 +12,7 @@ from .reharmonizer import (
     check_melody_clash,
     reharmonize_progression,
     suggest_bar_substitutions,
+    recommend_artistry,
 )
 from .arrangement_grooves import (
     ADVANCED_STYLES,
@@ -27,11 +29,13 @@ __all__ = [
     "parse_extended_chord",
     "generate_voicings",
     "optimize_voice_leading",
+    "select_ergonomic_capo",
     "REHARMONIZE_PRESETS",
     "roman_numeral",
     "check_melody_clash",
     "reharmonize_progression",
     "suggest_bar_substitutions",
+    "recommend_artistry",
     "ADVANCED_STYLES",
     "arrange_advanced",
     "synthesize_realistic_guitar",
