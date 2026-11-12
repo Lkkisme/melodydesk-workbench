@@ -1791,6 +1791,181 @@ class ForensicRegressionTests(unittest.TestCase):
         # Never mutate AudioBufferSourceNode.playbackRate (must stay strictly at concert pitch 1.0)
         self.assertNotIn(".playbackRate", index_html)
 
+    def test_campaign_fable_audit_and_split_inspector_regressions(self):
+        import re
+        import xml.etree.ElementTree as ET
+        from unittest.mock import patch
+        from fastapi.testclient import TestClient
+        from subpkgs.guitar_reharm import arrange_advanced, check_melody_clash, reharmonize_progression
+        from subpkgs.score_web import render_publication_score_html
+
+        # M1: Meter / BPM change resamples base_chords & bar_dynamics by dominant bar overlap instead of truncating/drifting
+        app_m1 = srv.create_app()
+        with app_m1.state.session_lock:
+            s_m1 = srv._build_session("mandarin_pop")
+            # Force synthetic 12-bar 4/4 grid so assertions are deterministic regardless of local audio files
+            s_m1.project.meter = "4/4"
+            s_m1.project.bpm = 92.0
+            s_m1.project.beat_origin = 0.0
+            s_m1.project.source = ""
+            s_m1.project.audio = {}
+            s_m1.beat_times = []
+            s_m1.bar_start_seconds = []
+            s_m1.base_chords = ["C", "G/B", "Am7", "G", "C", "G/B", "Am7", "Fmaj7", "Fmaj7", "C/E", "Dm7", "C"]
+            s_m1.bar_dynamics = [0.80 + 0.02 * i for i in range(12)]
+            s_m1.custom_voicings = [None] * 12
+            s_m1.project.notes, _ = parse_jianpu(srv._DEMO_PIECES["mandarin_pop"]["jianpu"], tonic="C", bpm=92.0)
+            s_m1.project.reference_notes = [Note(**vars(n)) for n in s_m1.project.notes]
+            s_m1.note_lyrics = [""] * len(s_m1.project.notes)
+            s_m1.reference_note_lyrics = list(s_m1.note_lyrics)
+            s_m1.note_ref_indices = list(range(len(s_m1.project.notes)))
+            srv._rebuild(s_m1)
+            app_m1.state.session = s_m1
+
+        c_m1 = TestClient(app_m1)
+        r_m1 = c_m1.post("/api/reharmonize", json={"meter": "3/4"})
+        self.assertEqual(r_m1.status_code, 200)
+        ba_m1 = r_m1.json()["bar_analysis"]
+        self.assertEqual(len(ba_m1), 16)
+        # Beats 9..12 -> old bar 2 ('Am7'), beats 12..15 -> old bar 3 ('G'), beats 45..48 -> old bar 11 ('C')
+        self.assertEqual(ba_m1[3]["original_chord"], "Am7")
+        self.assertEqual(ba_m1[4]["original_chord"], "G")
+        self.assertEqual(ba_m1[15]["original_chord"], "C")
+
+        # M2: 3/4 and 9/8 user split_bar=True lands on metrically valid beats (2.0 in 3/4, 3.0 in 9/8, 1.5 in 6/8)
+        p_34 = Project(title="m2_34", tonic="C", meter="3/4", bpm=96.0, notes=[])
+        reh_34_split = reharmonize_progression(["Am", "Dm", "G7", "C"], p_34, preset="walking_bass", tonic="C", split_bar=True)
+        for row in reh_34_split:
+            for seg in row["split_segments"]:
+                self.assertIn(seg["beat"], (0.0, 2.0))
+        p_98 = Project(title="m2_98", tonic="C", meter="9/8", bpm=90.0, notes=[])
+        reh_98_split = reharmonize_progression(["Am", "Dm", "G7", "C"], p_98, preset="walking_bass", tonic="C", split_bar=True)
+        for row in reh_98_split:
+            for seg in row["split_segments"]:
+                self.assertIn(seg["beat"], (0.0, 3.0))
+
+        # M3: 3/4 palm_mute=True uses groove['bass_pivot'] (beat 2.0), never injecting an off-beat 1.5 PM bass
+        p_pm34 = Project(
+            title="m3_pm34",
+            tonic="C",
+            meter="3/4",
+            bpm=96.0,
+            notes=[Note(start=0.0, duration=2.0, pitch=69), Note(start=3.0, duration=2.0, pitch=65)],
+        )
+        arr_pm34 = arrange_advanced(p_pm34, ["Am", "Dm"], style="分解和弦", palm_mute=True, intro_mode="none")
+        self.assertFalse(any(e.get("technique") == "PM" and abs(e["beat"] - 1.5) < 1e-9 for e in arr_pm34["events"]))
+
+        # M4: Asymmetric 3/4 split [(0, 2), (2, 1)] places the SVG dashed divider at exact x_at(2.0 * TICKS)
+        arr_svg34 = {
+            "title": "m4_svg34",
+            "tonic": "C",
+            "meter": "3/4",
+            "bpm": 96.0,
+            "style": "指弹律动",
+            "capo": 0,
+            "bar_count": 1,
+            "measure_beats": 3.0,
+            "chords": ["Am7"],
+            "bars": [
+                {
+                    "bar": 0,
+                    "chord": "Am7",
+                    "roman": "vi7",
+                    "frets": [-1, 0, 2, 0, 1, 0],
+                    "split_segments": [
+                        {"beat": 0.0, "duration": 2.0, "chord": "Am7", "roman": "vi7", "frets": [-1, 0, 2, 0, 1, 0]},
+                        {"beat": 2.0, "duration": 1.0, "chord": "G/B", "roman": "V/7", "frets": [-1, 2, 0, 0, 0, 3]},
+                    ],
+                }
+            ],
+            "events": [
+                {"bar": 0, "start": 0.0, "duration": 1.0, "string": 5, "fret": 0, "pitch": 45, "velocity": 84, "technique": ""},
+                {"bar": 0, "start": 2.0, "duration": 1.0, "string": 5, "fret": 2, "pitch": 47, "velocity": 84, "technique": ""},
+            ],
+        }
+        p_svg34 = Project(title="m4_svg34", tonic="C", meter="3/4", bpm=96.0, notes=[Note(start=0.0, duration=3.0, pitch=69)])
+        svg_34_html = render_publication_score_html(p_svg34, arr_svg34, ["月"])
+        svg_34_match = re.search(r"<svg\b[^>]*>.*?</svg>", svg_34_html, flags=re.S)
+        self.assertIsNotNone(svg_34_match)
+        root_34 = ET.fromstring(svg_34_match.group(0))
+        svg_ns = "{http://www.w3.org/2000/svg}"
+        bar_g = next(el for el in root_34.iter(f"{svg_ns}g") if el.attrib.get("class") == "score-bar")
+        b_left = float(bar_g.attrib["data-x-left"])
+        b_pad = float(bar_g.attrib["data-x-pad"])
+        b_w = float(bar_g.attrib["data-bar-width"])
+        dashed = [
+            el for el in bar_g.findall(f"{svg_ns}line")
+            if el.attrib.get("stroke-dasharray") == "4,3"
+        ]
+        self.assertEqual(len(dashed), 1)
+        expected_div_x = b_left + b_pad + (2.0 / 3.0) * (b_w - 2.0 * b_pad)
+        self.assertAlmostEqual(float(dashed[0].attrib["x1"]), expected_div_x, places=2)
+
+        # M5: Leaped downbeat minor-2nd Db4 over C is flagged as clash ('minor_ninth'), while offbeat stepwise passing F4 stays tension
+        rep_clash = check_melody_clash(
+            "C",
+            [Note(pitch=61, start=0.0, duration=0.5), Note(pitch=67, start=0.5, duration=3.5)],
+            0.0,
+            4.0,
+            "C",
+        )
+        self.assertEqual(rep_clash["status"], "clash")
+        self.assertEqual(rep_clash["clashes"][0]["reason"], "minor_ninth")
+        rep_pass = check_melody_clash(
+            "C",
+            [
+                Note(pitch=64, start=0.0, duration=1.0),
+                Note(pitch=65, start=1.0, duration=0.5),
+                Note(pitch=67, start=1.5, duration=2.5),
+            ],
+            0.0,
+            4.0,
+            "C",
+        )
+        self.assertNotEqual(rep_pass["status"], "clash")
+
+        # M6: Fractional beat_origin strictly between beat_times grid points aligns arrangement['beat_times'][0] == 0.0 at warp_origin
+        s_m6 = srv._build_session("real_vocal")
+        s_m6.project.source = ""
+        s_m6.project.audio = {}
+        s_m6.project.bpm = 120.0
+        s_m6.project.beat_origin = 0.25
+        s_m6.beat_times = [0.5 * i for i in range(40)]
+        s_m6.bar_start_seconds = [2.0 * i for i in range(10)]
+        srv._rebuild(s_m6)
+        self.assertAlmostEqual(s_m6.arrangement["beat_times"][0], 0.0, places=6)
+        self.assertAlmostEqual(s_m6.arrangement["beat_times"][1], 0.5, places=6)
+        self.assertAlmostEqual(s_m6.arrangement["warp_origin"], 0.25, places=6)
+
+        # M7 + SG1 + SG3: /api/load_demo runs _rebuild once; split segments expose per-segment voicings/candidates; /evolution_atlas serves 200
+        app_m7 = srv.create_app()
+        c_m7 = TestClient(app_m7)
+        with patch.object(srv, "_rebuild", wraps=srv._rebuild) as mock_reb:
+            r_ld = c_m7.post("/api/load_demo", json={"demo": "real_vocal"})
+            self.assertEqual(r_ld.status_code, 200)
+            self.assertEqual(mock_reb.call_count, 1)
+        r_sp = c_m7.post("/api/reharmonize", json={"preset": "walking_bass", "split_bar": True})
+        self.assertEqual(r_sp.status_code, 200)
+        split_bars = [b for b in r_sp.json()["bar_analysis"] if len(b.get("split_segments", [])) > 1]
+        self.assertGreaterEqual(len(split_bars), 1)
+        seg1_info = split_bars[0]["split_segments"][1]
+        self.assertTrue(len(seg1_info.get("voicings", [])) >= 1)
+        self.assertTrue(len(seg1_info.get("candidates", [])) >= 1)
+        # Replacing segment 1 chord preserves segment 0 chord intact
+        target_bar_idx = split_bars[0]["bar"]
+        seg0_chord_before = split_bars[0]["split_segments"][0]["chord"]
+        alt_chord = seg1_info["candidates"][0]["chord"]
+        r_seg_edit = c_m7.post("/api/bar_chord", json={"bar": target_bar_idx, "segment": 1, "chord": alt_chord})
+        self.assertEqual(r_seg_edit.status_code, 200)
+        updated_bar = r_seg_edit.json()["bar_analysis"][target_bar_idx]
+        self.assertEqual(len(updated_bar["split_segments"]), 2)
+        self.assertEqual(updated_bar["split_segments"][0]["chord"], seg0_chord_before)
+        self.assertEqual(updated_bar["split_segments"][1]["chord"], alt_chord)
+
+        r_atlas = c_m7.get("/evolution_atlas")
+        self.assertEqual(r_atlas.status_code, 200)
+        self.assertIn("MelodyDesk 2.0", r_atlas.text)
+
 
 if __name__ == "__main__":
     unittest.main()

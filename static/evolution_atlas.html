@@ -1,0 +1,834 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MelodyDesk 2.0 · 项目进化图鉴 — Luthier Evolution Atlas</title>
+  <style>
+    :root {
+      --canvas: #F5EFE6;
+      --card: #FFFDF9;
+      --well: #EDE5D8;
+      --hair: rgba(74, 48, 28, 0.13);
+      --hair-strong: rgba(74, 48, 28, 0.26);
+      --ink: #1E1612;
+      --ink-2: #5A4638;
+      --ink-3: #8A7360;
+      --accent: #B45309;
+      --accent-deep: #7C2D12;
+      --accent-soft: rgba(180, 83, 9, 0.11);
+      --emerald: #1F6E58;
+      --emerald-soft: rgba(31, 110, 88, 0.11);
+      --danger: #B91C1C;
+      --danger-soft: rgba(185, 28, 28, 0.10);
+      --shadow: 0 1px 3px rgba(74,48,28,0.05), 0 10px 28px -6px rgba(74,48,28,0.08);
+      --purfling: 0 0 0 1px var(--card), 0 0 0 2px rgba(124,45,18,0.55), 0 0 0 4px var(--card), 0 0 0 5px rgba(124,45,18,0.20);
+      --serif: "Noto Serif SC", "Songti SC", "Source Han Serif SC", Georgia, serif;
+      --mono: "SF Mono", "JetBrains Mono", ui-monospace, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--canvas);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-size: 13.5px;
+      line-height: 1.55;
+      -webkit-font-smoothing: antialiased;
+    }
+    .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    .topbar {
+      position: sticky; top: 0; z-index: 20;
+      min-height: 60px; padding: 10px 24px;
+      display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+      background: rgba(245, 239, 230, 0.94);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--hair-strong);
+      box-shadow: 0 3px 0 -2px rgba(124,45,18,0.18);
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .rosette {
+      width: 38px; height: 38px; border-radius: 50%;
+      background: radial-gradient(circle at 50% 50%, #3A2618 0 38%, #1E1612 40%);
+      box-shadow: 0 0 0 2px #F5C77E, 0 0 0 4px #7C2D12;
+      display: grid; place-items: center; color: #F5C77E; font-family: var(--serif); font-weight: 700;
+    }
+    .brand-title { font-family: var(--serif); font-size: 17px; font-weight: 700; letter-spacing: 0.03em; }
+    .brand-sub { font-family: var(--serif); font-style: italic; font-size: 12px; color: var(--ink-3); }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 600;
+      border: 1px solid var(--hair-strong); background: var(--card); color: var(--accent-deep);
+    }
+    .btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      height: 32px; padding: 0 13px; border-radius: 8px;
+      border: 1px solid var(--hair-strong); background: var(--card); color: var(--ink);
+      font-size: 12.5px; font-weight: 600; cursor: pointer; text-decoration: none;
+      transition: all .14s ease;
+    }
+    .btn:hover { background: var(--well); }
+    .btn.primary { background: var(--ink); border-color: var(--ink); color: #FFF7EC; }
+    .btn.primary:hover { background: var(--accent-deep); border-color: var(--accent-deep); }
+    .btn.active-mode { background: #FFF9F0; box-shadow: var(--purfling); border-color: transparent; color: var(--accent-deep); }
+
+    .container { max-width: 1260px; margin: 0 auto; padding: 22px 24px 56px; display: flex; flex-direction: column; gap: 20px; }
+
+    /* Stage Selector Tabs */
+    .stage-tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .stage-tab {
+      text-align: left; padding: 14px 16px; border-radius: 14px;
+      background: var(--card); border: 1px solid var(--hair); cursor: pointer;
+      box-shadow: var(--shadow); transition: all .15s ease;
+    }
+    .stage-tab:hover { background: #FBF6EE; border-color: var(--hair-strong); }
+    .stage-tab.active { background: #FFF9F0; border-color: transparent; box-shadow: var(--purfling); }
+    .stage-kicker { font-family: var(--mono); font-size: 10.5px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; }
+    .stage-name { font-family: var(--serif); font-size: 16px; font-weight: 700; margin: 4px 0; }
+    .stage-summary { font-size: 12px; color: var(--ink-2); line-height: 1.45; }
+
+    /* Interactive Theater */
+    .theater {
+      background: var(--card); border: 1px solid var(--hair); border-radius: 16px;
+      box-shadow: var(--shadow); padding: 20px; display: flex; flex-direction: column; gap: 16px;
+    }
+    .theater-head {
+      display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+      padding-bottom: 12px; border-bottom: 3px double rgba(124,45,18,0.18);
+    }
+    .theater-title { font-family: var(--serif); font-size: 18px; font-weight: 700; }
+    .mode-pill-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .provenance-tag {
+      font-family: var(--mono); font-size: 11px; padding: 3px 9px; border-radius: 6px;
+      background: var(--emerald-soft); color: var(--emerald); border: 1px solid rgba(31,110,88,0.25); font-weight: 600;
+    }
+    .provenance-tag.sim { background: var(--accent-soft); color: var(--accent-deep); border-color: rgba(180,83,9,0.25); }
+
+    .viz-grid { display: grid; grid-template-columns: 1.45fr 1fr; gap: 16px; align-items: stretch; }
+    @media (max-width: 980px) {
+      .stage-tabs, .viz-grid, .three-col { grid-template-columns: 1fr !important; }
+    }
+    .score-box, .neck-box {
+      background: #FFFDF9; border: 1px solid var(--hair); border-radius: 12px; padding: 14px;
+      display: flex; flex-direction: column; justify-content: space-between;
+    }
+    .neck-box { background: linear-gradient(180deg, #2A1D15 0%, #1D140E 100%); color: #FAF3E8; border-color: #4A3322; }
+    .box-label {
+      display: flex; justify-content: space-between; align-items: center;
+      font-family: var(--mono); font-size: 11px; letter-spacing: 0.05em; margin-bottom: 8px; color: var(--ink-3);
+    }
+    .neck-box .box-label { color: #D7C3AE; }
+
+    /* Telemetry Strip */
+    .metrics-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    @media (max-width: 760px) { .metrics-row { grid-template-columns: repeat(2, 1fr); } }
+    .metric-card {
+      padding: 10px 12px; border-radius: 10px; background: var(--well); border: 1px solid var(--hair);
+    }
+    .metric-k { font-size: 11px; color: var(--ink-3); font-weight: 600; }
+    .metric-v { font-family: var(--mono); font-size: 16px; font-weight: 700; margin-top: 2px; }
+    .metric-v.good { color: var(--emerald); }
+    .metric-v.warn { color: var(--danger); }
+
+    /* Narrative 3-Column Cards */
+    .three-col { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+    .info-card {
+      background: var(--card); border: 1px solid var(--hair); border-radius: 14px;
+      padding: 16px; box-shadow: var(--shadow);
+    }
+    .info-card h3 {
+      margin: 0 0 8px; font-family: var(--serif); font-size: 15px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .info-card ul { margin: 8px 0 0; padding-left: 18px; color: var(--ink-2); font-size: 12.5px; }
+    .info-card li { margin-bottom: 6px; }
+    .gap-pill {
+      display: inline-block; font-family: var(--mono); font-size: 10.5px; padding: 1px 6px;
+      border-radius: 4px; background: var(--danger-soft); color: var(--danger); font-weight: 600;
+    }
+    .ok-pill {
+      display: inline-block; font-family: var(--mono); font-size: 10.5px; padding: 1px 6px;
+      border-radius: 4px; background: var(--emerald-soft); color: var(--emerald); font-weight: 600;
+    }
+
+    /* Tables */
+    .matrix-card {
+      background: var(--card); border: 1px solid var(--hair); border-radius: 16px;
+      padding: 18px 20px; box-shadow: var(--shadow); overflow-x: auto;
+    }
+    .matrix-card h2 { margin: 0 0 12px; font-family: var(--serif); font-size: 16.5px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--hair); vertical-align: top; }
+    th { font-family: var(--serif); font-weight: 700; color: var(--ink-2); background: rgba(237,229,216,0.45); }
+    tr:last-child td { border-bottom: none; }
+    code {
+      font-family: var(--mono); font-size: 11.5px; padding: 1px 5px; border-radius: 4px;
+      background: var(--well); color: var(--accent-deep);
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="rosette">弦</div>
+      <div>
+        <div class="brand-title">MelodyDesk 2.0 · 项目进化图鉴 <span class="brand-sub">Project Evolution Atlas</span></div>
+        <div style="font-size:11.5px;color:var(--ink-3)">人声驱动木吉他编配与出版级六线谱工作台 · 真实场景 / 当前进展与缺口 / 下一步演进前后对比</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <span class="badge mono">Branch: feat/route1-studio-acoustics-route3-btc-melodyt5 · PR #2</span>
+      <a class="btn" href="/">← 返回弦语工坊工作台</a>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- 3-Stage Interactive Selector -->
+    <section class="stage-tabs" role="tablist" aria-label="项目演进三阶段">
+      <button type="button" class="stage-tab" data-stage="origin" id="tab-origin">
+        <div class="stage-kicker">01 · 原来是做什么的 (v1.0 原型)</div>
+        <div class="stage-name">整曲人声扒谱 → 基础三和弦弹唱草稿</div>
+        <div class="stage-summary">解决弹唱者「有歌无谱」痛点，但每小节仅单一大/小三和弦、歌词仅按句粗对齐、易与主唱产生小二度碰撞。</div>
+      </button>
+      <button type="button" class="stage-tab active" data-stage="current" id="tab-current">
+        <div class="stage-kicker">02 · 现在做到哪 (2026 SOTA · PR #2)</div>
+        <div class="stage-name">六大重配美学 + 切分斜杠低音 + 耦合木吉他</div>
+        <div class="stage-summary">已跑通 4 大子包与 86+ 项回归测试：MMS-FA 逐字对齐、Plomp-Levelt 避碰、拍段级双和弦与 60fps 联谱跟弹。</div>
+      </button>
+      <button type="button" class="stage-tab" data-stage="next" id="tab-next">
+        <div class="stage-kicker">03 · 下一步能变成什么 (Next Frontier)</div>
+        <div class="stage-name">自由散板弱起自校准 + 伴唱串音免疫重排</div>
+        <div class="stage-summary">同一弱起散板乐句前后对比：消除无鼓慢歌半拍网格漂移与伴唱八度毛刺，实现零人工校准的出版级成谱。</div>
+      </button>
+    </section>
+
+    <!-- 8-Second Interactive Code Animation + WebAudio Synthesizer -->
+    <section class="theater">
+      <div class="theater-head">
+        <div>
+          <div class="theater-title" id="scene-heading">阶段二实况对比：同一 4 小节主歌乐句（1 = C · 4/4 · 76 BPM）</div>
+          <div style="font-size:12px;color:var(--ink-2)" id="scene-subtitle">点击播放键试听 7.9 秒循环动画：实时观察和弦指型、六线谱拨弦轨迹、主唱简谱歌词与 Plomp-Levelt 声学粗糙度变化。</div>
+        </div>
+        <div class="mode-pill-group">
+          <span class="provenance-tag" id="provenance-badge">算法实况还原 + WebAudio 物理拨弦合成</span>
+          <button type="button" class="btn" id="btn-ab-toggle" title="在同一阶段内快速切换前后对比">⇄ 切换 A/B 对比</button>
+          <button type="button" class="btn primary" id="btn-play">▶ 播放 8s 演示循环</button>
+        </div>
+      </div>
+
+      <div class="viz-grid">
+        <!-- Left: Synchronized Yoopu-style Chord + TAB + Jianpu + Lyrics SVG -->
+        <div class="score-box">
+          <div class="box-label">
+            <span id="score-caption">联谱视图 · 和弦拍段 / 六线谱 TAB / 主唱简谱 / 逐字歌词</span>
+            <span class="mono" id="playhead-readout">Bar 1 · Beat 1.00 / 07.9s</span>
+          </div>
+          <svg id="score-svg" viewBox="0 0 720 270" width="100%" height="270" aria-label="动态六线谱与简谱联谱"></svg>
+        </div>
+
+        <!-- Right: 6-String Rosewood Fretboard + Voice-Leading Trajectory -->
+        <div class="neck-box">
+          <div class="box-label">
+            <span id="neck-caption">玫瑰木指板实时按法 · 毫米级人体工学把位</span>
+            <span class="mono" id="active-chord-badge" style="color:#F5C77E;font-weight:700">Cmaj7 [X32000]</span>
+          </div>
+          <svg id="neck-svg" viewBox="0 0 460 215" width="100%" height="215" aria-label="六弦指板实时动画"></svg>
+          <div style="display:flex;justify-content:space-between;font-size:11.5px;color:#D7C3AE;margin-top:6px">
+            <span id="tech-readout">技法: 指弹律动 + 顺阶斜杠低音 (PB/H)</span>
+            <span class="mono" id="span-readout">左手跨度: 31.8 mm (舒适)</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Quantitative Telemetry -->
+      <div class="metrics-row">
+        <div class="metric-card">
+          <div class="metric-k">小二度旋律碰撞 (Avoid-Note Clashes)</div>
+          <div class="metric-v good" id="m-clash">0 处 (零碰撞)</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-k">Plomp-Levelt 泛音粗糙度均值</div>
+          <div class="metric-v good" id="m-rough">0.14 PL (温润协和)</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-k">歌词—音符时间轴对齐粒度</div>
+          <div class="metric-v good" id="m-lyric">MMS-FA 音节级 (≤28 ms)</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-k">相邻把位左手质心位移</div>
+          <div class="metric-v good" id="m-shift">1.1 品 / 拍段平滑连接</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Honest 3-Part Engineering Breakdown -->
+    <section class="three-col">
+      <article class="info-card">
+        <h3><span>① 原来解决什么问题</span> <span class="ok-pill">真实场景</span></h3>
+        <div style="font-size:12.5px;color:var(--ink-2)">
+          吉他弹唱学习者面对冷门现场曲、独立音乐或降调翻唱时，市面上往往只有纯歌词或机械 MIDI 谱。项目初衷是打通 <b>「整曲音频 → 主唱简谱 + 唱词 + 可选变调夹把位的吉他弹唱联谱」</b>：
+        </div>
+        <ul>
+          <li><b>初代原型 (`DEVELOPMENT.md`)</b>：使用 Demucs + 稳定化 pYIN + faster-whisper 句级字幕 + 每小节单一大/小三和弦候选。</li>
+          <li><b>历史瓶颈</b>：主唱唱到四度音（如 `F4`）遇到 `C` 大三和弦的 `E4` 时产生刺耳半音碰撞；无七/九/挂留与斜杠低音；歌词仅按整句粗挂。</li>
+        </ul>
+      </article>
+
+      <article class="info-card">
+        <h3><span>② 现在跑通了什么 & 真实缺口</span> <span class="gap-pill">诚实审计</span></h3>
+        <div style="font-size:12.5px;color:var(--ink-2)">
+          自 `073c717` 至 `7e3c057` 已完成四大子包重构与 7 首真唱曲库实测：
+        </div>
+        <ul>
+          <li><span class="ok-pill">已跑通</span> <b>6 大重配预设 + 5 种律动织体</b>：Plomp-Levelt / 12-D TIS 协和度 Viterbi 解码、BTC 170 类切分/斜杠和弦识别、MelodyT5 前间奏双音(`DS`)/滑音(`SL`) 与 Studio Multi-RR 耦合弦合成。</li>
+          <li><span class="gap-pill">缺口 1</span> <b>无鼓散板弱起校准</b>：自由速度慢歌首拍 `beat_origin` 偶有半拍偏移，需在工坊微调。</li>
+          <li><span class="gap-pill">缺口 2</span> <b>多声部伴唱串音</b>：副歌厚重和声偶发 RMVPE 八度毛刺。</li>
+          <li><span class="gap-pill">缺口 3</span> <b>合成器微动态</b>：物理混合合成距真实麦克风箱体空气感仍有差距。</li>
+        </ul>
+      </article>
+
+      <article class="info-card">
+        <h3><span>③ 下一步最值得补的能力</span> <span class="ok-pill">高 ROI 演进</span></h3>
+        <div style="font-size:12.5px;color:var(--ink-2)">
+          拒绝堆砌花哨大模型，优先补齐直接决定「导出即能弹」的三项确定性能力：
+        </div>
+        <ul>
+          <li><b>弱起句法与重拍联合推断</b>：结合歌词句首重音与和声换和弦边界联合锁死 `beat_origin`，消除半拍错位。</li>
+          <li><b>伴唱串音置信度门控</b>：融合 Karaoke 分离掩码能量比与基频连续性先验，自动抑制八度跳变碎音（保留原始 `raw_start` 可一键撤销）。</li>
+          <li><b>分拍段和弦与指型精细编辑</b>：在工坊底栏直接点选小节内第 1/2 拍段（如 `Dm7 → G7`）独立试听替代和弦与按法。</li>
+        </ul>
+      </article>
+    </section>
+
+    <!-- Git Releases / PR / Commit Delta & Ecosystem Comparison -->
+    <section class="matrix-card">
+      <h2>四、 提交记录实质增量核对（Commit History）与同类工具横向定位</h2>
+      <table>
+        <thead>
+          <tr>
+            <th style="width:130px">节点 / 参照系</th>
+            <th style="width:210px">核心技术栈</th>
+            <th>实质新增能力 / 对比定位</th>
+            <th style="width:220px">验证凭据 / 已知边界</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>073c717</code> → <code>5e85516</code><br/><span style="color:var(--ink-3);font-size:11px">MelodyDesk 2.0 基线</span></td>
+            <td>RoFormer-Karaoke + Beat This! + MMS-FA + Viterbi Reharm</td>
+            <td>打通 100% 人声驱动扒谱、中英混排音节级强制对齐、首批和声重配美学与 7 首预置真唱曲库。</td>
+            <td>通过子包单测与真唱端到端回归校验</td>
+          </tr>
+          <tr>
+            <td><code>2a5c019</code> → <code>5bae468</code><br/><span style="color:var(--ink-3);font-size:11px">PR #2 声学与和声升级</span></td>
+            <td>Studio Multi-RR 耦合弦 + BTC 170-Chord + MelodyT5 + 毫米级人体工学指板</td>
+            <td>新增 6 大重配预设（含 `folk_easy` / `walking_bass` / `suspend_dreamy`）、小节内切分斜杠和弦、前间奏双音/滑音编配，消除滑音橡皮筋失真。</td>
+            <td>86 项单测与法医回归测试全部通过</td>
+          </tr>
+          <tr>
+            <td><code>7e3c057</code> + 本次加固<br/><span style="color:var(--ink-3);font-size:11px">Luthier Salon 交互谱面</span></td>
+            <td>Yoopu 出版级 SVG 联谱 + 60fps 游标跟谱 + 拍段级 (`bar:segment`) 检查器</td>
+            <td>补齐分拍段和弦/把位独立替换与自动声部平滑连接（Voice-Leading），修复拍段覆盖误抹除问题。</td>
+            <td>零外部 CDN 依赖 · 保留用户编辑与 30 步撤销</td>
+          </tr>
+          <tr>
+            <td>对比同类方案：<br/><b>Songscription / Klangio / Yoopu</b></td>
+            <td>通用多乐器转谱 SaaS vs 人工精制固定曲谱库</td>
+            <td><b>Klangio / Songscription</b> 擅长原曲吉他直扒但难以针对人声随意改调重配；<b>Yoopu</b> 排版精良但曲库封闭。<b>MelodyDesk 2.0</b> 聚焦「纯人声输入 → 零小二度冲突的可定制把位木吉他编配联谱」。</td>
+            <td>按 `AGENTS.md` 保持研究原型诚实边界，不以删减音符冒充准确率</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      // 4-bar real musical scenario in 1 = C, 4/4, 76 BPM (total loop = 8 beats compressed to 7.9s, 4 bars x 2s/bar visual phrasing)
+      // Vocal phrase features sustained F4 on Bar 1 ("走过...") and A4->G4->F4->E4 arch to expose avoid-note & slash-bass differences cleanly.
+      const SCENARIOS = {
+        origin: {
+          heading: '阶段一（v1.0 初代原型 · 原理演示）：机械大/小三和弦 + 句级粗挂歌词',
+          subtitle: '注意第 1 小节主唱唱 F4 (简谱 4) 时，底层机械配出 C 大三和弦含 E4 (简谱 3)，产生刺耳小二度碰撞；低音整小节死板停留在根音。',
+          provenance: '原理演示 · 还原 v1.0 三和弦草稿引擎',
+          provSim: true,
+          variants: {
+            A: {
+              label: 'v1.0 基础三和弦草稿',
+              metrics: ['2 处 (Bar 1 E4↔F4 碰撞!)', '0.68 PL (明显拍频毛刺)', '句级粗挂 (±420 ms)', '3.4 品 (开放把位硬跳)'],
+              metricClasses: ['warn', 'warn', 'warn', 'warn'],
+              tech: '技法: 机械四分/八分块状分解 (无经过低音 / 无延留解决)',
+              span: '左手跨度: 36.5 mm · 无声部连接优化',
+              segments: [
+                { bar: 0, beat: 0, dur: 4, chord: 'C', frets: [-1, 3, 2, 0, 1, 0], clash: true },
+                { bar: 1, beat: 0, dur: 4, chord: 'Am', frets: [-1, 0, 2, 2, 1, 0], clash: false },
+                { bar: 2, beat: 0, dur: 4, chord: 'F', frets: [1, 3, 3, 2, 1, 1], clash: false },
+                { bar: 3, beat: 0, dur: 4, chord: 'G', frets: [3, 2, 0, 0, 0, 3], clash: true }
+              ],
+              vocal: [
+                { beat: 0.0, dur: 1.5, midi: 65, jianpu: '4', lyric: '走过玉林路', clash: true },
+                { beat: 1.5, dur: 1.0, midi: 64, jianpu: '3', lyric: '', clash: false },
+                { beat: 2.5, dur: 1.5, midi: 62, jianpu: '2', lyric: '', clash: false },
+                { beat: 4.0, dur: 2.0, midi: 69, jianpu: '6', lyric: '坐在小酒馆门口', clash: false },
+                { beat: 6.0, dur: 2.0, midi: 67, jianpu: '5', lyric: '', clash: false },
+                { beat: 8.0, dur: 1.5, midi: 65, jianpu: '4', lyric: '灯火微凉如水', clash: false },
+                { beat: 9.5, dur: 1.0, midi: 64, jianpu: '3', lyric: '', clash: false },
+                { beat: 10.5, dur: 1.5, midi: 62, jianpu: '2', lyric: '', clash: false },
+                { beat: 12.0, dur: 2.0, midi: 60, jianpu: '1', lyric: '晚风轻拂心头', clash: true },
+                { beat: 14.0, dur: 2.0, midi: 62, jianpu: '2', lyric: '', clash: false }
+              ],
+              plucks: [
+                [0.0,5,3,60],[1.0,4,2,64],[2.0,3,0,67],[3.0,2,1,72],
+                [4.0,5,0,57],[5.0,4,2,64],[6.0,3,2,69],[7.0,2,1,72],
+                [8.0,6,1,53],[9.0,4,3,65],[10.0,3,2,69],[11.0,2,1,72],
+                [12.0,6,3,55],[13.0,4,0,62],[14.0,3,0,67],[15.0,2,0,71]
+              ]
+            },
+            B: {
+              label: '2026 SOTA 重配对照 (Csus4→C/E)',
+              metrics: ['0 处 (sus4→3 完美避碰)', '0.14 PL (温润木吉他泛音)', 'MMS-FA 逐字 (≤28 ms)', '1.1 品 (顺阶斜杠低音)'],
+              metricClasses: ['good', 'good', 'good', 'good'],
+              tech: '技法: 延留避碰 Csus4→C/E + 顺阶低音 C→E→A→G→F→G',
+              span: '左手跨度: 31.8 mm (免大横按 Fmaj7/add9)',
+              segments: [
+                { bar: 0, beat: 0, dur: 2, chord: 'Csus4', frets: [-1, 3, 3, 0, 1, 1], clash: false },
+                { bar: 0, beat: 2, dur: 2, chord: 'C/E', frets: [0, 3, 2, 0, 1, 0], clash: false },
+                { bar: 1, beat: 0, dur: 2, chord: 'Am7', frets: [-1, 0, 2, 0, 1, 0], clash: false },
+                { bar: 1, beat: 2, dur: 2, chord: 'Am7/G', frets: [3, 0, 2, 0, 1, 0], clash: false },
+                { bar: 2, beat: 0, dur: 4, chord: 'Fadd9', frets: [-1, -1, 3, 2, 1, 3], clash: false },
+                { bar: 3, beat: 0, dur: 2, chord: 'G7sus4', frets: [3, 3, 0, 0, 1, 1], clash: false },
+                { bar: 3, beat: 2, dur: 2, chord: 'G7', frets: [3, 2, 0, 0, 0, 1], clash: false }
+              ],
+              vocal: [
+                { beat: 0.0, dur: 1.5, midi: 65, jianpu: '4', lyric: '走', clash: false },
+                { beat: 1.5, dur: 1.0, midi: 64, jianpu: '3', lyric: '过', clash: false },
+                { beat: 2.5, dur: 1.5, midi: 62, jianpu: '2', lyric: '街口', clash: false },
+                { beat: 4.0, dur: 2.0, midi: 69, jianpu: '6', lyric: '坐', clash: false },
+                { beat: 6.0, dur: 2.0, midi: 67, jianpu: '5', lyric: '下', clash: false },
+                { beat: 8.0, dur: 1.5, midi: 65, jianpu: '4', lyric: '灯', clash: false },
+                { beat: 9.5, dur: 1.0, midi: 64, jianpu: '3', lyric: '火', clash: false },
+                { beat: 10.5, dur: 1.5, midi: 62, jianpu: '2', lyric: '微凉', clash: false },
+                { beat: 12.0, dur: 2.0, midi: 60, jianpu: '1', lyric: '晚', clash: false },
+                { beat: 14.0, dur: 2.0, midi: 62, jianpu: '2', lyric: '风', clash: false }
+              ],
+              plucks: [
+                [0.0,5,3,60],[0.5,4,3,65],[1.0,3,0,67],[1.5,2,1,72],
+                [2.0,6,0,52],[2.5,4,2,64],[3.0,3,0,67],[3.5,2,1,72],
+                [4.0,5,0,57],[4.5,4,2,64],[5.0,3,0,67],[5.5,2,1,72],
+                [6.0,6,3,55],[6.5,4,2,64],[7.0,3,0,67],[7.5,1,0,76],
+                [8.0,4,3,65],[8.5,3,2,69],[9.0,2,1,72],[9.5,1,3,79],
+                [10.0,4,3,65],[10.5,3,2,69],[11.0,2,1,72],[11.5,3,2,69],
+                [12.0,6,3,55],[12.5,4,0,62],[13.0,3,0,67],[13.5,2,1,72],
+                [14.0,6,3,55],[14.5,4,0,62],[15.0,3,0,67],[15.5,1,1,77]
+              ]
+            }
+          }
+        },
+        current: {
+          heading: '阶段二（2026 SOTA 工作台 · PR #2 已跑通）：六大重配美学 + 拍段级斜杠和弦 + 指弹织体',
+          subtitle: '一键切换 A（原版直白三和弦）与 B（流行走心 Emotional Pop + 顺阶斜杠切分 + H/P 装饰音），实时听到低音线条与泛音协和度跃升。',
+          provenance: '算法实况还原 · 对应 reharmonizer.py + arrangement_grooves.py',
+          provSim: false,
+          variants: {}
+        },
+        next: {
+          heading: '阶段三（下一步演进前后对比 · 原理演示）：自由散板弱起锁拍 + 伴唱串音免疫',
+          subtitle: '同一段无鼓自由散板副歌：对比 A（当前静态起点易错位半拍 + 伴唱和声诱发八度跳音）与 B（句法重音联合锁拍 + 掩码置信度门控）。',
+          provenance: '原理演示 · 下一步高 ROI 攻关前后对比',
+          provSim: true,
+          variants: {
+            A: {
+              label: 'Before: 弱起漂移半拍 + 伴唱八度毛刺',
+              metrics: ['1 处 (错拍导致换和弦滞后)', '0.49 PL (重拍错位摩擦)', '散板首拍偏移 +0.5 拍', '含 1 处伴唱 +12st 伪高音'],
+              metricClasses: ['warn', 'warn', 'warn', 'warn'],
+              tech: '缺口现场: 无鼓 Rubato 首拍滞后 0.5 拍 + 副歌伴唱诱发 C6 八度跳变',
+              span: '人工修正耗时: 约 2–3 分钟校准 beat_origin 与删改毛刺音',
+              segments: [
+                { bar: 0, beat: 0, dur: 4, chord: 'Cmaj7', frets: [-1, 3, 2, 0, 0, 0], clash: false },
+                { bar: 1, beat: 0, dur: 4, chord: 'Em7', frets: [0, 2, 2, 0, 3, 0], clash: true },
+                { bar: 2, beat: 0, dur: 4, chord: 'Fmaj7', frets: [1, -1, 2, 2, 1, 0], clash: false },
+                { bar: 3, beat: 0, dur: 4, chord: 'G9sus4', frets: [3, -1, 0, 2, 1, 3], clash: false }
+              ],
+              vocal: [
+                { beat: 0.5, dur: 1.5, midi: 64, jianpu: '3', lyric: '原(偏半拍)', clash: false },
+                { beat: 2.0, dur: 2.0, midi: 67, jianpu: '5', lyric: '来', clash: false },
+                { beat: 4.5, dur: 1.0, midi: 81, jianpu: '6̇!', lyric: '伴唱串音', clash: true },
+                { beat: 5.5, dur: 2.5, midi: 69, jianpu: '6', lyric: '你', clash: false },
+                { beat: 8.5, dur: 2.0, midi: 65, jianpu: '4', lyric: '还', clash: false },
+                { beat: 10.5, dur: 1.5, midi: 64, jianpu: '3', lyric: '在', clash: false },
+                { beat: 12.5, dur: 3.0, midi: 62, jianpu: '2', lyric: '这里', clash: false }
+              ],
+              plucks: [
+                [0.0,5,3,60],[1.0,3,0,67],[2.0,2,0,71],[3.0,1,0,76],
+                [4.0,6,0,52],[5.0,4,2,64],[6.0,2,3,74],[7.0,3,0,67],
+                [8.0,6,1,53],[9.0,4,2,64],[10.0,3,2,69],[11.0,2,1,72],
+                [12.0,6,3,55],[13.0,4,0,62],[14.0,3,2,69],[15.0,2,1,72]
+              ]
+            },
+            B: {
+              label: 'After: 弱起句法锁拍 + 伴唱串音门控',
+              metrics: ['0 处 (换和弦严丝合缝落重拍)', '0.12 PL (纯净主唱与指弹共鸣)', '弱起 3.5 拍拾音自动归位', '0 处八度毛刺 (可撤销)'],
+              metricClasses: ['good', 'good', 'good', 'good'],
+              tech: '演进效果: 歌词重音+和声边界联合锁死小节线 · Karaoke 掩码比抑制串音',
+              span: '人工修正耗时: 0 秒开箱即弹 · 完整保留 raw_start 随时撤销',
+              segments: [
+                { bar: 0, beat: 0, dur: 2, chord: 'Cmaj9', frets: [-1, 3, 2, 4, 3, 0], clash: false },
+                { bar: 0, beat: 2, dur: 2, chord: 'E7/B', frets: [-1, 2, 2, 1, 3, 0], clash: false },
+                { bar: 1, beat: 0, dur: 2, chord: 'Am9', frets: [-1, 0, 2, 4, 1, 3], clash: false },
+                { bar: 1, beat: 2, dur: 2, chord: 'Gm7', frets: [3, -1, 3, 3, 3, -1], clash: false },
+                { bar: 2, beat: 0, dur: 2, chord: 'Fmaj9', frets: [1, -1, 2, 0, 1, 3], clash: false },
+                { bar: 2, beat: 2, dur: 2, chord: 'Fm6', frets: [1, -1, 0, 1, 1, -1], clash: false },
+                { bar: 3, beat: 0, dur: 4, chord: 'G13sus4', frets: [3, -1, 3, 2, 1, 0], clash: false }
+              ],
+              vocal: [
+                { beat: 0.0, dur: 1.5, midi: 64, jianpu: '3', lyric: '原', clash: false },
+                { beat: 1.5, dur: 2.5, midi: 67, jianpu: '5', lyric: '来', clash: false },
+                { beat: 4.0, dur: 2.0, midi: 69, jianpu: '6', lyric: '你', clash: false },
+                { beat: 6.0, dur: 2.0, midi: 67, jianpu: '5', lyric: '一直', clash: false },
+                { beat: 8.0, dur: 2.0, midi: 65, jianpu: '4', lyric: '还', clash: false },
+                { beat: 10.0, dur: 2.0, midi: 65, jianpu: '4', lyric: '在', clash: false },
+                { beat: 12.0, dur: 3.5, midi: 62, jianpu: '2', lyric: '这里', clash: false }
+              ],
+              plucks: [
+                [0.0,5,3,60],[0.5,4,2,64],[1.0,3,4,71],[1.5,2,3,74],
+                [2.0,5,2,59],[2.5,3,1,68],[3.0,2,3,74],[3.5,1,0,76],
+                [4.0,5,0,57],[4.5,4,2,64],[5.0,3,4,71],[5.5,2,1,72],
+                [6.0,6,3,55],[6.5,4,3,65],[7.0,3,3,70],[7.5,2,3,74],
+                [8.0,6,1,53],[8.5,4,2,64],[9.0,3,0,67],[9.5,2,1,72],
+                [10.0,6,1,53],[10.5,4,0,62],[11.0,3,1,68],[11.5,2,1,72],
+                [12.0,6,3,55],[12.5,4,3,65],[13.0,3,2,69],[13.5,2,1,72],[14.0,1,0,76]
+              ]
+            }
+          }
+        }
+      };
+      // Stage 2 reuses the exact same 4-bar musical ground truth so A vs B is a pure apples-to-apples comparison!
+      SCENARIOS.current.variants = {
+        A: SCENARIOS.origin.variants.A,
+        B: SCENARIOS.origin.variants.B
+      };
+
+      let activeStage = 'current';
+      let activeVariant = 'B'; // Default show SOTA / After on 'current' & 'next', 'A' on 'origin'
+      let isPlaying = false;
+      let animId = null;
+      let startWallSec = 0;
+      let lastTriggeredBeat = -1;
+      let audioCtx = null;
+
+      const LOOP_BEATS = 16.0;
+      const LOOP_SECONDS = 7.9; // Strictly <= 10s per Prompt 3 requirement!
+      const BEATS_PER_SEC = LOOP_BEATS / LOOP_SECONDS;
+
+      const scoreSvg = document.getElementById('score-svg');
+      const neckSvg = document.getElementById('neck-svg');
+      const NS = 'http://www.w3.org/2000/svg';
+
+      function el(tag, attrs = {}, text = '') {
+        const node = document.createElementNS(NS, tag);
+        for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, String(v));
+        if (text) node.textContent = text;
+        return node;
+      }
+
+      function midiToHz(m) {
+        return 440 * Math.pow(2, (m - 69) / 12);
+      }
+
+      function ensureAudio() {
+        if (!audioCtx) {
+          const Ctx = window.AudioContext || window.webkitAudioContext;
+          if (Ctx) audioCtx = new Ctx();
+        }
+        if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+      }
+
+      // Warm wooden acoustic guitar pluck (multi-harmonic body-filtered tone) + soft vocal bell lead
+      function playPluck(midi, durationSec = 0.65, isVocal = false, isClash = false) {
+        if (!audioCtx) return;
+        const now = audioCtx.currentTime;
+        const freq = midiToHz(midi);
+        const master = audioCtx.createGain();
+        const filter = audioCtx.createBiquadFilter();
+        filter.type = isVocal ? 'bandpass' : 'lowpass';
+        filter.frequency.setValueAtTime(isVocal ? freq * 2.2 : freq * 4.2, now);
+        filter.frequency.exponentialRampToValueAtTime(isVocal ? freq * 1.4 : Math.max(280, freq * 1.3), now + durationSec);
+        filter.Q.value = isVocal ? 1.4 : 1.1;
+
+        const peak = isVocal ? 0.085 : 0.095;
+        master.gain.setValueAtTime(0.0001, now);
+        master.gain.linearRampToValueAtTime(peak, now + (isVocal ? 0.025 : 0.006));
+        master.gain.exponentialRampToValueAtTime(0.0008, now + durationSec);
+
+        const ratios = isVocal ? [1, 2] : [1, 2, 3, 4];
+        const weights = isVocal ? [1.0, 0.35] : [1.0, 0.52, 0.24, 0.11];
+        ratios.forEach((r, idx) => {
+          const osc = audioCtx.createOscillator();
+          const g = audioCtx.createGain();
+          osc.type = isVocal ? 'sine' : (idx === 0 ? 'triangle' : 'sine');
+          osc.frequency.setValueAtTime(freq * r, now);
+          if (isClash && idx === 0) osc.detune.setValueAtTime(18, now);
+          g.gain.value = weights[idx];
+          osc.connect(g);
+          g.connect(filter);
+          osc.start(now);
+          osc.stop(now + durationSec + 0.03);
+        });
+
+        filter.connect(master);
+        master.connect(audioCtx.destination);
+      }
+
+      function currentData() {
+        return SCENARIOS[activeStage].variants[activeVariant];
+      }
+
+      function renderStaticScene(playBeat = 0) {
+        const sc = SCENARIOS[activeStage];
+        const v = currentData();
+        document.getElementById('scene-heading').textContent = sc.heading;
+        document.getElementById('scene-subtitle').textContent = sc.subtitle;
+        const prov = document.getElementById('provenance-badge');
+        prov.textContent = sc.provenance + ' · 当前视图: ' + v.label;
+        prov.className = 'provenance-tag' + (sc.provSim ? ' sim' : '');
+        document.getElementById('btn-ab-toggle').textContent =
+          `⇄ 切换对比 (当前 ${activeVariant}: ${v.label.split(':')[0]})`;
+
+        const ids = ['m-clash', 'm-rough', 'm-lyric', 'm-shift'];
+        ids.forEach((id, i) => {
+          const node = document.getElementById(id);
+          node.textContent = v.metrics[i];
+          node.className = 'metric-v ' + v.metricClasses[i];
+        });
+        document.getElementById('tech-readout').textContent = v.tech;
+        document.getElementById('span-readout').textContent = v.span;
+
+        drawScoreSVG(v, playBeat);
+        const activeSeg = v.segments.find(s => (s.bar * 4 + s.beat) <= playBeat && playBeat < (s.bar * 4 + s.beat + s.dur))
+          || v.segments[0];
+        const activePluck = v.plucks.find(p => Math.abs(p[0] - playBeat) < 0.28);
+        drawNeckSVG(activeSeg, activePluck);
+      }
+
+      function drawScoreSVG(v, playBeat) {
+        scoreSvg.replaceChildren();
+        const x0 = 46, x1 = 702, w = x1 - x0;
+        const beatToX = b => x0 + (b / LOOP_BEATS) * w;
+
+        // Background staff card & bar shading
+        scoreSvg.appendChild(el('rect', { x: 0, y: 0, width: 720, height: 270, rx: 8, fill: '#FFFDF9' }));
+        for (let b = 0; b < 4; b++) {
+          const bx = beatToX(b * 4);
+          if (b % 2 === 1) {
+            scoreSvg.appendChild(el('rect', { x: bx, y: 12, width: w / 4, height: 242, fill: 'rgba(237,229,216,0.32)' }));
+          }
+          scoreSvg.appendChild(el('line', { x1: bx, y1: 36, x2: bx, y2: 238, stroke: 'rgba(74,48,28,0.22)', 'stroke-width': 1.2 }));
+          scoreSvg.appendChild(el('text', { x: bx + 5, y: 47, fill: '#8A7360', 'font-size': 10, 'font-family': 'monospace' }, `Bar ${b + 1}`));
+        }
+        scoreSvg.appendChild(el('line', { x1: x1, y1: 36, x2: x1, y2: 238, stroke: 'rgba(74,48,28,0.32)', 'stroke-width': 2 }));
+
+        // Chord pills row
+        v.segments.forEach(seg => {
+          const sx = beatToX(seg.bar * 4 + seg.beat) + 3;
+          const sw = (seg.dur / LOOP_BEATS) * w - 6;
+          scoreSvg.appendChild(el('rect', {
+            x: sx, y: 12, width: Math.max(28, sw), height: 22, rx: 5,
+            fill: seg.clash ? 'rgba(185,28,28,0.12)' : 'rgba(180,83,9,0.11)',
+            stroke: seg.clash ? '#B91C1C' : 'rgba(180,83,9,0.35)'
+          }));
+          scoreSvg.appendChild(el('text', {
+            x: sx + 8, y: 27,
+            fill: seg.clash ? '#B91C1C' : '#7C2D12',
+            'font-size': 12, 'font-weight': '700', 'font-family': 'Georgia, serif'
+          }, seg.chord));
+        });
+
+        // 6-String TAB lines
+        const tabTop = 64, tabGap = 16;
+        const strNames = ['e', 'B', 'G', 'D', 'A', 'E'];
+        for (let s = 0; s < 6; s++) {
+          const y = tabTop + s * tabGap;
+          scoreSvg.appendChild(el('line', { x1: x0, y1: y, x2: x1, y2: y, stroke: 'rgba(74,48,28,0.20)', 'stroke-width': 1 }));
+          scoreSvg.appendChild(el('text', { x: 18, y: y + 4, fill: '#8A7360', 'font-size': 10.5, 'font-family': 'monospace' }, strNames[s]));
+        }
+
+        // TAB fret numbers
+        v.plucks.forEach(([bt, strNum, fret]) => {
+          const px = beatToX(bt) + 8;
+          const py = tabTop + (strNum - 1) * tabGap;
+          const active = Math.abs(bt - playBeat) < 0.28;
+          scoreSvg.appendChild(el('rect', {
+            x: px - 6, y: py - 7, width: 12, height: 14, rx: 3,
+            fill: active ? '#B45309' : '#FFFDF9'
+          }));
+          scoreSvg.appendChild(el('text', {
+            x: px, y: py + 4, 'text-anchor': 'middle',
+            fill: active ? '#FFFDF9' : '#1E1612',
+            'font-size': 11, 'font-weight': '700', 'font-family': 'monospace'
+          }, String(fret)));
+        });
+
+        // Divider + Vocal Jianpu + Syllabic Lyrics
+        scoreSvg.appendChild(el('text', { x: 10, y: 196, fill: '#8A7360', 'font-size': 10.5, 'font-weight': '600' }, '简谱'));
+        scoreSvg.appendChild(el('text', { x: 10, y: 226, fill: '#8A7360', 'font-size': 10.5, 'font-weight': '600' }, '唱词'));
+
+        v.vocal.forEach(n => {
+          const nx = beatToX(n.beat) + 10;
+          const isNow = playBeat >= n.beat && playBeat < n.beat + n.dur;
+          if (n.clash) {
+            scoreSvg.appendChild(el('circle', { cx: nx + 4, cy: 192, r: 12, fill: 'rgba(185,28,28,0.15)', stroke: '#B91C1C', 'stroke-dasharray': '2,2' }));
+          } else if (isNow) {
+            scoreSvg.appendChild(el('circle', { cx: nx + 4, cy: 192, r: 11, fill: 'rgba(31,110,88,0.16)' }));
+          }
+          scoreSvg.appendChild(el('text', {
+            x: nx + 4, y: 197, 'text-anchor': 'middle',
+            fill: n.clash ? '#B91C1C' : (isNow ? '#1F6E58' : '#1E1612'),
+            'font-size': 14, 'font-weight': '700', 'font-family': 'monospace'
+          }, n.jianpu));
+          if (n.lyric) {
+            scoreSvg.appendChild(el('text', {
+              x: nx, y: 226,
+              fill: n.clash ? '#B91C1C' : '#5A4638',
+              'font-size': 12, 'font-weight': isNow ? '700' : '500'
+            }, n.lyric));
+          }
+        });
+
+        // 60fps Playhead Cursor
+        const cx = beatToX(playBeat);
+        scoreSvg.appendChild(el('line', { x1: cx, y1: 10, x2: cx, y2: 244, stroke: '#D97706', 'stroke-width': 2.2 }));
+        scoreSvg.appendChild(el('circle', { cx, cy: 10, r: 4.5, fill: '#D97706' }));
+
+        const barNum = Math.min(4, Math.floor(playBeat / 4) + 1);
+        const beatInBar = (playBeat % 4) + 1;
+        const secNow = (playBeat / BEATS_PER_SEC).toFixed(1);
+        document.getElementById('playhead-readout').textContent =
+          `Bar ${barNum} · Beat ${beatInBar.toFixed(2)} / 0${secNow}s`;
+      }
+
+      function drawNeckSVG(seg, activePluck) {
+        neckSvg.replaceChildren();
+        const fStr = seg.frets.map(f => f < 0 ? 'X' : f).join('');
+        document.getElementById('active-chord-badge').textContent = `${seg.chord} [${fStr}]`;
+
+        const nutX = 54, endX = 438, topY = 28, strGap = 28;
+        const fretCount = 5;
+        const fretW = (endX - nutX) / fretCount;
+
+        // Rosewood fingerboard body
+        neckSvg.appendChild(el('rect', { x: nutX, y: topY - 10, width: endX - nutX, height: strGap * 5 + 20, rx: 6, fill: '#3B2416', stroke: '#6E472B' }));
+        // Bone nut
+        neckSvg.appendChild(el('rect', { x: nutX - 6, y: topY - 10, width: 6, height: strGap * 5 + 20, rx: 2, fill: '#EFE4D2' }));
+
+        for (let f = 1; f <= fretCount; f++) {
+          const fx = nutX + f * fretW;
+          neckSvg.appendChild(el('line', { x1: fx, y1: topY - 10, x2: fx, y2: topY + strGap * 5 + 10, stroke: '#B89F82', 'stroke-width': 2 }));
+          neckSvg.appendChild(el('text', { x: fx - fretW / 2, y: topY + strGap * 5 + 26, 'text-anchor': 'middle', fill: '#BCA58E', 'font-size': 10.5, 'font-family': 'monospace' }, `${f}品`));
+        }
+        // Fretboard inlay dots (3rd & 5th fret)
+        [3, 5].forEach(fn => {
+          neckSvg.appendChild(el('circle', { cx: nutX + (fn - 0.5) * fretW, cy: topY + strGap * 2.5, r: 5, fill: 'rgba(245,230,205,0.28)' }));
+        });
+
+        // 6 Strings (top = 1st high E, bottom = 6th low E)
+        const labels = ['1弦 E4', '2弦 B3', '3弦 G3', '4弦 D3', '5弦 A2', '6弦 E2'];
+        for (let s = 1; s <= 6; s++) {
+          const y = topY + (s - 1) * strGap;
+          const isPlucked = activePluck && activePluck[1] === s;
+          neckSvg.appendChild(el('line', {
+            x1: nutX, y1: y, x2: endX, y2: y,
+            stroke: isPlucked ? '#F5C77E' : '#D6C2A8',
+            'stroke-width': 1.1 + s * 0.32
+          }));
+          neckSvg.appendChild(el('text', { x: 8, y: y + 4, fill: '#BCA58E', 'font-size': 10, 'font-family': 'monospace' }, labels[s - 1]));
+
+          // seg.frets is ordered [6th, 5th, 4th, 3rd, 2nd, 1st]
+          const fretVal = seg.frets[6 - s];
+          if (fretVal < 0) {
+            neckSvg.appendChild(el('text', { x: nutX - 18, y: y + 4, 'text-anchor': 'middle', fill: '#D97706', 'font-size': 12, 'font-weight': '700' }, '×'));
+          } else if (fretVal === 0) {
+            neckSvg.appendChild(el('circle', {
+              cx: nutX - 18, cy: y, r: 5.5,
+              fill: isPlucked ? '#F5C77E' : 'none', stroke: '#F5C77E', 'stroke-width': 1.8
+            }));
+          } else if (fretVal <= fretCount) {
+            const cx = nutX + (fretVal - 0.5) * fretW;
+            neckSvg.appendChild(el('circle', {
+              cx, cy: y, r: isPlucked ? 10.5 : 8.5,
+              fill: seg.clash ? '#DC2626' : (isPlucked ? '#F5C77E' : '#D97706'),
+              stroke: '#FFF7EC', 'stroke-width': 1.5
+            }));
+            neckSvg.appendChild(el('text', {
+              x: cx, y: y + 3.8, 'text-anchor': 'middle',
+              fill: isPlucked ? '#1E1612' : '#FFFDF9', 'font-size': 10.5, 'font-weight': '700', 'font-family': 'monospace'
+            }, String(fretVal)));
+          }
+        }
+      }
+
+      function tick(nowMs) {
+        if (!isPlaying) return;
+        const elapsedSec = ((nowMs - startWallSec) / 1000) % LOOP_SECONDS;
+        const beat = elapsedSec * BEATS_PER_SEC;
+        const v = currentData();
+
+        // Trigger plucks & vocal synth notes when crossing beat timestamps
+        if (beat < lastTriggeredBeat) lastTriggeredBeat = -0.01;
+        v.plucks.forEach(([bt, , , midi]) => {
+          if (bt > lastTriggeredBeat && bt <= beat) {
+            playPluck(midi, 0.62, false, false);
+          }
+        });
+        v.vocal.forEach(n => {
+          if (n.beat > lastTriggeredBeat && n.beat <= beat) {
+            playPluck(n.midi, Math.min(1.1, (n.dur / BEATS_PER_SEC) * 0.92), true, n.clash);
+          }
+        });
+        lastTriggeredBeat = beat;
+
+        renderStaticScene(beat);
+        animId = requestAnimationFrame(tick);
+      }
+
+      function stopPlayback() {
+        isPlaying = false;
+        if (animId) cancelAnimationFrame(animId);
+        document.getElementById('btn-play').textContent = '▶ 播放 8s 演示循环';
+        renderStaticScene(0);
+      }
+
+      document.getElementById('btn-play').addEventListener('click', () => {
+        if (isPlaying) {
+          stopPlayback();
+          return;
+        }
+        ensureAudio();
+        isPlaying = true;
+        startWallSec = performance.now();
+        lastTriggeredBeat = -0.01;
+        document.getElementById('btn-play').textContent = '⏹ 停止演示';
+        animId = requestAnimationFrame(tick);
+      });
+
+      document.getElementById('btn-ab-toggle').addEventListener('click', () => {
+        activeVariant = activeVariant === 'A' ? 'B' : 'A';
+        lastTriggeredBeat = -0.01;
+        renderStaticScene(0);
+      });
+
+      document.querySelectorAll('.stage-tab').forEach(btn => {
+        btn.addEventListener('click', () => {
+          document.querySelectorAll('.stage-tab').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          activeStage = btn.dataset.stage;
+          activeVariant = activeStage === 'origin' ? 'A' : 'B';
+          lastTriggeredBeat = -0.01;
+          renderStaticScene(0);
+        });
+      });
+
+      renderStaticScene(0);
+    })();
+  </script>
+</body>
+</html>

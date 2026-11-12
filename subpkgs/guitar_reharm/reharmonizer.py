@@ -591,6 +591,7 @@ def check_melody_clash(
             and (next_n.pitch % 12) in tones
         )
         not_downbeat = abs(n.start - bar_start) >= 0.20
+        avoid_tag = _avoid_note_reason(tones, parsed, pitch % 12)
         is_weak_passing = (
             (
                 overlap_dur <= 1.05
@@ -601,8 +602,13 @@ def check_melody_clash(
             )
             or (
                 overlap_dur <= 0.55
+                and not_downbeat
                 and chord_tone_beats >= max(1.0, 2.0 * overlap_dur)
-                and (has_step_in or has_step_out or chord_tone_beats >= 1.5)
+                and (
+                    (has_step_in or has_step_out)
+                    if avoid_tag == 'minor_ninth'
+                    else (has_step_in or has_step_out or chord_tone_beats >= 1.5)
+                )
             )
         )
         if is_weak_passing:
@@ -611,7 +617,6 @@ def check_melody_clash(
 
         roughness = _dyadic_roughness(tones, parsed, pitch % 12, pitch)
         interval = (pitch - parsed['root']) % 12
-        avoid_tag = _avoid_note_reason(tones, parsed, pitch % 12)
         is_minor_chord = (3 in parsed['intervals'] and 4 not in parsed['intervals'])
         if avoid_tag is None and is_minor_chord and interval in (2, 5):
             report['tensions'].append(dict(pitch=pitch, start=n.start, interval=interval,
@@ -746,8 +751,19 @@ def _bass_transition_score(bass_a, bass_b, preset):
     return score
 
 
-def _solve_split_bar_chord(chosen_sym, next_sym, notes, bar_idx, measure, tonic, preset='walking_bass', capo: int = 0):
-    mid = bar_idx * measure + measure / 2.0
+def _solve_split_bar_chord(
+    chosen_sym,
+    next_sym,
+    notes,
+    bar_idx,
+    measure,
+    tonic,
+    preset='walking_bass',
+    capo: int = 0,
+    split_beat: float | None = None,
+):
+    d1_local = (measure / 2.0) if split_beat is None else float(split_beat)
+    mid = bar_idx * measure + d1_local
     bar_end = (bar_idx + 1) * measure
     chosen_parsed = parse_extended_chord(chosen_sym)
     if chosen_parsed is None:
@@ -977,7 +993,15 @@ def reharmonize_progression(
                 sym = safe_sym
         chosen_syms.append(sym)
 
-    is_simple_triple = (round(measure) == 3 and not str(project.meter).strip().endswith('/8'))
+    meter_str = str(project.meter).strip()
+    n_slots_m = int(round(measure * 2.0))
+    if meter_str.endswith('/8') and n_slots_m >= 6 and n_slots_m % 3 == 0:
+        n_pulses = n_slots_m // 3
+        split_d1 = float(math.ceil(n_pulses / 2.0)) * 1.5 if n_pulses >= 2 else (measure / 2.0)
+    elif measure >= 2.0:
+        split_d1 = float(math.ceil(measure / 2.0))
+    else:
+        split_d1 = measure / 2.0
     det_map = detected_split_chords if isinstance(detected_split_chords, dict) else {}
 
     def _adapt_half_chord(raw_sym: str, seg_s: float, seg_e: float, bar_i: int) -> str | None:
@@ -1022,7 +1046,7 @@ def reharmonize_progression(
             and measure >= 2.0
             and chosen.strip() != 'N.C.'
         ):
-            d1 = 2.0 if is_simple_triple else (measure / 2.0)
+            d1 = split_d1
             d2 = measure - d1
             c1_use = _adapt_half_chord(str(det_pair[0]).strip(), bar_start, bar_start + d1, idx)
             c2_use = _adapt_half_chord(str(det_pair[1]).strip(), bar_start + d1, bar_end, idx)
@@ -1044,14 +1068,17 @@ def reharmonize_progression(
 
         if split_bar and (n_bars < 2 or idx < n_bars - 1) and chosen.strip() != 'N.C.':
             next_sym = chosen_syms[idx + 1] if idx + 1 < n_bars else None
-            second_sym = _solve_split_bar_chord(chosen, next_sym, project.notes, idx, measure, tonic, preset=preset, capo=capo)
+            d1 = split_d1
+            d2 = measure - d1
+            second_sym = _solve_split_bar_chord(
+                chosen, next_sym, project.notes, idx, measure, tonic, preset=preset, capo=capo, split_beat=d1
+            )
             if second_sym and second_sym != chosen:
-                half = measure / 2.0
-                rep1 = check_melody_clash(chosen, project.notes, bar_start, bar_start + half, tonic)
-                rep2 = check_melody_clash(second_sym, project.notes, bar_start + half, bar_end, tonic)
+                rep1 = check_melody_clash(chosen, project.notes, bar_start, bar_start + d1, tonic)
+                rep2 = check_melody_clash(second_sym, project.notes, bar_start + d1, bar_end, tonic)
                 if rep1['status'] != 'clash' and rep2['status'] != 'clash':
-                    seg1 = dict(beat=0.0, duration=half, chord=chosen, roman=roman_numeral(chosen, tonic), frets=[], capo=capo)
-                    seg2 = dict(beat=half, duration=half, chord=second_sym, roman=roman_numeral(second_sym, tonic), frets=[], capo=capo)
+                    seg1 = dict(beat=0.0, duration=d1, chord=chosen, roman=roman_numeral(chosen, tonic), frets=[], capo=capo)
+                    seg2 = dict(beat=d1, duration=d2, chord=second_sym, roman=roman_numeral(second_sym, tonic), frets=[], capo=capo)
                     segments = [seg1, seg2]
                     reports = [rep1, rep2]
                     flattened.extend(segments)

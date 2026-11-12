@@ -271,12 +271,12 @@ def _rebuild(candidate):
             fallback_chord = candidate.base_chords[-1] if candidate.base_chords else candidate.project.tonic
             tail = [suggested[b] if b < len(suggested) else fallback_chord for b in range(old_c_len, count)]
             candidate.base_chords = list(candidate.base_chords) + tail
-        if not voicings_explicit and not voicings_reset and len(candidate.custom_voicings) != count:
-            old_v_len = len(candidate.custom_voicings)
-            if old_v_len > count:
-                candidate.custom_voicings = list(candidate.custom_voicings[:count])
-            else:
-                candidate.custom_voicings = list(candidate.custom_voicings) + [None] * (count - old_v_len)
+    if not voicings_explicit and not voicings_reset and len(candidate.custom_voicings) != count:
+        old_v_len = len(candidate.custom_voicings)
+        if old_v_len > count:
+            candidate.custom_voicings = list(candidate.custom_voicings[:count])
+        else:
+            candidate.custom_voicings = list(candidate.custom_voicings) + [None] * (count - old_v_len)
     if not chords_explicit and candidate.custom_chords:
         candidate.custom_chords = {k: v for k, v in candidate.custom_chords.items() if 0 <= int(k.split(':')[0]) < count}
     if candidate.custom_segment_voicings:
@@ -315,8 +315,8 @@ def _rebuild(candidate):
                 choices = generate_voicings(chord, candidate.capo)
                 if not choices:
                     raise ValueError('Chord has no playable voicing')
-                segment.update(chord=chord, roman=roman_numeral(chord, candidate.project.tonic),
-                               frets=list(choices[0]['frets']), capo=candidate.capo)
+                segment.pop('frets', None)
+                segment.update(chord=chord, roman=roman_numeral(chord, candidate.project.tonic), capo=candidate.capo)
         for row in analysis:
             row['chord'] = row['split_segments'][0]['chord']
             row['roman'] = row['split_segments'][0]['roman']
@@ -357,9 +357,26 @@ def _rebuild(candidate):
         if candidate.bar_dynamics and 'bar_dynamics' in inspect.signature(arrange_advanced).parameters:
             _arrange_kwargs['bar_dynamics'] = candidate.bar_dynamics
         arrangement = arrange_advanced(candidate.project, **_arrange_kwargs)
-        for row, bar in zip(analysis, arrangement['bars']):
-            row['split_segments'] = deepcopy(bar['split_segments'])
+        for row_idx, (row, bar) in enumerate(zip(analysis, arrangement['bars'])):
+            segs_copy = deepcopy(bar['split_segments'])
+            prev_bar_c = analysis[row_idx - 1]['split_segments'][-1]['chord'] if row_idx > 0 else None
+            next_bar_c = analysis[row_idx + 1]['split_segments'][0]['chord'] if row_idx + 1 < len(analysis) else None
+            for p_idx, seg in enumerate(segs_copy):
+                seg['voicings'] = generate_voicings(seg['chord'], candidate.capo)
+                if _implemented(suggest_bar_substitutions) and seg['chord'] != 'N.C.':
+                    p_c = segs_copy[p_idx - 1]['chord'] if p_idx > 0 else prev_bar_c
+                    n_c = segs_copy[p_idx + 1]['chord'] if p_idx + 1 < len(segs_copy) else next_bar_c
+                    seg_s = row_idx * measure + float(seg.get('beat', 0.0))
+                    seg_e = seg_s + float(seg.get('duration', measure))
+                    seg['candidates'] = suggest_bar_substitutions(
+                        seg['chord'], p_c, n_c, candidate.project.tonic, candidate.project.notes, seg_s, seg_e
+                    )[:8]
+                else:
+                    seg['candidates'] = []
+            row['split_segments'] = segs_copy
             row['frets'] = list(bar['frets'])
+            if segs_copy:
+                row['voicings'] = list(segs_copy[0]['voicings'])
     else:
         if candidate.preset != 'original' or any((candidate.passing_bass, candidate.split_bar, candidate.slap_x,
                                                 candidate.palm_mute, candidate.embellish_hp, candidate.intro_mode != 'none')):
@@ -387,14 +404,37 @@ def _rebuild(candidate):
             analysis.append(dict(bar=index, chord=bar['chord'], roman='', split_segments=[deepcopy(segment)]))
     build_score_timeline(candidate.project, arrangement)
     origin_sec = float(candidate.project.beat_origin)
-    active_bt = [float(t) for t in candidate.beat_times if float(t) >= origin_sec - 1e-9]
-    if len(active_bt) < 2 and len(candidate.beat_times) >= 2: active_bt = [float(t) for t in candidate.beat_times]
-    active_bss = [float(t) for t in candidate.bar_start_seconds if float(t) >= origin_sec - 1e-9]
-    if len(active_bss) < 2 and len(candidate.bar_start_seconds) >= 2: active_bss = [float(t) for t in candidate.bar_start_seconds]
-    warp_origin = (origin_sec if origin_sec != 0.0 else min(active_bt[0], active_bss[0]) if len(active_bt) >= 2 and len(active_bss) >= 2
-                   else active_bt[0] if len(active_bt) >= 2 else active_bss[0] if len(active_bss) >= 2 else 0.0)
-    if active_bss: arrangement['bar_start_seconds'] = [t - warp_origin for t in active_bss]
-    if active_bt: arrangement['beat_times'] = [t - warp_origin for t in active_bt]
+    raw_bt_all = [float(t) for t in candidate.beat_times]
+    raw_bss_all = [float(t) for t in candidate.bar_start_seconds]
+    if (
+        origin_sec != 0.0
+        and len(raw_bt_all) >= 2
+        and callable(seconds_to_beats_piecewise)
+        and callable(beats_to_seconds_piecewise)
+        and not any(abs(t - origin_sec) <= 1e-6 for t in raw_bt_all)
+    ):
+        cur_bpm_w = float(candidate.project.bpm)
+        ob = float(seconds_to_beats_piecewise(origin_sec, raw_bt_all, cur_bpm_w, origin_sec))
+        n_rem_bt = max(2, int(math.ceil(max(0.0, (len(raw_bt_all) - 1) - ob))) + 1)
+        warp_origin = origin_sec
+        arrangement['beat_times'] = [
+            float(beats_to_seconds_piecewise(ob + k, raw_bt_all, cur_bpm_w, origin_sec)) - warp_origin
+            for k in range(n_rem_bt)
+        ]
+        n_bars_w = max(1, count)
+        arrangement['bar_start_seconds'] = [
+            float(beats_to_seconds_piecewise(ob + b * measure, raw_bt_all, cur_bpm_w, origin_sec)) - warp_origin
+            for b in range(n_bars_w + 1)
+        ]
+    else:
+        active_bt = [t for t in raw_bt_all if t >= origin_sec - 1e-9]
+        if len(active_bt) < 2 and len(raw_bt_all) >= 2: active_bt = list(raw_bt_all)
+        active_bss = [t for t in raw_bss_all if t >= origin_sec - 1e-9]
+        if len(active_bss) < 2 and len(raw_bss_all) >= 2: active_bss = list(raw_bss_all)
+        warp_origin = (origin_sec if origin_sec != 0.0 else min(active_bt[0], active_bss[0]) if len(active_bt) >= 2 and len(active_bss) >= 2
+                       else active_bt[0] if len(active_bt) >= 2 else active_bss[0] if len(active_bss) >= 2 else 0.0)
+        if active_bss: arrangement['bar_start_seconds'] = [t - warp_origin for t in active_bss]
+        if active_bt: arrangement['beat_times'] = [t - warp_origin for t in active_bt]
     arrangement.update(time_origin_shifted=True, warp_origin=warp_origin, warp_beat_origin=origin_sec)
     if candidate.bar_dynamics: arrangement['bar_dynamics'] = list(candidate.bar_dynamics)
     if len(candidate.note_lyrics) != len(candidate.project.notes): _align(candidate)
@@ -485,7 +525,7 @@ _DEMO_PIECES = {
 }
 
 
-def _initial_session(demo_mode: str = 'mandarin_pop'):
+def _build_session(demo_mode: str = 'mandarin_pop') -> Session:
     _refresh_backends()
     if demo_mode == 'manual':
         demo_mode = 'mandarin_pop'
@@ -581,7 +621,6 @@ def _initial_session(demo_mode: str = 'mandarin_pop'):
                 warnings=list(init_warnings),
                 demo_mode=demo_mode,
             )
-            _rebuild(session)
             return session
         if demo_mode not in _DEMO_PIECES:
             raise ValueError(f"Manifest vocal recording for '{demo_mode}' is missing and no synthetic fallback exists")
@@ -633,6 +672,11 @@ def _initial_session(demo_mode: str = 'mandarin_pop'):
         warnings=list(init_warnings),
         demo_mode=demo_mode,
     )
+    return session
+
+
+def _initial_session(demo_mode: str = 'mandarin_pop'):
+    session = _build_session(demo_mode)
     _rebuild(session)
     return session
 
@@ -1123,6 +1167,13 @@ def create_app() -> FastAPI:
             return FileResponse(STATIC_ROOT/'index.html')
         return HTMLResponse(_fallback_workbench())
 
+    @application.get('/evolution_atlas')
+    def evolution_atlas():
+        atlas_path = STATIC_ROOT / 'evolution_atlas.html'
+        if atlas_path.is_file():
+            return FileResponse(atlas_path)
+        raise HTTPException(404, 'Evolution atlas page is not installed')
+
     @application.get('/api/state')
     def state():
         return get_state_payload(snapshot())
@@ -1130,6 +1181,13 @@ def create_app() -> FastAPI:
     @application.post('/api/reharmonize')
     def reharmonize(request: ReharmonizeRequest):
         def operation(candidate):
+            old_m_parts = str(candidate.project.meter).strip().split('/')
+            old_meas = (
+                int(old_m_parts[0]) * 4.0 / int(old_m_parts[1])
+                if len(old_m_parts) == 2 and old_m_parts[0].isdigit() and old_m_parts[1].isdigit() and int(old_m_parts[1]) > 0
+                else 4.0
+            )
+            old_bpm = float(candidate.project.bpm)
             preset_changed = 'preset' in request.model_fields_set and request.preset != candidate.preset
             capo_changed = 'capo' in request.model_fields_set and request.capo != candidate.capo
             tonic_changed = 'tonic' in request.model_fields_set and request.tonic != candidate.project.tonic
@@ -1175,6 +1233,47 @@ def create_app() -> FastAPI:
                             for seg_key in [k for k in candidate.custom_segment_voicings if k == str(b_idx) or k.startswith(f'{b_idx}:')]:
                                 candidate.custom_segment_voicings.pop(seg_key, None)
                 setattr(candidate.project if key in ('title', 'tonic', 'bpm', 'meter') else candidate, key, value)
+
+            has_recording_grid = bool(candidate.project.source) or bool(candidate.project.audio.get('vocals'))
+            if meter_changed or (bpm_changed and has_recording_grid):
+                new_m_parts = str(candidate.project.meter).strip().split('/')
+                if (
+                    len(new_m_parts) == 2
+                    and new_m_parts[0].isdigit()
+                    and new_m_parts[1].isdigit()
+                    and int(new_m_parts[0]) > 0
+                    and int(new_m_parts[1]) in (2, 4, 8)
+                ):
+                    new_meas_g = int(new_m_parts[0]) * 4.0 / int(new_m_parts[1])
+                    bpm_ratio = (
+                        (old_bpm / float(candidate.project.bpm))
+                        if (bpm_changed and has_recording_grid and float(candidate.project.bpm) > 0)
+                        else 1.0
+                    )
+                    bar_scale = (new_meas_g * bpm_ratio) / max(1e-6, old_meas)
+                    if abs(bar_scale - 1.0) > 1e-9:
+                        def _resample_bar_seq(seq: list) -> list:
+                            if not seq:
+                                return []
+                            n_out = max(1, math.ceil(len(seq) / bar_scale - 1e-9))
+                            out = []
+                            for b_i in range(n_out):
+                                lo_u = b_i * bar_scale
+                                hi_u = (b_i + 1) * bar_scale
+                                k0 = max(0, min(len(seq) - 1, int(math.floor(lo_u + 1e-9))))
+                                k1 = max(k0, min(len(seq) - 1, int(math.ceil(hi_u - 1e-9)) - 1))
+                                best_k = max(
+                                    range(k0, k1 + 1),
+                                    key=lambda k: (round(min(hi_u, k + 1.0) - max(lo_u, float(k)), 9), -k),
+                                )
+                                out.append(seq[best_k])
+                            return out
+
+                        candidate.base_chords = _resample_bar_seq(candidate.base_chords)
+                        if candidate.bar_dynamics:
+                            candidate.bar_dynamics = _resample_bar_seq(candidate.bar_dynamics)
+                        if 'custom_voicings' not in request.model_fields_set:
+                            candidate.custom_voicings = [None] * len(candidate.base_chords)
 
             if bpm_changed:
                 candidate.bar_start_seconds = []
@@ -1539,7 +1638,7 @@ def create_app() -> FastAPI:
     @application.post('/api/load_demo')
     def load_demo(request: DemoRequest = Body(default=DemoRequest())):
         def operation(candidate):
-            fresh = _initial_session(request.demo)
+            fresh = _build_session(request.demo)
             candidate.__dict__.update(vars(fresh))
         return mutate(operation, bump_generation=True)
 

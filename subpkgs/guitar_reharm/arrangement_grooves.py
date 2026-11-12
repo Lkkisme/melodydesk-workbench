@@ -2040,6 +2040,7 @@ def arrange_advanced(
             ))
             plan.append(('treble', beat, len(treble_requests) - 1, velocity, kind, direction))
 
+        pm_beats = (0.0,) + ((groove['bass_pivot'] * 0.5,) if groove['bass_pivot'] is not None else ())
         for beat in grid:
             segment = active(bar,beat)
             if segment is None or segment.get('chord') == 'N.C.':
@@ -2054,7 +2055,7 @@ def arrange_advanced(
             slot = min(int(round(beat*2)), last_slot)
             slot_dir = slot_dirs[slot]
             is_segment_boundary = any(abs(beat - sb) < 1e-9 for sb in segment_beats)
-            is_pm_beat = palm_mute and (rho_b < 0.5) and any(abs(beat - b) < 1e-9 for b in (0.0, measure / 2))
+            is_pm_beat = palm_mute and (rho_b < 0.5) and any(abs(beat - b) < 1e-9 for b in pm_beats)
 
             slot_in_active = slot in active_slots or is_segment_boundary
             if is_pm_beat and not slot_in_active:
@@ -2103,7 +2104,7 @@ def arrange_advanced(
                 emitted_cm_bass = False
                 if is_cm_bass_slot and bass is not None and not is_cm_reserved(bass[0], beat) and bass[2] < ceil_p:
                     bass_pitch = bass[2]
-                    technique = 'PM' if palm_mute and any(abs(beat - b) < 1e-9 for b in (0, measure / 2)) else ''
+                    technique = 'PM' if palm_mute and any(abs(beat - b) < 1e-9 for b in pm_beats) else ''
                     bass_vel = 74 if slot == 0 else 66
                     bass_cap = max(50, int((min_cm_bar_vel - 8) / dyn_div)) if bass[0] <= 4 else 127
                     vel_b = max(1, min(127, bass_cap, round(bass_vel * phrase_vel_scale)))
@@ -2171,7 +2172,7 @@ def arrange_advanced(
                     selection.append(bass)
                 for item in selection:
                     is_bass_note = bass is not None and (item == bass or (use_alt_bass and item == alt_bass_item))
-                    technique = 'PM' if palm_mute and is_bass_note and any(abs(beat-b) < 1e-9 for b in (0, measure/2)) else ''
+                    technique = 'PM' if palm_mute and is_bass_note and any(abs(beat - b) < 1e-9 for b in pm_beats) else ''
                     velocity = (90 if slot == 0 else slot_vels[slot]) if is_strum else (90 if (is_bass_note and slot == 0) else 84 if is_bass_note else slot_vels[slot])
                     velocity = max(1, min(127, round(velocity * phrase_vel_scale)))
                     plan.append(('note', beat, step_dur, item, velocity, technique, slot_dir, None))
@@ -2181,7 +2182,7 @@ def arrange_advanced(
                     bass_item = alt_bass_item if (use_alt_bass and alt_bass_item is not None) else bass
                     if bass_item is not None:
                         bass_pitch = bass_item[2]
-                        technique = 'PM' if palm_mute and any(abs(beat-b) < 1e-9 for b in (0, measure/2)) else ''
+                        technique = 'PM' if palm_mute and any(abs(beat - b) < 1e-9 for b in pm_beats) else ''
                         bass_vel = 90 if slot == 0 else 84
                         velocity = max(1, min(127, round(bass_vel * phrase_vel_scale)))
                         plan.append(('note', beat, step_dur, bass_item, velocity, technique, slot_dir, None))
@@ -2206,7 +2207,7 @@ def arrange_advanced(
                     selection.append(bass)
                 for item in selection:
                     is_bass_note = bass is not None and (item == bass or (use_alt_bass and item == alt_bass_item))
-                    technique = 'PM' if palm_mute and is_bass_note and any(abs(beat-b) < 1e-9 for b in (0, measure/2)) else ''
+                    technique = 'PM' if palm_mute and is_bass_note and any(abs(beat - b) < 1e-9 for b in pm_beats) else ''
                     velocity = (90 if slot == 0 else slot_vels[slot]) if is_strum else (90 if (is_bass_note and slot == 0) else 84 if is_bass_note else slot_vels[slot])
                     velocity = max(1, min(127, round(velocity * phrase_vel_scale)))
                     plan.append(('note', beat, step_dur, item, velocity, technique, slot_dir, None))

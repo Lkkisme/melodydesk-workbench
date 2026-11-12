@@ -474,13 +474,17 @@ def render_publication_score_html(
                 segments = bar['split_segments'] if 'split_segments' in bar else [bar]
                 for part_idx, supplied in enumerate(segments):
                     segment = dict(supplied)
-                    center = left + (part_idx + 0.5) * width / len(segments)
+                    seg_x0 = left if part_idx == 0 else x_at(float(segment.get('beat', 0.0)) * TICKS)
+                    if part_idx + 1 < len(segments):
+                        seg_x1 = x_at(float(segments[part_idx + 1].get('beat', 0.0)) * TICKS)
+                    else:
+                        seg_x1 = left + width
+                    center = 0.5 * (seg_x0 + seg_x1)
                     content.append(_svg_text(center, CHORD_NAME_Y, segment['chord'], 16, fill="#1E1612", font_weight="700"))
                     content.append(_chord_diagram(center, DIAGRAM_Y_TOP, segment))
 
                     if len(segments) > 1 and part_idx < len(segments) - 1:
-                        div_x = left + (part_idx + 1) * width / len(segments)
-                        content.append(f'<line x1="{div_x:g}" y1="{ZONE1_TOP:g}" x2="{div_x:g}" y2="{DIAGRAM_Y_BOTTOM + 8:g}" stroke="#D6C7B2" stroke-width="1" stroke-dasharray="4,3"/>')
+                        content.append(f'<line x1="{seg_x1:g}" y1="{ZONE1_TOP:g}" x2="{seg_x1:g}" y2="{DIAGRAM_Y_BOTTOM + 8:g}" stroke="#D6C7B2" stroke-width="1" stroke-dasharray="4,3"/>')
 
             content.append(_render_tab_bar(arr_for_tab, index, x_at, width, left, TAB_Y_BASE))
             content.append(_render_jianpu_bar(project, spans, note_lyrics, x_at, lyric_y, baseline))

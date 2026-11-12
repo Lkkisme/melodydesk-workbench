@@ -288,6 +288,7 @@
       <span class="readout mono">
         <span class="k">调式</span><span id="pill-key">1 = C</span><span class="sep">·</span><span class="k">速度</span><span id="pill-bpm">78 BPM</span><span class="sep">·</span><span class="k">变调夹</span><span id="pill-capo">Capo 0</span><span class="sep">·</span><span id="pill-bars">— 小节全曲</span>
       </span>
+      <a class="btn ghost" href="/evolution_atlas" target="_blank" rel="noopener" title="查看 MelodyDesk 项目进化图鉴与 8s 交互声学演示">进化图鉴</a>
       <button type="button" class="btn ghost" id="btn-undo" title="退回上一步修改">
         <svg class="i" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>撤销
       </button>
@@ -532,6 +533,7 @@
   <script>
     let currentState = null;
     let selectedBarIndex = 0;
+    let selectedSegmentIndex = 0;
     let currentZoom = 100;
     let activeDemo = 'mandarin_pop';
 
@@ -970,9 +972,18 @@
 
     // Select a bar everywhere (inspector, fretboard, score) and move the transport there — never reloads audio
     function selectBar(idx, localBeat, fromScore) {
-      const n = ((currentState && currentState.bar_analysis) || []).length;
+      const bars = (currentState && currentState.bar_analysis) || [];
+      const n = bars.length;
       if (!n) return;
       selectedBarIndex = Math.max(0, Math.min(n - 1, idx));
+      const segs = (bars[selectedBarIndex] && bars[selectedBarIndex].split_segments) || [];
+      if (localBeat === undefined) {
+        selectedSegmentIndex = 0;
+      } else {
+        let sIdx = 0;
+        for (let i = 0; i < segs.length; i++) if (segs[i].beat <= localBeat + 1e-6) sIdx = i;
+        selectedSegmentIndex = sIdx;
+      }
       if (!fromScore) forceScroll = true;
       seek(beatToSec(selectedBarIndex * measureBeats + (localBeat || 0)));
       renderBarInspector(currentState);
@@ -1107,7 +1118,15 @@
       const bar = sys.bars.find(b => svgX >= b.left && svgX < b.left + b.width)
         || (svgX < sys.bars[0].left ? sys.bars[0] : sys.bars[sys.bars.length - 1]);
       const frac = Math.max(0, Math.min(0.999, (svgX - bar.left - bar.pad) / Math.max(1, bar.width - 2 * bar.pad)));
-      return { sys, svgX, barIdx: bar.idx, localBeat: svgY < 105 ? 0 : frac * measureBeats };
+      let localBeat = frac * measureBeats;
+      if (svgY < 105) {
+        const bInfo = currentState && currentState.bar_analysis && currentState.bar_analysis[bar.idx];
+        const segs = (bInfo && bInfo.split_segments) || [];
+        let snapBeat = 0;
+        for (let i = 0; i < segs.length; i++) if (segs[i].beat <= localBeat + 1e-6) snapBeat = segs[i].beat;
+        localBeat = snapBeat;
+      }
+      return { sys, svgX, barIdx: bar.idx, localBeat };
     }
 
     function onGlobalKey(e) {
@@ -1417,27 +1436,58 @@
       });
 
       const activeBar = bars[selectedBarIndex];
-      const cands = (activeBar.candidates && activeBar.candidates.length)
-        ? activeBar.candidates.map(c => c.chord)
-        : [activeBar.chord];
+      const segs = activeBar.split_segments || [];
+      const hasSplit = segs.length > 1;
+      if (selectedSegmentIndex >= segs.length) selectedSegmentIndex = 0;
+      const activeSeg = hasSplit ? segs[selectedSegmentIndex] : activeBar;
+
+      if (hasSplit) {
+        segs.forEach((sg, sIdx) => {
+          const segBtn = document.createElement('button');
+          segBtn.type = 'button';
+          segBtn.className = 'cand-chip' + (sIdx === selectedSegmentIndex ? ' active' : '');
+          segBtn.title = `选择本小节第 ${sIdx + 1} 拍段 (${sg.chord})`;
+          segBtn.textContent = `拍段${sIdx + 1}:${sg.chord}`;
+          segBtn.onclick = () => {
+            selectedSegmentIndex = sIdx;
+            seek(beatToSec(selectedBarIndex * measureBeats + (sg.beat || 0)));
+            renderBarInspector(currentState);
+          };
+          candStrip.appendChild(segBtn);
+        });
+      }
+
+      const rawCands = (activeSeg.candidates && activeSeg.candidates.length)
+        ? activeSeg.candidates
+        : (activeBar.candidates || []);
+      const cands = rawCands.length ? rawCands.map(c => c.chord) : [activeSeg.chord];
 
       cands.slice(0, 8).forEach(ch => {
         const chip = document.createElement('button');
         chip.type = 'button';
-        chip.className = 'cand-chip' + (ch === activeBar.chord ? ' active' : '');
+        chip.className = 'cand-chip' + (ch === activeSeg.chord ? ' active' : '');
         chip.textContent = ch;
-        chip.onclick = () => apiCall('bar_chord', { bar: selectedBarIndex, chord: ch }, true);
+        const payload = hasSplit
+          ? { bar: selectedBarIndex, segment: selectedSegmentIndex, chord: ch }
+          : { bar: selectedBarIndex, chord: ch };
+        chip.onclick = () => apiCall('bar_chord', payload, true);
         candStrip.appendChild(chip);
       });
 
-      (activeBar.voicings || []).slice(0, 4).forEach((v, vIdx) => {
+      const segVoicings = (activeSeg.voicings && activeSeg.voicings.length)
+        ? activeSeg.voicings
+        : (activeBar.voicings || []);
+      segVoicings.slice(0, 4).forEach((v, vIdx) => {
         const chip = document.createElement('button');
         chip.type = 'button';
         const fStr = v.frets.map(f => f < 0 ? 'X' : f).join('');
-        const curFStr = (activeBar.frets || []).map(f => f < 0 ? 'X' : f).join('');
+        const curFStr = (activeSeg.frets || activeBar.frets || []).map(f => f < 0 ? 'X' : f).join('');
         chip.className = 'cand-chip' + (fStr === curFStr ? ' active' : '');
         chip.textContent = `按法${vIdx + 1} ${fStr}`;
-        chip.onclick = () => apiCall('bar_chord', { bar: selectedBarIndex, frets: v.frets }, true);
+        const vPayload = hasSplit
+          ? { bar: selectedBarIndex, segment: selectedSegmentIndex, frets: v.frets }
+          : { bar: selectedBarIndex, frets: v.frets };
+        chip.onclick = () => apiCall('bar_chord', vPayload, true);
         voicingStrip.appendChild(chip);
       });
 
