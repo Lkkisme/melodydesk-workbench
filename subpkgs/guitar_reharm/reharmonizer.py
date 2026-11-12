@@ -221,13 +221,23 @@ def _transform(parsed, tonic, preset):
     return parsed['root_name'] + parsed['quality'] + ('/' + parsed['bass'] if parsed['bass'] else '')
 
 
-def _generate_preset_candidates(parsed: dict, tonic_pc: int, preset: str, bar_idx: int, total_bars: int) -> list[tuple[str, float]]:
+def _generate_preset_candidates(
+    parsed: dict,
+    tonic_pc: int,
+    preset: str,
+    bar_idx: int,
+    total_bars: int,
+    capo: int = 0,
+) -> list[tuple[str, float]]:
     root = parsed['root_name']
     if '#' in root and tonic_pc in (5, 10, 3, 8, 1):
         root = {1: 'Db', 3: 'Eb', 6: 'Gb', 8: 'Ab', 10: 'Bb'}.get(parsed['root'], root)
     quality = parsed['quality']
     bass = parsed['bass']
+    if bass and '#' in bass and tonic_pc in (5, 10, 3, 8, 1):
+        bass = {'C#': 'Db', 'D#': 'Eb', 'F#': 'Gb', 'G#': 'Ab', 'A#': 'Bb'}.get(bass, bass)
     displacement = (parsed['root'] - tonic_pc) % 12
+    has_explicit_slash = bool(bass) and (parsed.get('bass_pc') != parsed.get('root'))
     original_sym = root + quality + ('/' + bass if bass else '')
 
     if preset == 'original':
@@ -240,11 +250,15 @@ def _generate_preset_candidates(parsed: dict, tonic_pc: int, preset: str, bar_id
     is_min_q = (3 in ivs and 4 not in ivs and not is_dim_q) or quality in _MINOR
     is_dom_q = (4 in ivs and 10 in ivs) or quality in {'7', '9', '11', '13'}
     is_maj_q = (4 in ivs and 3 not in ivs) or quality in _MAJOR
+    is_borrowed_minor_iv = is_min_q and displacement == 5
 
     if preset == 'folk_easy':
         if is_maj_q:
             candidates.append((root, 1.0))
             candidates.append((root + 'add9', 0.7))
+        elif is_borrowed_minor_iv:
+            candidates.append((root + 'm', 1.0))
+            candidates.append((root + 'm6', 0.78))
         elif is_min_q:
             candidates.append((root + 'm', 1.0))
             candidates.append((root + 'm7', 0.75))
@@ -264,6 +278,20 @@ def _generate_preset_candidates(parsed: dict, tonic_pc: int, preset: str, bar_id
             candidates.append((root + ('9' if displacement == 7 else 'maj7'), 0.95))
             candidates.append((root + '6', 0.8))
             candidates.append((root + 'add9', 0.7))
+        elif is_borrowed_minor_iv:
+            # Borrowed minor iv in major key: m6 (diatonic 2nd) avoids m7/m9's b3/#9 clash against major tonic 3rd
+            candidates.append((root + 'm6', 0.96))
+            candidates.append((root + 'm', 0.88))
+            candidates.append((root + 'madd9', 0.80))
+        elif is_min_q and displacement == 4:
+            # Phrygian iii in major key: m7/m stay diatonic (m9 adds #4 tritone; m6 adds b2 clash against tonic)
+            candidates.append((root + 'm7', 0.95))
+            candidates.append((root + 'm', 0.85))
+        elif is_min_q and displacement == 9:
+            # Aeolian vi in major key: m9/m7 stay diatonic (m6 adds #4 tritone)
+            candidates.append((root + 'm9', 0.95))
+            candidates.append((root + 'm7', 0.88))
+            candidates.append((root + 'm', 0.78))
         elif is_min_q:
             candidates.append((root + 'm9', 0.95))
             candidates.append((root + 'm7', 0.85))
@@ -288,6 +316,10 @@ def _generate_preset_candidates(parsed: dict, tonic_pc: int, preset: str, bar_id
                 candidates.append((root + 'add9', 0.9))
                 candidates.append((root, 0.78))
             candidates.append((root + 'sus2', 0.68))
+        elif is_borrowed_minor_iv:
+            candidates.append((root + 'm6', 0.92))
+            candidates.append((root + 'm', 0.88))
+            candidates.append((root + 'madd9', 0.82))
         elif is_min_q:
             candidates.append((root + 'm7', 0.9))
             candidates.append((root + 'm9', 0.75))
@@ -296,7 +328,7 @@ def _generate_preset_candidates(parsed: dict, tonic_pc: int, preset: str, bar_id
             candidates.append((original_sym, 0.8))
 
     elif preset == 'walking_bass':
-        candidates.append((original_sym, 0.7))
+        candidates.append((original_sym, 0.94 if has_explicit_slash else 0.7))
         third_pair = (3, 2) if 3 in ivs else ((4, 2) if 4 in ivs else ((2, 1) if 2 in ivs else ((5, 3) if 5 in ivs else None)))
         if third_pair is not None:
             _bass_3rd = _spell_from(root, third_pair[0], third_pair[1])
@@ -326,7 +358,26 @@ def _generate_preset_candidates(parsed: dict, tonic_pc: int, preset: str, bar_id
     else:
         candidates.append((original_sym, 0.8))
 
-    if all(sym != original_sym for sym, _ in candidates):
+    if has_explicit_slash and preset != 'walking_bass':
+        slash_expanded: list[tuple[str, float]] = []
+        root_fallbacks: list[tuple[str, float]] = []
+        seen_syms: set[str] = set()
+        for sym_c, pr_c in candidates:
+            if '/' not in sym_c:
+                sl_sym = sym_c + '/' + bass
+                if sl_sym not in seen_syms:
+                    slash_expanded.append((sl_sym, pr_c + 0.12))
+                    seen_syms.add(sl_sym)
+                if sym_c not in seen_syms:
+                    root_fallbacks.append((sym_c, pr_c - 1.25))
+                    seen_syms.add(sym_c)
+            elif sym_c not in seen_syms:
+                slash_expanded.append((sym_c, pr_c))
+                seen_syms.add(sym_c)
+        if original_sym not in seen_syms:
+            slash_expanded.append((original_sym, 0.94))
+        candidates = slash_expanded + root_fallbacks
+    elif all(sym != original_sym for sym, _ in candidates):
         candidates.append((original_sym, 0.72))
 
     is_boundary_bar = (bar_idx == 0 or (total_bars > 1 and bar_idx == total_bars - 1))
@@ -334,7 +385,7 @@ def _generate_preset_candidates(parsed: dict, tonic_pc: int, preset: str, bar_id
     valid = []
     for sym, prior in candidates:
         p = parse_extended_chord(sym)
-        if p is not None and generate_voicings(sym):
+        if p is not None and generate_voicings(sym, capo):
             adj_prior = float(prior)
             if is_boundary_bar and p['root'] == tonic_pc and p['bass_pc'] == tonic_pc:
                 adj_prior += 0.08
@@ -342,44 +393,57 @@ def _generate_preset_candidates(parsed: dict, tonic_pc: int, preset: str, bar_id
                 adj_prior += 0.06
             valid.append((sym, adj_prior))
     if not valid:
-        valid = [(original_sym, 0.5)]
+        fallback_root = (root + 'm') if is_min_q else root
+        if parse_extended_chord(original_sym) is not None and generate_voicings(original_sym, capo):
+            valid = [(original_sym, 0.5)]
+        elif parse_extended_chord(fallback_root) is not None and generate_voicings(fallback_root, capo):
+            valid = [(fallback_root, 0.5)]
+        else:
+            valid = [(original_sym, 0.5)]
     else:
         valid.sort(key=lambda item: item[1], reverse=True)
     return valid
 
 
-def _resolve_harmony(symbol, previous, following, tonic, notes, start, end):
+def _resolve_harmony(symbol, previous, following, tonic, notes, start, end, capo: int = 0):
     report = check_melody_clash(symbol, notes, start, end, tonic)
-    if report['status'] != 'clash' and generate_voicings(symbol):
+    if report['status'] != 'clash' and generate_voicings(symbol, capo):
         return symbol, report
     parsed = _parse(symbol)
     root = parsed['root_name']
+    bass = parsed['bass']
+    has_slash = bool(bass) and (parsed.get('bass_pc') != parsed.get('root'))
     tonic_pc = _note_pc(tonic)
     scale = {(tonic_pc + x) % 12 for x in _SCALE}
     is_min = (3 in parsed['intervals'] and 4 not in parsed['intervals']) or parsed['quality'] in _MINOR
-    same_root_fallbacks = (
-        [root + 'm', root + 'm7', root + 'madd9', root + 'm6']
-        if is_min
-        else [root + 'add9', root, root + 'sus4', root + 'sus2', root + '6', root + 'maj7']
+    base_fallbacks = (
+        [root + 'm', root + 'm6', root + 'm7', root + 'madd9']
+        if (is_min and ((parsed['root'] - tonic_pc) % 12) == 5)
+        else ([root + 'm', root + 'm7', root + 'madd9', root + 'm6']
+              if is_min
+              else [root + 'add9', root, root + 'sus4', root + 'sus2', root + '6', root + 'maj7'])
     )
+    same_root_fallbacks = ([fb + '/' + bass for fb in base_fallbacks] + base_fallbacks) if has_slash else base_fallbacks
     for alt in same_root_fallbacks:
+        if parse_extended_chord(alt) is None:
+            continue
         alt_rep = check_melody_clash(alt, notes, start, end, tonic)
-        if alt_rep['status'] != 'clash' and generate_voicings(alt):
+        if alt_rep['status'] != 'clash' and generate_voicings(alt, capo):
             return alt, alt_rep
     subs = suggest_bar_substitutions(symbol, previous, following, tonic, notes, start, end)
     orig_pcs = set(parsed['pcs'])
     # Prefer in-key substitutions that share at least one chord tone with the original harmony before any chromatic root shift
     for candidate in subs:
-        if candidate['clash']['status'] == 'clash' or not generate_voicings(candidate['chord']):
+        if candidate['clash']['status'] == 'clash' or not generate_voicings(candidate['chord'], capo):
             continue
         p_cand = parse_extended_chord(candidate['chord'])
         if p_cand and len(set(p_cand['pcs']) - scale) == 0 and len(set(p_cand['pcs']) & orig_pcs) >= 1:
             return candidate['chord'], candidate['clash']
     for candidate in subs:
-        if candidate['clash']['status'] != 'clash' and generate_voicings(candidate['chord']):
+        if candidate['clash']['status'] != 'clash' and generate_voicings(candidate['chord'], capo):
             return candidate['chord'], candidate['clash']
     for candidate in subs:
-        if generate_voicings(candidate['chord']):
+        if generate_voicings(candidate['chord'], capo):
             return candidate['chord'], candidate['clash']
     return symbol, report
 
@@ -640,7 +704,7 @@ def _bass_transition_score(bass_a, bass_b, preset):
     return score
 
 
-def _solve_split_bar_chord(chosen_sym, next_sym, notes, bar_idx, measure, tonic, preset='walking_bass'):
+def _solve_split_bar_chord(chosen_sym, next_sym, notes, bar_idx, measure, tonic, preset='walking_bass', capo: int = 0):
     mid = bar_idx * measure + measure / 2.0
     bar_end = (bar_idx + 1) * measure
     chosen_parsed = parse_extended_chord(chosen_sym)
@@ -672,22 +736,22 @@ def _solve_split_bar_chord(chosen_sym, next_sym, notes, bar_idx, measure, tonic,
         inversions.append(root + 'dim7/' + _spell_from(root, 9, 6))
 
     for sym in inversions:
-        if parse_extended_chord(sym) and generate_voicings(sym):
+        if parse_extended_chord(sym) and generate_voicings(sym, capo):
             candidates.append(sym)
 
     is_maj_split = (4 in ivs and 3 not in ivs) or quality in _MAJOR
     if is_maj_split:
         for q in ['sus4', 'sus2']:
             sym = root + q
-            if parse_extended_chord(sym) and generate_voicings(sym):
+            if parse_extended_chord(sym) and generate_voicings(sym, capo):
                 candidates.append(sym)
     if 5 in ivs and 10 in ivs and 3 not in ivs and 4 not in ivs:
         sym7 = root + '7'
-        if parse_extended_chord(sym7) and generate_voicings(sym7):
+        if parse_extended_chord(sym7) and generate_voicings(sym7, capo):
             candidates.append(sym7)
     if is_maj_split and 3 not in ivs and 4 in ivs:
         sym = root + 'm6'
-        if parse_extended_chord(sym) and generate_voicings(sym):
+        if parse_extended_chord(sym) and generate_voicings(sym, capo):
             candidates.append(sym)
 
     if next_sym and next_sym.strip() != 'N.C.':
@@ -697,7 +761,7 @@ def _solve_split_bar_chord(chosen_sym, next_sym, notes, bar_idx, measure, tonic,
             v_3rd_name = _spell_from(v_root_name, 4, 2)
             for q in ['7', '', '/' + v_3rd_name]:
                 sym = v_root_name + q
-                if parse_extended_chord(sym) and generate_voicings(sym):
+                if parse_extended_chord(sym) and generate_voicings(sym, capo):
                     candidates.append(sym)
 
     if not candidates:
@@ -766,7 +830,7 @@ def reharmonize_progression(
             continue
         parsed = _parse(original)
 
-        cands = _generate_preset_candidates(parsed, tonic_pc, preset, idx, n_bars)
+        cands = _generate_preset_candidates(parsed, tonic_pc, preset, idx, n_bars, capo=capo)
         if not cands:
             cands = [(original, 0.5)]
         candidate_lists.append(cands)
@@ -783,7 +847,7 @@ def reharmonize_progression(
             base_sym = base_chords[idx]
             prev_c = base_chords[idx - 1] if idx > 0 else None
             next_c = base_chords[idx + 1] if idx + 1 < n_bars else None
-            safe_sym, safe_rep = _resolve_harmony(base_sym, prev_c, next_c, tonic, project.notes, bar_start, bar_end)
+            safe_sym, safe_rep = _resolve_harmony(base_sym, prev_c, next_c, tonic, project.notes, bar_start, bar_end, capo=capo)
             clash_cache[(idx, safe_sym)] = safe_rep
             if all(s != safe_sym for s, _ in cands):
                 cands.append((safe_sym, 0.65))
@@ -862,12 +926,12 @@ def reharmonize_progression(
         if preset != 'original' and report.get('status') == 'clash':
             base_sym = base_chords[b]
             fallback_report = check_melody_clash(base_sym, project.notes, b * measure, (b + 1) * measure, tonic)
-            if fallback_report['status'] != 'clash' and generate_voicings(base_sym):
+            if fallback_report['status'] != 'clash' and generate_voicings(base_sym, capo):
                 sym = base_sym
             else:
                 prev_c = chosen_syms[b - 1] if b > 0 else None
                 next_c = candidate_lists[b + 1][chosen_indices[b + 1]][0] if b + 1 < n_bars else None
-                safe_sym, _ = _resolve_harmony(base_sym, prev_c, next_c, tonic, project.notes, b * measure, (b + 1) * measure)
+                safe_sym, _ = _resolve_harmony(base_sym, prev_c, next_c, tonic, project.notes, b * measure, (b + 1) * measure, capo=capo)
                 sym = safe_sym
         chosen_syms.append(sym)
 
@@ -883,7 +947,7 @@ def reharmonize_progression(
         mel_tiv_h, has_mel_h = _melody_tiv_for_bar(project.notes, seg_s, seg_e)
         best_sym_h = None
         best_sc_h = -1e9
-        for cand_sym, prior_h in _generate_preset_candidates(p_raw, tonic_pc, preset, bar_i, n_bars):
+        for cand_sym, prior_h in _generate_preset_candidates(p_raw, tonic_pc, preset, bar_i, n_bars, capo=capo):
             if not generate_voicings(cand_sym, capo):
                 continue
             rep_h = check_melody_clash(cand_sym, project.notes, seg_s, seg_e, tonic)
@@ -938,7 +1002,7 @@ def reharmonize_progression(
 
         if split_bar and (n_bars < 2 or idx < n_bars - 1) and chosen.strip() != 'N.C.':
             next_sym = chosen_syms[idx + 1] if idx + 1 < n_bars else None
-            second_sym = _solve_split_bar_chord(chosen, next_sym, project.notes, idx, measure, tonic, preset=preset)
+            second_sym = _solve_split_bar_chord(chosen, next_sym, project.notes, idx, measure, tonic, preset=preset, capo=capo)
             if second_sym and second_sym != chosen:
                 half = measure / 2.0
                 rep1 = check_melody_clash(chosen, project.notes, bar_start, bar_start + half, tonic)

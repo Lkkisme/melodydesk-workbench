@@ -1,12 +1,13 @@
 """Studio Multi-Round-Robin 6-String Acoustic Guitar Synthesizer & Vocal/Guitar Stem Mixer.
 
 Architecture (Route 1 Acoustic Physics & Multi-Sample Engine):
-1. Hybrid Multi-RR Sample Engine: 272 pure microphone-recorded acoustic plucks from `Shinyguitar`
-   (17 minor-3rd zones x 4 velocity layers x 4 Round-Robins) fused with per-string minimum-phase FIR
-   timbre transfer (`_minphase_fir`) from 375 `Meta Steel Guitar` per-string recordings, plus `FSS`
-   and Karplus-Strong physical-modeling fallback when sample libraries are absent.
+1. Studio Steel-String Multi-RR Sample Engine: 375 per-string, per-fret close-miked wooden steel-string
+   plucks from `Meta Steel Guitar` blended with stereo studio-miked `FSS Steel String Guitar` (`MV`/`HV`)
+   across 4 distinct physical Round-Robin takes (`rr=1..4`: primary fret, neighbor-fret pluck-node shift,
+   cross-velocity RMS-matched layer, and adjacent-string/fret studio-mic take) with pitch-adaptive
+   sub-fundamental rumble filtering, falling back to `Shinyguitar` and Karplus-Strong when absent.
 2. Formant-Preserving Phase-Continuous Fret-Slide (`'SL'` / `slide_from_fret`): separates static wood-body
-   formants (98/196/385/2800 Hz RBJ modes) from string excitation, warps along a fret-quantized C^1 glide
+   formants (98/196/385/2800 Hz RBJ modes) from string excitation, warps along a fret-quantized step
    with integer phase-locked splice `D`, fret-wire micro-dip/buzz, and amplitude-complementary crossfade.
 3. Real Studio Articulation Noise Staging: `Shinyguitar` 5-RR string-release noises (`release_rr`),
    16-RR wooden body taps (`perc_rr`), per-string muted chops (`mute_string`), and `Emilyguitar` 5-RR
@@ -37,9 +38,17 @@ def _resolve_samples_dirs() -> list[Path]:
         cand = Path(env_dir)
         if cand.is_dir():
             dirs.append(cand.resolve())
-    repo_cand = (Path(__file__).resolve().parents[2] / "guitar_samples").resolve()
-    if repo_cand.is_dir() and repo_cand not in dirs:
-        dirs.append(repo_cand)
+    here = Path(__file__).resolve()
+    fallback_cands = [here.parents[2] / "guitar_samples"]
+    if len(here.parents) >= 5:
+        fallback_cands.append(here.parents[4] / "work" / "guitar_samples")
+    if len(here.parents) >= 4:
+        fallback_cands.append(here.parents[3] / "work" / "guitar_samples")
+    for fb in fallback_cands:
+        if fb.is_dir():
+            resolved = fb.resolve()
+            if resolved not in dirs:
+                dirs.append(resolved)
     return dirs
 
 
@@ -76,7 +85,7 @@ _WAVE_CACHE: OrderedDict[tuple[str, int, bool], np.ndarray] = OrderedDict()
 _SHINY_ZONE_STATS_CACHE: dict[tuple[int, int, int], tuple[float, dict[int, int], np.ndarray]] = {}
 _TIMBRE_FIR_CACHE: dict[tuple[int, int, int, int], np.ndarray | None] = {}
 _HYBRID_BASE_CACHE: OrderedDict[tuple[int, int, int, int, int, bool], np.ndarray] = OrderedDict()
-_BLENDED_NOTE_CACHE: OrderedDict[tuple[int, int, int, int, bool], np.ndarray] = OrderedDict()
+_BLENDED_NOTE_CACHE: OrderedDict[tuple[int, int, int, int, int, bool], np.ndarray] = OrderedDict()
 _NOISE_ASSET_CACHE: dict[tuple[str, int, int], np.ndarray] = {}
 _SLAP_CACHE: dict[tuple[int, int, int], np.ndarray] = {}
 _ROOM_IR_CACHE: dict[int, tuple[np.ndarray, np.ndarray]] = {}
@@ -645,63 +654,128 @@ def _select_vel_layer(velocity: float, technique: str) -> tuple[int, float]:
     return layer, float(10.0 ** (db_offset / 20.0))
 
 
-def _get_blended_studio_base(pitch: int, string: int, layer: int, sr: int, is_pm: bool) -> np.ndarray | None:
-    key = (string, int(pitch), layer, sr, is_pm)
+def _get_blended_studio_base(
+    pitch: int,
+    string: int,
+    layer: int,
+    sr: int,
+    is_pm: bool,
+    rr: int = 1,
+) -> np.ndarray | None:
+    rr_idx = ((int(rr) - 1) % 4) + 1
+    key = (int(string), int(pitch), int(layer), rr_idx, int(sr), bool(is_pm))
     with _CACHE_LOCK:
         if key in _BLENDED_NOTE_CACHE:
             _BLENDED_NOTE_CACHE.move_to_end(key)
             return _BLENDED_NOTE_CACHE[key]
-    primary_wave = None
-    shift_semi = 0.0
+
+    max_len = round(4.0 * sr)
+    f0_hz = 440.0 * (2.0 ** ((float(pitch) - 69.0) / 12.0))
+    sos_hp = _cached_butter_sos(2, min(0.38 * float(sr), max(62.0, 0.65 * f0_hz)), "highpass", sr)
+
+    def _prep_meta_take(m_key: tuple[int, int, int]) -> np.ndarray:
+        _, m_src, _ = m_key
+        w_raw = _read_cached_audio(_META_INDEX[m_key], sr)
+        w_seg = w_raw[: min(len(w_raw), max_len)].astype(np.float64)
+        w_seg = _pitch_shift_resample(w_seg, float(pitch - m_src))
+        if sos_hp is not None and len(w_seg) >= 16:
+            w_seg = sosfilt(sos_hp, w_seg)
+        if abs(pitch - m_src) > 0.5:
+            sos_lp_m = _cached_butter_sos(2, 10500.0, "lowpass", sr)
+            if sos_lp_m is not None and len(w_seg) >= 16:
+                w_seg = sosfilt(sos_lp_m, w_seg)
+        return w_seg
+
+    meta_cands: list[tuple[int, int, int]] = []
+    eff_layer = 2 if (layer == 1 and pitch >= 72 and any(s == string and v == 2 for (s, _, v) in _META_INDEX)) else layer
+    layer_atten = 0.68 if (layer == 1 and eff_layer == 2) else 1.0
+    alt_layer = 2 if eff_layer == 3 else (3 if eff_layer == 2 else 2)
+
     if _META_INDEX:
-        if (string, pitch, layer) in _META_INDEX:
-            primary_wave = _read_cached_audio(_META_INDEX[(string, pitch, layer)], sr)
-        else:
-            same_str = [m for (s, m, v) in _META_INDEX if s == string and v == layer]
-            if same_str:
-                nearest_m = min(same_str, key=lambda m: abs(m - pitch))
-                if abs(nearest_m - pitch) <= 3:
-                    primary_wave = _read_cached_audio(_META_INDEX[(string, nearest_m, layer)], sr)
-                    shift_semi = float(pitch - nearest_m)
-            if primary_wave is None:
-                any_str = [(s, m) for (s, m, v) in _META_INDEX if v == layer]
-                if any_str:
-                    nearest_s, nearest_m = min(any_str, key=lambda sm: (abs(sm[1] - pitch), abs(sm[0] - string)))
-                    primary_wave = _read_cached_audio(_META_INDEX[(nearest_s, nearest_m, layer)], sr)
-                    shift_semi = float(pitch - nearest_m)
+        same_primary = sorted(
+            [m for (s, m, v) in _META_INDEX if s == string and v == eff_layer and abs(m - pitch) <= 4],
+            key=lambda m: (abs(m - pitch), m),
+        )
+        same_alt_v = sorted(
+            [m for (s, m, v) in _META_INDEX if s == string and v == alt_layer and abs(m - pitch) <= 4],
+            key=lambda m: (abs(m - pitch), m),
+        )
+        adj_str = sorted(
+            [
+                (s, m, v)
+                for (s, m, v) in _META_INDEX
+                if abs(s - string) == 1 and v in (eff_layer, alt_layer) and abs(m - pitch) <= 2
+            ],
+            key=lambda smv: (abs(smv[1] - pitch), abs(smv[2] - eff_layer), abs(smv[0] - string)),
+        )
+
+        def _push_cand(item: tuple[int, int, int]) -> None:
+            if item in _META_INDEX and item not in meta_cands:
+                meta_cands.append(item)
+
+        if same_primary:
+            _push_cand((string, same_primary[0], eff_layer))
+        if len(same_primary) >= 2:
+            _push_cand((string, same_primary[1], eff_layer))
+        if same_alt_v:
+            _push_cand((string, same_alt_v[0], alt_layer))
+        if len(same_primary) >= 3:
+            _push_cand((string, same_primary[2], eff_layer))
+        for smv in adj_str:
+            if len(meta_cands) >= 4:
+                break
+            _push_cand(smv)
+        for m_av in same_alt_v[1:]:
+            if len(meta_cands) >= 4:
+                break
+            _push_cand((string, m_av, alt_layer))
+        if not meta_cands:
+            any_str = sorted(
+                [(s, m, v) for (s, m, v) in _META_INDEX if v in (eff_layer, alt_layer, layer)],
+                key=lambda smv: (abs(smv[1] - pitch), abs(smv[0] - string), abs(smv[2] - eff_layer)),
+            )
+            for smv in any_str[:4]:
+                _push_cand(smv)
 
     fss_wave = None
     fss_shift = 0.0
     if _FSS_INDEX:
         pref_tag = "HV" if layer == 3 else "MV"
         alt_tag = "MV" if pref_tag == "HV" else "HV"
-        if (pitch, pref_tag) in _FSS_INDEX:
-            fss_wave = _read_cached_audio(_FSS_INDEX[(pitch, pref_tag)], sr)
-        elif (pitch, alt_tag) in _FSS_INDEX:
-            fss_wave = _read_cached_audio(_FSS_INDEX[(pitch, alt_tag)], sr)
-        else:
-            avail = sorted({m for (m, _) in _FSS_INDEX})
-            nearest_m = min(avail, key=lambda m: abs(m - pitch))
-            tag = pref_tag if (nearest_m, pref_tag) in _FSS_INDEX else alt_tag
-            fss_wave = _read_cached_audio(_FSS_INDEX[(nearest_m, tag)], sr)
-            fss_shift = float(pitch - nearest_m)
+        chosen_tag = pref_tag if rr_idx in (1, 3) else alt_tag
+        other_tag = alt_tag if chosen_tag == pref_tag else pref_tag
+        avail_fss = sorted({m for (m, _) in _FSS_INDEX}, key=lambda m: (abs(m - pitch), m))
+        if avail_fss:
+            pick_fss_m = avail_fss[1] if (rr_idx in (3, 4) and len(avail_fss) >= 2 and abs(avail_fss[1] - pitch) <= 3) else avail_fss[0]
+            tag = chosen_tag if (pick_fss_m, chosen_tag) in _FSS_INDEX else other_tag
+            if (pick_fss_m, tag) in _FSS_INDEX:
+                fss_wave = _read_cached_audio(_FSS_INDEX[(pick_fss_m, tag)], sr)
+                fss_shift = float(pitch - pick_fss_m)
 
-    max_len = round(4.0 * sr)
-    if primary_wave is not None:
-        seg = primary_wave[: min(len(primary_wave), max_len)].astype(np.float64)
-        seg = _pitch_shift_resample(seg, shift_semi) * 2.45
-        if abs(shift_semi) > 0.5:
-            sos_lp = _cached_butter_sos(2, 10500.0, "lowpass", sr)
-            if sos_lp is not None:
-                seg = sosfilt(sos_lp, seg)
+    fss_mix = (0.10, 0.15, 0.18, 0.22)[rr_idx - 1]
+    if meta_cands:
+        ref_seg = _prep_meta_take(meta_cands[0])
+        chosen_key = meta_cands[min(rr_idx - 1, len(meta_cands) - 1)]
+        seg = ref_seg.copy() if chosen_key == meta_cands[0] else _prep_meta_take(chosen_key)
+        if chosen_key != meta_cands[0]:
+            n_cal = min(len(ref_seg), len(seg), max(32, round(0.45 * sr)))
+            rms_ref = float(np.sqrt(np.mean(ref_seg[:n_cal] ** 2)))
+            rms_cur = float(np.sqrt(np.mean(seg[:n_cal] ** 2)))
+            if rms_ref > 1e-5 and rms_cur > 1e-5:
+                seg *= float(np.clip((rms_ref / rms_cur) ** 0.82, 0.45, 2.25))
+        seg *= 2.42 * layer_atten
         if fss_wave is not None:
             f_seg = fss_wave[: min(len(fss_wave), max_len)].astype(np.float64)
             f_seg = _pitch_shift_resample(f_seg, fss_shift)
+            if sos_hp is not None and len(f_seg) >= 16:
+                f_seg = sosfilt(sos_hp, f_seg)
             n_blend = min(len(seg), len(f_seg))
-            seg[:n_blend] = 0.88 * seg[:n_blend] + 0.12 * (f_seg[:n_blend] * 0.45)
+            seg[:n_blend] = (1.0 - fss_mix) * seg[:n_blend] + fss_mix * (f_seg[:n_blend] * 0.46)
     elif fss_wave is not None:
         seg = fss_wave[: min(len(fss_wave), max_len)].astype(np.float64)
         seg = _pitch_shift_resample(seg, fss_shift) * 0.55
+        if sos_hp is not None and len(seg) >= 16:
+            seg = sosfilt(sos_hp, seg)
     else:
         return None
 
@@ -712,8 +786,14 @@ def _get_blended_studio_base(pitch: int, string: int, layer: int, sr: int, is_pm
         if sos_pm is not None:
             seg = sosfilt(sos_pm, seg)
     else:
-        decay_rate = 0.12 if string >= 4 else (0.22 if layer == 1 else 0.16)
+        decay_rate = 0.11 if string >= 4 else (0.20 if layer == 1 else 0.14)
         seg *= np.exp(-t * decay_rate)
+        if sr >= 16000 and len(seg) >= 32:
+            body_db = 1.05 if rr_idx != 4 else 1.35
+            sos_warm = _peaking_eq_sos(188.0, body_db, 1.05, sr)
+            if string <= 3 and layer >= 2:
+                sos_warm = np.vstack([sos_warm, _peaking_eq_sos(min(0.42 * sr, 3400.0), -1.05, 1.35, sr)])
+            seg = sosfilt(sos_warm, seg)
         if layer == 1 and string <= 3:
             sos_s = _cached_butter_sos(1, 9800.0, "lowpass", sr)
             if sos_s is not None:
@@ -816,16 +896,17 @@ def _fetch_studio_guitar_note(
         return None
     eff_rr = int(rr_idx) if rr_idx is not None else (1 + (abs(int(seed)) % 4))
     base: np.ndarray | None = None
-    if _SHINY_PITCHED:
+    vel_gain = 0.0
+    if _META_INDEX or _FSS_INDEX:
+        layer, vel_gain = _select_vel_layer(velocity, technique)
+        if vel_gain <= 0.0:
+            return np.zeros(duration_samples, dtype=np.float64)
+        base = _get_blended_studio_base(pitch, string, layer, sr, technique == "PM", rr=eff_rr)
+    if base is None and _SHINY_PITCHED:
         vl, vel_gain = _select_shiny_layer_and_gain(velocity, technique)
         if vel_gain <= 0.0:
             return np.zeros(duration_samples, dtype=np.float64)
         base = _get_hybrid_shiny_base(pitch, string, vl, eff_rr, sr, technique == "PM")
-    if base is None:
-        layer, vel_gain = _select_vel_layer(velocity, technique)
-        if vel_gain <= 0.0:
-            return np.zeros(duration_samples, dtype=np.float64)
-        base = _get_blended_studio_base(pitch, string, layer, sr, technique == "PM")
     if base is None:
         return None
 

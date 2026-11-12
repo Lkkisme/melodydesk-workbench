@@ -289,11 +289,11 @@ def _bar_beat_positions(
     interior = beat_arr[(beat_arr > db_start + 0.3 * local_spb) & (beat_arr < db_end - 0.3 * local_spb)]
     if measure_beats == 1:
         return [db_start]
-    if not is_compound and len(interior) == measure_beats - 1 and np.all(np.diff(interior) > 0):
+    if not is_compound and len(interior) == measure_beats - 1 and np.all(np.diff(interior) >= 0.45 * local_spb):
         return [db_start] + [float(t) for t in interior]
     sub_spb = bar_span / (2 * measure_beats)
     interior_sub = beat_arr[(beat_arr > db_start + 0.3 * sub_spb) & (beat_arr < db_end - 0.3 * sub_spb)]
-    if len(interior_sub) == 2 * measure_beats - 1 and np.all(np.diff(interior_sub) > 0):
+    if len(interior_sub) == 2 * measure_beats - 1 and np.all(np.diff(interior_sub) >= 0.45 * sub_spb):
         return [db_start] + [float(t) for t in interior_sub[1::2]]
     inside = beat_arr[(beat_arr > db_start + 1e-4) & (beat_arr < db_end - 1e-4)]
     if is_compound and len(inside):
@@ -798,7 +798,16 @@ def track_beats_and_downbeats(
                     loss = acoustic_loss
                 if loss < min_parity_loss:
                     chosen_parity, min_parity_loss = par, loss
-            beat_arr = np.unique(np.sort(np.concatenate([beat_arr, db[1 - chosen_parity::2]])))
+            demoted_db = db[1 - chosen_parity::2]
+            if len(demoted_db):
+                min_sep = 0.35 * max(0.15, float(spb_q))
+                keep_demoted = [
+                    float(d_t)
+                    for d_t in demoted_db
+                    if len(beat_arr) == 0 or float(np.min(np.abs(beat_arr - float(d_t)))) >= min_sep
+                ]
+                if keep_demoted:
+                    beat_arr = np.unique(np.sort(np.concatenate([beat_arr, np.asarray(keep_demoted, dtype=np.float64)])))
             db = db[chosen_parity::2]
             if len(db) == 1:
                 db = np.array([float(db[0]), float(db[0]) + 2.0 * median_bar], dtype=np.float64)

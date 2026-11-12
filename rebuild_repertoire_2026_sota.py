@@ -34,7 +34,9 @@ from music import NAMES, Project
 from subpkgs.guitar_reharm import recommend_artistry
 from subpkgs.singing_lyrics import (
     align_lyrics_to_notes,
+    detect_pre_lyric_vocalise_onsets,
     estimate_key_albrecht_shanahan,
+    filter_pre_lyric_bleed_notes,
     regulate_singing_notes_for_score,
     transcribe_vocal_notes,
     transcribe_word_timestamps,
@@ -103,27 +105,24 @@ FULL_LYRICS: dict[str, str] = {
     ),
     "greensleeves": (
         "Alas my love you do me wrong to cast me off discourteously "
-        "For I have loved you well and long delighting in your company "
+        "For I have courted you so long delighting in your company "
         "Greensleeves was all my joy Greensleeves was my delight "
-        "Greensleeves was my heart of gold and who but my lady Greensleeves "
-        "I have been ready at your hand to grant whatever you would crave "
-        "I have both waged life and land your love and good will for to have "
+        "Greensleeves was my heart of gold and who but my Lady Greensleeves "
+        "So Greensleeves now farewell adieu may good fortune prosper thee "
+        "For I am still thy lover true oh come once again and love me "
         "Greensleeves was all my joy Greensleeves was my delight "
-        "Greensleeves was my heart of gold and who but my lady Greensleeves "
-        "Thy smock of silk both fair and white with gold embroidered gorgeously "
-        "Thy petticoat of sendal right and these I bought all gladly "
-        "Greensleeves was all my joy Greensleeves was my delight "
-        "Greensleeves was my heart of gold and who but my lady Greensleeves"
+        "Greensleeves my heart of gold and who but my Lady Greensleeves"
     ),
     "real_vocal": (
-        "Woke up early in the morning sun shining through the kitchen door "
-        "Grabbed my tackle box and willow pole heading down to the river shore "
-        "Let's go fishin down by the creek where the cool clear waters flow "
-        "Leave all your worries on the dusty bank and watch that bobber go "
-        "Honeysuckle breeze in the sycamore trees crickets singing in the shade "
-        "Best kind of memories that you ever keep are the ones that the river made "
-        "Let's go fishin down by the creek where the cool clear waters flow "
-        "Leave all your worries on the dusty bank and watch that bobber go"
+        "Hey now baby it's a beautiful day let's call in to work and we'll go out and play sweet darlin' "
+        "Cause I've got nothin' but time on my hands I just wanna spend a little time with my man sweet darlin' "
+        "You grab the rods and I'll get the bait we'll do a little fishin' let's make it a date "
+        "with the blue skies above and the sun on our skin oh sweet darlin' let's go fishin' "
+        "I'll pack us a lunch we'll eat by the water talk about the good times down at the harbor darlin' "
+        "You can hold my hand like you did in high school I'll even let you sneak a kiss if you want to darlin' "
+        "You grab the rods and I'll get the bait we'll do a little fishin' let's make it a date "
+        "with the blue skies above and the sun on our skin oh sweet darlin' let's go fishin' "
+        "Yeah let's go fishin' Come on darlin' Oh sweet darlin'"
     ),
     "regular_friends": (
         "等待 我随时随地在等待 做你感情上的依赖 我没有任何的疑问 这是爱 "
@@ -174,7 +173,7 @@ SONG_SPECS: dict[str, dict] = {
         "harmony_tonic": "E",
         "minor": True,
         "meter": "3/4",
-        "capo": 2,
+        "capo": 0,
         "preset": "emotional_pop",
         "style": "分解和弦",
         "bpm_range": (116.0, 142.0),
@@ -303,7 +302,7 @@ def main() -> None:
         expected_tokens = len(re.findall(r"[A-Za-z0-9']+|[\u4e00-\u9fff]", raw_lyrics))
         voc_stat = voc_wav.stat()
         wt_cache_key = hashlib.sha256(
-            f"mms_ctc_v2|{voc_wav.name}|{voc_stat.st_size}|{int(voc_stat.st_mtime)}|{raw_lyrics}".encode("utf-8")
+            f"mms_ctc_v3|{voc_wav.name}|{voc_stat.st_size}|{int(voc_stat.st_mtime)}|{raw_lyrics}".encode("utf-8")
         ).hexdigest()[:16]
         cached_wt = entry.get("word_timestamps")
         if (
@@ -335,6 +334,8 @@ def main() -> None:
             {round(float(w["start"]), 3) for w in measured_ts if "start" in w and float(w["start"]) >= 0.0}
             | {round(float(w["group_start"]), 3) for w in subdiv_ts if "group_start" in w and float(w["group_start"]) >= 0.0}
         )
+        pre_voc_onsets = detect_pre_lyric_vocalise_onsets(voc_wav, all_vocal_onsets[0]) if all_vocal_onsets else []
+        beat_vocal_onsets = sorted(set(pre_voc_onsets) | set(all_vocal_onsets))
 
         # 3. Zero-Hint Blind Beat & Meter Tracking via ISMIR #1 Beat This! + Multi-Cue Octave Posterior
         beat_wav = src_wav if has_acc else voc_wav
@@ -342,7 +343,7 @@ def main() -> None:
         beat_info = track_beats_and_downbeats(
             beat_wav,
             prefer_cuda=True,
-            vocal_onsets_sec=all_vocal_onsets,
+            vocal_onsets_sec=beat_vocal_onsets,
             pre_vocal_bars=4 if has_acc else 1,
         )
         meter = str(beat_info["meter"])
@@ -372,7 +373,9 @@ def main() -> None:
         raw_notes = tx["notes"]
         if all_vocal_onsets:
             pickup_tol_sec = min(0.5, 0.5 * (60.0 / bpm))
-            raw_notes = [n for n in raw_notes if n.raw_start >= max(beat_origin, all_vocal_onsets[0] - pickup_tol_sec)]
+            raw_notes = filter_pre_lyric_bleed_notes(
+                raw_notes, voc_wav, all_vocal_onsets[0], beat_origin, pickup_tol_sec
+            )
         notes = regulate_singing_notes_for_score(
             raw_notes,
             bpm=bpm,
@@ -483,7 +486,7 @@ def main() -> None:
             capo=spec["capo"],
             style=rec_style,
             preset=rec_preset,
-            split_bar=(rec_preset == "neosoul_jazz"),
+            split_bar=False,
             passing_bass=(rec_preset in ("emotional_pop", "neosoul_jazz")),
             embellish_hp=(rec_preset in ("emotional_pop", "neosoul_jazz")),
             intro_mode="chord_melody",

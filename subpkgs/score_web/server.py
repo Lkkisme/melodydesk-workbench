@@ -1607,7 +1607,10 @@ def create_app() -> FastAPI:
                 word_boundaries: list[float] = []
                 inferred_lyrics = lyrics or ''
                 try:
-                    from subpkgs.singing_lyrics import transcribe_word_timestamps
+                    from subpkgs.singing_lyrics import (
+                        transcribe_word_timestamps,
+                        detect_pre_lyric_vocalise_onsets,
+                    )
                     aligned = transcribe_word_timestamps(stems['vocals'], prefer_cuda=True, ground_truth_text=inferred_lyrics)
                     word_ts = aligned.get('word_timestamps') or []
                     if not inferred_lyrics.strip() and aligned.get('raw_lyrics'):
@@ -1619,6 +1622,10 @@ def create_app() -> FastAPI:
                         | {float(w['group_start']) for w in subdiv_ts if 'group_start' in w and float(w['group_start']) >= 0}
                     )
                     word_boundaries = list(vocal_onsets)
+                    if vocal_onsets:
+                        pre_voc = detect_pre_lyric_vocalise_onsets(stems['vocals'], vocal_onsets[0])
+                        if pre_voc:
+                            vocal_onsets = sorted(set(pre_voc) | set(vocal_onsets))
                 except Exception as exc:
                     lyric_extraction_failed = True
                     warn_msg = f"lyric_extraction_failed: {exc}"
@@ -1648,10 +1655,16 @@ def create_app() -> FastAPI:
                 clip_duration = float(info.duration)
 
                 # Step 4 — Vocal Note Transcription & Regulation
+                from subpkgs.singing_lyrics import filter_pre_lyric_bleed_notes
                 tx = transcribe_vocal_notes(stems['vocals'], bpm=bpm, beat_origin=beat_origin,
                                             word_boundaries_sec=word_boundaries or None, prefer_cuda=True,
                                             beat_times=beat_times_secs or None)
                 raw_notes = sorted(tx['notes'], key=lambda n: n.raw_start)
+                if word_boundaries:
+                    pickup_tol_s = min(0.5, 0.5 * (60.0 / max(20.0, bpm)))
+                    raw_notes = filter_pre_lyric_bleed_notes(
+                        raw_notes, stems['vocals'], word_boundaries[0], beat_origin, pickup_tol_s
+                    )
                 word_boundaries = sorted(set(word_boundaries) | set(tx.get('word_boundaries_sec') or []))
                 try:
                     notes = regulate_singing_notes_for_score(

@@ -1220,20 +1220,63 @@ def recognize_accompaniment_chords(
         is_simple_triple = (round(measure_beats) == 3 and not meter.strip().endswith("/8"))
         split_frac = (2.0 / 3.0) if is_simple_triple else 0.5
         clean_pool_all = [c[8] for c in candidates if "/" not in c[8]]
+
+        def _span_vocal_profile(
+            s_sec: float,
+            e_sec: float,
+            bs_full_sec: float,
+            be_full_sec: float,
+            b_lo_m: float,
+            b_hi_m: float,
+            b_base_m: float,
+        ) -> tuple[np.ndarray, bool]:
+            vw = np.zeros(12, dtype=np.float64)
+            if not notes:
+                return vw, False
+            full_dur_s = max(1e-3, be_full_sec - bs_full_sec)
+            for n in notes:
+                if getattr(n, "raw_start", None) is not None and getattr(n, "raw_duration", None) is not None and float(n.raw_duration) > 0:
+                    ns_s = float(n.raw_start)
+                    ne_s = ns_s + float(n.raw_duration)
+                    ov_s = max(0.0, min(ne_s, e_sec) - max(ns_s, s_sec))
+                    if ov_s <= 0.0:
+                        continue
+                    ov_b = (ov_s / full_dur_s) * measure_beats
+                    rel_on = ((max(ns_s, bs_full_sec) - bs_full_sec) / full_dur_s) * measure_beats
+                else:
+                    ns_b = float(n.start)
+                    ne_b = ns_b + float(n.duration)
+                    ov_b = max(0.0, min(ne_b, b_hi_m) - max(ns_b, b_lo_m))
+                    if ov_b <= 0.0:
+                        continue
+                    rel_on = (max(ns_b, b_base_m) - b_base_m) % measure_beats
+                sal = _gttm_note_salience(rel_on, ov_b, measure_beats, meter)
+                vw[int(round(float(n.pitch))) % 12] += sal
+            return vw, bool(np.sum(vw) > 0.0)
+
         for b in range(n_bars):
             if bar_btc_gates[b] < 0.30 or bar_acc_rms[b] < 0.005:
                 continue
             bs_sec = max(0.0, computed_bar_starts[b])
             be_sec = max(bs_sec + 0.10, computed_bar_starts[b + 1])
             mid_sec = bs_sec + split_frac * (be_sec - bs_sec)
-            sc_h1, _, r_h1, g_h1, nf_h1 = _score_span_candidates(bs_sec, mid_sec, None, False)
-            sc_h2, _, r_h2, g_h2, nf_h2 = _score_span_candidates(mid_sec, be_sec, None, False)
+            b_base_m = b * measure_beats
+            b_mid_m = (b + split_frac) * measure_beats
+            b_end_m = (b + 1.0) * measure_beats
+            vw_h1, hv_h1 = _span_vocal_profile(bs_sec, mid_sec, bs_sec, be_sec, b_base_m, b_mid_m, b_base_m)
+            vw_h2, hv_h2 = _span_vocal_profile(mid_sec, be_sec, bs_sec, be_sec, b_mid_m, b_end_m, b_base_m)
+            sc_h1, _, r_h1, g_h1, nf_h1 = _score_span_candidates(bs_sec, mid_sec, vw_h1, hv_h1)
+            sc_h2, _, r_h2, g_h2, nf_h2 = _score_span_candidates(mid_sec, be_sec, vw_h2, hv_h2)
             if nf_h1 < 5.0 or nf_h2 < 5.0 or g_h1 < 0.32 or g_h2 < 0.32 or r_h1 < 0.0035 or r_h2 < 0.0035:
                 continue
             c_star_base = base_bar_chords[b].split("/")[0]
             top_bar = sorted(clean_pool_all, key=lambda nm: emission_scores[b].get(nm, -99.0), reverse=True)[:5]
+            top_h1 = sorted(clean_pool_all, key=lambda nm: sc_h1.get(nm, -99.0), reverse=True)[:4]
+            top_h2 = sorted(clean_pool_all, key=lambda nm: sc_h2.get(nm, -99.0), reverse=True)[:4]
             pool = list(dict.fromkeys(
                 top_bar
+                + top_h1
+                + top_h2
                 + [c_star_base]
                 + ([base_bar_chords[b - 1].split("/")[0]] if b > 0 else [])
                 + ([base_bar_chords[b + 1].split("/")[0]] if b + 1 < n_bars else [])

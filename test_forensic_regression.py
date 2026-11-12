@@ -1328,6 +1328,159 @@ class ForensicRegressionTests(unittest.TestCase):
         dadd9_v = generate_voicings("Dadd9", capo=0)[0]["frets"]
         self.assertEqual(dadd9_v, [-1, 5, 4, 2, 3, 0])
 
+    def test_wooden_acoustic_timbre_slash_harmony_arpeggio_continuity_and_mms_star(self):
+        import json
+        from types import SimpleNamespace
+        from subpkgs.guitar_reharm import guitar_simulator as gsim
+        from subpkgs.guitar_reharm.reharmonizer import _resolve_harmony
+        from subpkgs.stem_mir.beat_tracker import _bar_beat_positions
+        from subpkgs.singing_lyrics.lyric_aligner import (
+            detect_pre_lyric_vocalise_onsets,
+            filter_pre_lyric_bleed_notes,
+            _free_end_ctc_prefix_len,
+        )
+
+        # (a) Primary wooden acoustic sample index (_META_INDEX + _FSS_INDEX) & high-fret sub-150Hz rumble guard
+        gsim._ensure_sample_index()
+        self.assertGreater(len(gsim._META_INDEX), 300)
+        self.assertGreater(len(gsim._FSS_INDEX), 40)
+        hi_note = gsim._get_blended_studio_base(74, 1, 1, 22050, False, rr=1)
+        self.assertIsNotNone(hi_note)
+        mono_hi = hi_note.mean(axis=-1) if hi_note.ndim == 2 else hi_note
+        spec = np.abs(np.fft.rfft(mono_hi[:8192]))
+        freqs = np.fft.rfftfreq(len(mono_hi[:8192]), 1.0 / 22050.0)
+        rumble_e = float(np.sum(spec[freqs < 150.0] ** 2))
+        fund_e = float(np.sum(spec[(freqs >= 500.0) & (freqs <= 2500.0)] ** 2))
+        self.assertLess(rumble_e, 0.02 * max(1e-9, fund_e))
+
+        # (b) Explicit slash bass preservation + capo-consistent _resolve_harmony + borrowed iv + Phrygian iii
+        proj_a = Project(title="slash_walk", tonic="A", meter="4/4", bpm=78.0, notes=[])
+        slash_res = reharmonize_progression(
+            ["A", "E/G#", "F#m", "A/E", "D/F#"],
+            proj_a,
+            preset="emotional_pop",
+            tonic="A",
+            capo=2,
+        )
+        self.assertEqual(parse_extended_chord(slash_res[1]["chord"])["bass"], "G#")
+        self.assertEqual(parse_extended_chord(slash_res[3]["chord"])["bass"], "E")
+        self.assertEqual(parse_extended_chord(slash_res[4]["chord"])["bass"], "F#")
+
+        clash_notes = [Note(start=0.0, duration=4.0, pitch=61)]  # C# clashes with C-root triad/sus/7ths
+        res_sym, _ = _resolve_harmony("C", None, "G", "D", clash_notes, 0.0, 4.0, capo=2)
+        self.assertTrue(len(generate_voicings(res_sym, capo=2)) > 0)
+
+        proj_f = Project(title="neosoul_f", tonic="F", meter="4/4", bpm=90.0, notes=[])
+        neosoul_f = reharmonize_progression(
+            ["F", "Bbm", "Am", "Dm"],
+            proj_f,
+            preset="neosoul_jazz",
+            tonic="F",
+            capo=0,
+        )
+        bbm_pcs = set(parse_extended_chord(neosoul_f[1]["chord"])["pcs"])
+        am_pcs = set(parse_extended_chord(neosoul_f[2]["chord"])["pcs"])
+        self.assertNotIn(8, bbm_pcs)   # No Ab (pc 8) clashing against tonic third A (pc 9)
+        self.assertNotIn(11, am_pcs)   # No B natural (pc 11, #4 tritone) on Phrygian iii in F major
+
+        # (c) Continuous 6/8 arpeggio under active vocals + multi-bar CM inner accompaniment + no b3 over major V
+        proj_68 = Project(
+            title="continuous_68",
+            tonic="C",
+            meter="6/8",
+            bpm=68.0,
+            notes=[
+                Note(start=6.0, duration=1.0, pitch=64),
+                Note(start=7.0, duration=0.5, pitch=67),
+                Note(start=7.5, duration=1.5, pitch=64),
+            ],
+        )
+        arr_68 = arrange_advanced(
+            proj_68,
+            chords=["C", "Am", "C", "F"],
+            style="抒情琶音",
+            capo=0,
+            intro_mode="chord_melody",
+        )
+        b2_onsets = {round(e["start"] - 6.0, 2) for e in arr_68["events"] if e["bar"] == 2}
+        self.assertEqual(b2_onsets, {0.0, 0.5, 1.0, 1.5, 2.0, 2.5})
+        b1_cm = [e for e in arr_68["events"] if e["bar"] == 1 and e.get("technique") in ("CM", "DS")]
+        b1_acc = [e for e in arr_68["events"] if e["bar"] == 1 and e.get("technique", "") == ""]
+        self.assertTrue(len(b1_cm) >= 1)
+        self.assertTrue(len(b1_acc) >= 2)
+
+        proj_hm = Project(
+            title="harmonic_minor_v",
+            tonic="F",
+            meter="6/8",
+            bpm=92.0,
+            notes=[Note(start=0.0, duration=1.5, pitch=69), Note(start=1.5, duration=1.5, pitch=73)],
+        )
+        arr_hm = arrange_advanced(
+            proj_hm,
+            chords=["A", "Dm"],
+            style="抒情琶音",
+            capo=0,
+            intro_mode="groove",
+        )
+        bar0_pcs = {e["pitch"] % 12 for e in arr_hm["events"] if e["bar"] == 0}
+        self.assertNotIn(0, bar0_pcs)  # Forbid C natural (b3/#9) over harmonic-minor V (A major)
+
+        # (d) Beat jitter filter, pre-lyric vocalise vs bleed filter, free-end CTC <star>, and manifest health
+        jitter_beats = np.array([0.85, 0.92, 1.85], dtype=np.float64)
+        pos = _bar_beat_positions(jitter_beats, 0.0, 2.4, 4, is_compound=False)
+        self.assertEqual(len(pos), 4)
+        self.assertTrue(all(np.diff(pos) >= 0.35))
+
+        # Free-end CTC prefix length absorbs leading <star> vocalise and drops trailing unsung words cleanly
+        emissions = np.full((24, 5), -10.0, dtype=np.float32)
+        emissions[:, 0] = 5.0          # CTC blank default
+        emissions[0:6, 0] = -8.0       # Non-blank pre-lyric vocalise in frames 0..5 absorbed by <star> (id 1)
+        emissions[0:6, 1] = 6.0
+        emissions[8:11, 2] = 7.0       # Sung word 1 (token [2])
+        emissions[13:16, 3] = 7.0      # Sung word 2 (token [3])
+        kept_words = _free_end_ctc_prefix_len(
+            emissions,
+            [[2], [3], [4, 4]],        # Word 3 ([4, 4]) is unsung (-10.0 logits -> ~ -15 log-prob per char)
+            blank_id=0,
+            star_id=1,
+        )
+        self.assertEqual(kept_words, 2)
+
+        with tempfile.TemporaryDirectory() as td:
+            wav_p = Path(td) / "voc_test.wav"
+            sr_t = 16000
+            sig_t = np.zeros(sr_t * 12, dtype=np.float32)
+            # Low-energy bleed at 0.3..0.7s, real sustained humming at 1.5..3.5s, lyric at 5.2..6.7s
+            t_vec = np.arange(len(sig_t), dtype=np.float32) / sr_t
+            sig_t[int(0.3 * sr_t) : int(0.7 * sr_t)] = 0.004 * np.sin(2 * np.pi * 220.0 * t_vec[: int(0.4 * sr_t)])
+            sig_t[int(1.5 * sr_t) : int(3.5 * sr_t)] = 0.12 * np.sin(2 * np.pi * 330.0 * t_vec[: int(2.0 * sr_t)])
+            sig_t[int(5.2 * sr_t) : int(6.7 * sr_t)] = 0.15 * np.sin(2 * np.pi * 392.0 * t_vec[: int(1.5 * sr_t)])
+            sf.write(str(wav_p), sig_t, sr_t)
+
+            voc_onsets = detect_pre_lyric_vocalise_onsets(wav_p, first_lyric_sec=5.2)
+            self.assertEqual(len(voc_onsets), 1)
+            self.assertAlmostEqual(voc_onsets[0], 1.5, delta=0.15)
+
+            raw_ns = [
+                SimpleNamespace(raw_start=0.3, raw_duration=0.4, confidence=0.8),
+                SimpleNamespace(raw_start=1.6, raw_duration=1.8, confidence=0.9),
+                SimpleNamespace(raw_start=5.2, raw_duration=1.2, confidence=0.95),
+            ]
+            kept_ns = filter_pre_lyric_bleed_notes(raw_ns, wav_p, first_lyric_sec=5.2, beat_origin=0.2, pickup_tol_sec=0.5)
+            self.assertEqual([n.raw_start for n in kept_ns], [1.6, 5.2])
+
+        manifest_p = ROOT_DIR / "data" / "repertoire_manifest.json"
+        self.assertTrue(manifest_p.is_file())
+        manifest = json.loads(manifest_p.read_text(encoding="utf-8"))
+        self.assertEqual(len(manifest), 7)
+        items = manifest.values() if isinstance(manifest, dict) else manifest
+        for item in items:
+            self.assertFalse(item.get("split_bar", False), f"split_bar should be False on {item.get('id')}")
+            bt = item.get("beat_times", [])
+            if len(bt) >= 2:
+                self.assertGreaterEqual(min(np.diff(bt)), 0.30, f"Sub-0.30s beat glitch in {item.get('id')}")
+
 
 if __name__ == "__main__":
     unittest.main()

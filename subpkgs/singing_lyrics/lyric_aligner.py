@@ -140,7 +140,8 @@ def _free_end_ctc_prefix_len(
     emission_2d,
     transcript_tokens: list[list[int]],
     blank_id: int = 0,
-    char_prior_beta: float = 4.5,
+    char_prior_beta: float = 4.8,
+    star_id: int | None = None,
 ) -> int:
     """Forward-only CTC Viterbi over blank-interleaved transcript tokens to select sung prefix k* in 0..m."""
     import numpy as np
@@ -149,8 +150,11 @@ def _free_end_ctc_prefix_len(
     m = len(transcript_tokens)
     if m == 0:
         return 0
-    log_probs = torch.log_softmax(emission_2d.float(), dim=-1).cpu().numpy()
+    emis_t = torch.as_tensor(emission_2d, dtype=torch.float32)
+    log_probs = torch.log_softmax(emis_t, dim=-1).cpu().numpy()
     n_frames = int(log_probs.shape[0])
+    vocab_n = int(log_probs.shape[1]) if log_probs.ndim >= 2 else 0
+    has_star = star_id is not None and 0 <= int(star_id) < vocab_n
     flat_chars: list[int] = []
     cum_chars = [0]
     for tok_ids in transcript_tokens:
@@ -168,12 +172,16 @@ def _free_end_ctc_prefix_len(
         dtype=np.int64,
     )
     alpha = np.full(s_len, -np.inf, dtype=np.float64)
-    alpha[0] = float(log_probs[0, z[0]])
+    lead0 = float(log_probs[0, z[0]])
+    if has_star:
+        lead0 = max(lead0, float(log_probs[0, int(star_id)]) - 1.6)
+    alpha[0] = lead0
     if s_len > 1:
         alpha[1] = float(log_probs[0, z[1]])
     step1 = np.empty(s_len, dtype=np.float64)
     step2 = np.empty(s_len, dtype=np.float64)
     for t in range(1, n_frames):
+        prev_a0 = alpha[0]
         step1[0] = -np.inf
         step1[1:] = alpha[:-1]
         best_prev = np.maximum(alpha, step1)
@@ -182,6 +190,9 @@ def _free_end_ctc_prefix_len(
             step2[skip2_idx] = alpha[skip2_idx - 2]
             best_prev = np.maximum(best_prev, step2)
         alpha = best_prev + log_probs[t, z]
+        if has_star:
+            lead_t = max(float(log_probs[t, z[0]]), float(log_probs[t, int(star_id)]) - 1.6)
+            alpha[0] = prev_a0 + lead_t
 
     best_k = 0
     best_sc = float(alpha[0])
@@ -269,10 +280,19 @@ def _try_mms_fa(audio_path: Path, ground_truth_text: str, prefer_cuda: bool) -> 
 
         emis_cpu = emission[0].cpu() if emission.device.type != "cpu" else emission[0]
         blank_id = int(dictionary.get("-", 0))
-        k_star = _free_end_ctc_prefix_len(emis_cpu, transcript_tokens, blank_id=blank_id)
+        star_raw = dictionary.get("*")
+        star_id = int(star_raw) if star_raw is not None else None
+        k_star = _free_end_ctc_prefix_len(
+            emis_cpu, transcript_tokens, blank_id=blank_id, star_id=star_id
+        )
         if k_star <= 0:
             return None
-        token_spans = aligner(emis_cpu, transcript_tokens[:k_star])
+        active_tokens = transcript_tokens[:k_star]
+        if star_id is not None:
+            raw_spans = aligner(emis_cpu, [[star_id]] + active_tokens + [[star_id]])
+            token_spans = raw_spans[1:-1]
+        else:
+            token_spans = aligner(emis_cpu, active_tokens)
         total_duration = len(waveform) / float(sr)
         num_frames = emission.shape[1]
         frame_dur = total_duration / float(num_frames)
@@ -578,9 +598,10 @@ def _project_records_to_ground_truth(records: list[dict], ground_truth_text: str
 def transcribe_word_timestamps(
     audio_path: str | Path,
     prefer_cuda: bool = True,
-    ground_truth_text: str = "",
+    ground_truth_text: str | None = "",
 ) -> dict:
     """Run Qwen3-ASR / Qwen3-ForcedAligner-0.6B (or MMS-FA CTC / faster-whisper CUDA fallback) to obtain character/word-level timestamps."""
+    ground_truth_text = str(ground_truth_text or "")
     audio_path = Path(audio_path)
     if not audio_path.is_file():
         raise FileNotFoundError(audio_path)
@@ -1308,3 +1329,115 @@ def align_lyrics_to_notes(
     return {"note_lyrics": note_lyrics, "lyrics_blocks": blocks,
             "aligned_pairs": pairs, "unaligned_tokens": unaligned_tokens,
             "raw_lyrics": resolved_raw_lyrics}
+
+
+def detect_pre_lyric_vocalise_onsets(
+    audio_path: str | Path | None,
+    first_lyric_sec: float,
+) -> list[float]:
+    """Detect sustained pre-lyric human vocalise/humming phrase onsets before the first scripted word."""
+    hop_sec = 0.050
+    pre_guard_sec = 1.0
+    min_seg_sec = 1.20
+    min_seg_frames = int(round(min_seg_sec / hop_sec))
+    if audio_path is None:
+        return []
+    first_sec = float(first_lyric_sec)
+    if not math.isfinite(first_sec) or first_sec < pre_guard_sec + min_seg_sec:
+        return []
+    wav_p = Path(audio_path)
+    if not wav_p.is_file():
+        return []
+    import numpy as np
+    import soundfile as sf
+
+    arr, sr = sf.read(str(wav_p), dtype="float32", always_2d=True)
+    if arr.size == 0 or sr <= 0:
+        return []
+    mono = np.mean(arr.astype(np.float64), axis=1)
+    hop = max(1, int(round(hop_sec * sr)))
+    n_f = len(mono) // hop
+    if n_f < min_seg_frames:
+        return []
+    f_rms = np.sqrt(np.mean(mono[: n_f * hop].reshape(n_f, hop) ** 2, axis=1))
+    act = f_rms[f_rms > 0.003]
+    if act.size == 0:
+        return []
+    ref_rms = float(np.percentile(act, 80.0))
+    thr = max(0.014, 0.25 * ref_rms)
+    limit_f = min(n_f, int((first_sec - pre_guard_sec) / hop_sec))
+    if limit_f < min_seg_frames:
+        return []
+    mask = f_rms[:limit_f] >= thr
+    bridged = mask.copy()
+    for i in range(1, max(1, limit_f - 3)):
+        if bridged[i - 1] and not bridged[i]:
+            nxt = np.where(mask[i : min(limit_f, i + 4)])[0]
+            if nxt.size:
+                bridged[i : i + int(nxt[0])] = True
+    onsets: list[float] = []
+    in_seg = False
+    seg_s = 0
+    for i in range(limit_f + 1):
+        val = bool(bridged[i]) if i < limit_f else False
+        if val and not in_seg:
+            in_seg = True
+            seg_s = i
+        elif not val and in_seg:
+            in_seg = False
+            if (i - seg_s) >= min_seg_frames:
+                onsets.append(round(seg_s * hop_sec, 3))
+    return onsets
+
+
+def filter_pre_lyric_bleed_notes(
+    raw_notes: list,
+    audio_path: str | Path | None,
+    first_lyric_sec: float | None,
+    beat_origin: float,
+    pickup_tol_sec: float,
+) -> list:
+    """Reject low-energy instrumental bleed before the first lyric while retaining real sung vocalise/humming."""
+    if not raw_notes:
+        return []
+    origin = float(beat_origin)
+    if first_lyric_sec is None:
+        return [n for n in raw_notes if float(n.raw_start) >= origin - 1e-6]
+    cutoff = max(origin, float(first_lyric_sec) - float(pickup_tol_sec))
+    wav_p = Path(audio_path) if audio_path is not None else None
+    if wav_p is None or not wav_p.is_file():
+        return [n for n in raw_notes if float(n.raw_start) >= cutoff]
+
+    import numpy as np
+    import soundfile as sf
+
+    arr, sr = sf.read(str(wav_p), dtype="float32", always_2d=True)
+    if arr.size == 0 or sr <= 0:
+        return [n for n in raw_notes if float(n.raw_start) >= cutoff]
+    mono = np.mean(arr.astype(np.float64), axis=1)
+    hop = max(1, int(round(0.050 * sr)))
+    n_f = len(mono) // hop
+    if n_f < 4:
+        return [n for n in raw_notes if float(n.raw_start) >= cutoff]
+    f_rms = np.sqrt(np.mean(mono[: n_f * hop].reshape(n_f, hop) ** 2, axis=1))
+    act = f_rms[f_rms > 0.003]
+    ref_rms = float(np.percentile(act, 80.0)) if act.size else 0.05
+    voc_thr = max(0.015, 0.28 * ref_rms)
+
+    kept = []
+    for n in raw_notes:
+        ns = float(n.raw_start)
+        nd = float(n.raw_duration)
+        if ns < origin - 1e-6:
+            continue
+        if ns >= cutoff:
+            kept.append(n)
+            continue
+        if nd < 0.20 or float(getattr(n, "confidence", 1.0)) < 0.55:
+            continue
+        s0 = max(0, min(len(mono) - 1, int(round(ns * sr))))
+        s1 = max(s0 + 1, min(len(mono), int(round((ns + nd) * sr))))
+        note_rms = float(np.sqrt(np.mean(mono[s0:s1] ** 2)))
+        if note_rms >= voc_thr:
+            kept.append(n)
+    return kept

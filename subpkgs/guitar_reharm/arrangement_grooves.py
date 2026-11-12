@@ -855,6 +855,9 @@ def _adapt_cell_viterbi(
     for idx_i, (b_pos, dur, st_deg, seg) in enumerate(valid_specs):
         parsed = parse_extended_chord(seg['chord'])
         chord_pcs = (set(parsed['pcs']) | {parsed['bass_pc']}) if parsed else set(diatonic)
+        forbid_b3_pcs = set()
+        if parsed and 4 in parsed.get('intervals', ()) and 3 not in parsed.get('intervals', ()):
+            forbid_b3_pcs.add((parsed['root'] + 3) % 12)
         # Check every split-bar segment overlapped by the sustained note span [b_pos, b_pos + dur)
         later_chord_pcs_list = []
         later_bass_infos = []
@@ -866,6 +869,8 @@ def _adapt_cell_viterbi(
                 p_ov = parse_extended_chord(s_ov['chord'])
                 if p_ov is not None:
                     later_chord_pcs_list.append(set(p_ov['pcs']) | {p_ov['bass_pc']})
+                    if 4 in p_ov.get('intervals', ()) and 3 not in p_ov.get('intervals', ()):
+                        forbid_b3_pcs.add((p_ov['root'] + 3) % 12)
                     b_ov = _seg_bass_info(s_ov)
                     if b_ov is not None:
                         later_bass_infos.append(b_ov)
@@ -897,6 +902,8 @@ def _adapt_cell_viterbi(
                         if enforce_hand and any(not _is_playable_solo_hand(b_ov, (s, f), None, capo) for b_ov in later_bass_infos):
                             continue
                         pc = p % 12
+                        if pc in forbid_b3_pcs:
+                            continue
                         semi_above_ct = (((pc - 1) % 12 in chord_pcs) and (pc not in chord_pcs)) or any(
                             ((pc - 1) % 12 in l_pcs) and (pc not in l_pcs) for l_pcs in later_chord_pcs_list
                         )
@@ -961,7 +968,7 @@ def _adapt_cell_viterbi(
                     if bass_info is not None and (s_h >= bass_info[0] or p_h <= bass_info[2] + 2):
                         continue
                     pc_h = p_h % 12
-                    if pc_h not in diatonic:
+                    if pc_h not in diatonic or pc_h in forbid_b3_pcs:
                         continue
                     if depth_i <= 1 and pc_h not in chord_pcs:
                         continue
@@ -1417,25 +1424,33 @@ def _build_motif_chord_melody(
         w_lo: float,
         w_hi: float,
     ) -> list[tuple[float, float, int]]:
-        """Calm, spacious home-position chord-melody bell phrases (1-3 sustained notes/bar) for song Intros."""
-        if j_idx == 0 and w_lo <= 1e-6:
-            return _pickup_specs_for_measure(w_hi)
+        """Calm, flowing home-position chord-melody bell phrases (2-4 lyrical notes/bar) for multi-bar Intros."""
         is_end = (j_idx == n_wb_tot - 1)
         is_comp_m = str(meter).strip().endswith('/8') and int(round(measure * 2.0)) % 3 == 0
-        if abs(measure - 3.0) < 0.25:
+        if j_idx == 0 and w_lo <= 1e-6:
+            if n_wb_tot <= 1:
+                return _pickup_specs_for_measure(w_hi)
+            if abs(measure - 3.0) < 0.25:
+                raw = [(1.5, 1.0, 0), (2.5, 0.5, 1)] if is_comp_m else [(1.0, 1.0, 0), (2.0, 1.0, 1)]
+            elif measure >= 3.5:
+                raw = [(1.0, 1.0, 0), (2.0, 1.0, 1), (3.0, 1.0, -1)]
+            else:
+                half_m = max(0.5, round(measure * 0.5 * 2.0) / 2.0)
+                raw = [(half_m, max(0.5, measure - half_m), 0)]
+        elif abs(measure - 3.0) < 0.25:
             if is_end:
                 raw = [(0.0, 1.5, 0), (1.5, 1.5, -1)]
             elif is_comp_m:
-                raw = [(0.0, 1.5, 0), (1.5, 1.0, 1), (2.5, 0.5, -1)] if (j_idx % 2 == 1) else [(0.0, 1.5, 0), (1.5, 1.5, -1)]
+                raw = [(0.0, 1.5, 0), (1.5, 1.0, 1), (2.5, 0.5, -1)] if (j_idx % 2 == 1) else [(0.0, 1.0, 0), (1.0, 0.5, 1), (1.5, 1.5, -1)]
             else:
                 raw = [(0.0, 2.0, 0), (2.0, 1.0, 1)] if (j_idx % 2 == 1) else [(0.0, 1.0, 0), (1.0, 2.0, -1)]
         elif measure >= 3.5:
             if is_end:
-                raw = [(0.0, 2.0, 0), (2.0, 2.0, -1)]
-            elif j_idx % 2 == 1:
                 raw = [(0.0, 1.5, 0), (1.5, 0.5, 1), (2.0, 2.0, -1)]
+            elif j_idx % 2 == 1:
+                raw = [(0.0, 1.5, 0), (1.5, 0.5, 1), (2.0, 1.0, -1), (3.0, 1.0, 0)]
             else:
-                raw = [(0.0, 2.0, 0), (2.0, 1.0, 1), (3.0, 1.0, -1)]
+                raw = [(0.0, 1.0, 0), (1.0, 1.0, 1), (2.0, 1.5, -1), (3.5, 0.5, 0)]
         else:
             half_m = max(0.5, round(measure * 0.5 * 2.0) / 2.0)
             raw = [(0.0, half_m, 0), (half_m, max(0.5, measure - half_m), -1 if is_end else 1)]
@@ -1560,7 +1575,7 @@ def _build_motif_chord_melody(
         # For multi-bar Intros where vocals enter mid-bar inside b_last, leave b_last as pure chordal accompaniment
         intro_bar_end = (
             b_last - 1
-            if (kind == 'intro' and b_last > b_first and g_e < (b_last + 1) * measure - 0.25)
+            if (kind == 'intro' and (b_last - b_first) >= 2 and g_e < (b_last + 1) * measure - 0.25)
             else b_last
         )
         win_bars = []
@@ -1889,17 +1904,21 @@ def arrange_advanced(
                           +[s['beat'] for s in segments]))
 
         is_fingerpick_or_neosoul = style in _FINGERPICK_STYLES or style == _NEOSOUL_STYLE
+        ov_notes = _overlapping_notes(project.notes, index * measure, (index + 1) * measure) if not silent else []
+        eff_groove_rho = (
+            0.0
+            if (style in _ARPEGGIO_STYLES and ov_notes and rho_b < 0.72 and not cm)
+            else rho_b
+        )
         groove = _compute_metrical_groove_profile(
             measure, style, state, fast_tempo, cm, project.meter,
-            rho=rho_b, tau_slot=b_info['tau_slot'],
+            rho=eff_groove_rho, tau_slot=b_info['tau_slot'],
             exempt_pickup=b_info['exempt_pickup'], n_segments=len(segments),
         )
         active_slots = groove['active_slots']
         slot_vels = groove['velocities']
         slot_dirs = groove['directions']
         last_slot = groove['n_slots'] - 1
-
-        ov_notes = _overlapping_notes(project.notes, index * measure, (index + 1) * measure) if not silent else []
 
         # Place Chord-Melody (CM) lead first so accompaniment respects string/register reservations.
         cm_reservations: list[tuple[int, float, float, int, int]] = []
@@ -1974,6 +1993,33 @@ def arrange_advanced(
                 return min(near_r)
             return 999
 
+        def is_playable_cm_inner(
+            bass_item: tuple[int, int, int] | None,
+            act_cm_list: list[tuple[int, float, float, int, int]],
+            cand_item: tuple[int, int, int],
+        ) -> bool:
+            s_c, f_c, _ = cand_item
+            if f_c < 0 or f_c > 24 - capo or not (1 <= s_c <= 6):
+                return False
+            frets6 = [-1] * 6
+            if bass_item is not None and 1 <= bass_item[0] <= 6 and bass_item[1] >= 0:
+                if bass_item[0] == s_c:
+                    return False
+                frets6[6 - bass_item[0]] = int(bass_item[1])
+            for rs, _rb0, _rb1, _rp, rf in act_cm_list:
+                if rs == s_c or not (1 <= rs <= 6) or rf < 0:
+                    return False
+                frets6[6 - rs] = int(rf)
+            frets6[6 - s_c] = int(f_c)
+            pos = [f for f in frets6 if f > 0]
+            if pos and (max(pos) - min(pos)) > 4:
+                return False
+            f_cnt, _ = _fingers(frets6)
+            if f_cnt > 4:
+                return False
+            _, overflow, strain = _assign_fingers(tuple(frets6), capo)
+            return overflow == 0 and math.isfinite(strain)
+
         # Plan entries are executed in order after the bar's treble DAG is solved:
         # ('note', beat, duration, item, velocity, technique, direction, roll_step) or
         # ('treble', beat, request_index, velocity, kind, direction)
@@ -1988,10 +2034,12 @@ def arrange_advanced(
         )
         is_comp_bar = str(project.meter).strip().endswith('/8') and int(round(measure * 2.0)) % 3 == 0
         first_cm_beat = min((it[1] for it in cm_reservations), default=0.0)
-        max_cm_inner = 0 if is_1bar_intro else (1 if is_comp_bar else 2)
-        cm_inner_used = 0
-        last_cm_inner_beat = -99.0
-        last_cm_inner_pitch = None
+        cm_onset_beats = sorted({it[1] for it in cm_reservations})
+        min_cm_bar_vel = min(
+            (int(e['velocity']) for e in events.values() if e['bar'] == index and e.get('technique') == 'CM'),
+            default=88,
+        )
+        last_cm_acc_treble_pitch = None
 
         def request_treble(beat, candidates, bass_pitch, velocity, kind, direction=None):
             t_str = _default_target_string(beat, measure, style=style, kind=kind)
@@ -2037,69 +2085,75 @@ def arrange_advanced(
                     roll_items = [x for x in roll_items if not is_cm_reserved(x[0], beat) and x[2] < ceil_p]
                     if not roll_items and bass is not None and not is_cm_reserved(bass[0], beat) and bass[2] < ceil_p:
                         roll_items = [bass]
+                    rolled_tr = [x for x in roll_items if x[0] <= 3]
+                    if rolled_tr:
+                        last_cm_acc_treble_pitch = max(rolled_tr, key=lambda x: x[0])[2]
                 if bass is not None and (not cm or bass[2] < cm_ceiling_at(beat)):
                     bass_pitch = bass[2]
                 for r_idx, item in enumerate(roll_items):
+                    item_roll_dur = roll_dur
+                    if cm and not is_1bar_intro and item != bass and item[0] >= 4 and item[1] > 0:
+                        for rb0 in cm_onset_beats:
+                            if rb0 > 1e-6 and not is_playable_cm_inner(bass, active_cm_at(rb0), item):
+                                item_roll_dur = min(item_roll_dur, rb0)
+                                break
                     v_base = 84 if r_idx == 0 else max(68, 78 - r_idx)
                     vel_r = max(1, min(127, round(v_base * phrase_vel_scale)))
-                    plan.append(('note', beat, roll_dur, item, vel_r, '', '↓', roll_sec))
+                    plan.append(('note', beat, item_roll_dur, item, vel_r, '', '↓', roll_sec))
                 continue
 
             if cm:
-                # Let Beat-0 rolled chord ring undisturbed until the first pickup note enters
-                if index in roll_slot0_bars and beat < first_cm_beat - 1e-6:
+                if is_1bar_intro:
                     continue
-                if beat < first_cm_beat - 1e-6:
-                    if (slot == 0 or is_segment_boundary) and bass is not None:
-                        bass_pitch = bass[2]
-                        vel_b0 = max(1, min(127, round((76 if slot == 0 else 68) * phrase_vel_scale)))
-                        plan.append(('note', beat, max(step_dur, 1.0), bass, vel_b0, '', '↓', None))
-                    elif arpeggio_treble:
-                        vel_pre = max(48, min(64, round(slot_vels[slot] * 0.72 * phrase_vel_scale)))
-                        request_treble(beat, arpeggio_treble, bass_pitch, vel_pre, 'single', slot_dir)
-                    continue
-
                 ceil_p = cm_ceiling_at(beat)
-                is_cm_bass_slot = (not is_1bar_intro) and (
+                dyn_div = max(1.0, float(dyn_scale)) if dyn_scale is not None else 1.0
+                is_cm_bass_slot = (
                     (slot == 0)
                     or is_segment_boundary
-                    or (not is_comp_bar and slot == groove['bass_pivot'] and slot not in ds_onset_slots)
+                    or (
+                        slot == groove['bass_pivot']
+                        and slot not in ds_onset_slots
+                        and (not is_comp_bar or slot not in cm_onset_slots)
+                    )
                 )
+                emitted_cm_bass = False
                 if is_cm_bass_slot and bass is not None and not is_cm_reserved(bass[0], beat) and bass[2] < ceil_p:
                     bass_pitch = bass[2]
                     technique = 'PM' if palm_mute and any(abs(beat - b) < 1e-9 for b in (0, measure / 2)) else ''
                     bass_vel = 74 if slot == 0 else 66
-                    vel_b = max(1, min(127, round(bass_vel * phrase_vel_scale)))
+                    bass_cap = max(50, int((min_cm_bar_vel - 8) / dyn_div)) if bass[0] <= 4 else 127
+                    vel_b = max(1, min(127, bass_cap, round(bass_vel * phrase_vel_scale)))
                     bass_dur = max(step_dur, 1.5 if is_comp_bar else 1.0)
                     plan.append(('note', beat, bass_dur, bass, vel_b, technique, '↓', None))
+                    emitted_cm_bass = True
 
-                act_cm = active_cm_at(beat)
-                can_fill_hold = (
-                    bool(act_cm)
-                    and max(it[2] - it[1] for it in act_cm) >= 1.25 - 1e-6
-                    and beat >= min(it[1] for it in act_cm) + 0.5 - 1e-6
-                    and (beat - last_cm_inner_beat) >= 1.0 - 1e-6
+                allow_cm_inner_slot = (
+                    slot > 0
+                    and slot not in cm_onset_slots
+                    and slot not in ds_onset_slots
+                    and not emitted_cm_bass
+                    and (not fast_tempo or slot % 2 == 0)
                 )
-                if slot not in cm_onset_slots and cm_inner_used < max_cm_inner and can_fill_hold:
+                if allow_cm_inner_slot:
+                    act_cm = active_cm_at(beat)
                     avail_inner = [
                         c for c in mid_treble
                         if not is_cm_reserved(c[0], beat)
                         and c[2] <= ceil_p - 3
                         and (bass_pitch is None or c[2] >= bass_pitch + 3)
-                        and all(_is_playable_solo_hand(bass, (it[0], it[4]), (c[0], c[1]), capo) for it in act_cm)
+                        and is_playable_cm_inner(bass, act_cm, c)
                     ]
-                    if len(avail_inner) == 1 and avail_inner[0][2] == last_cm_inner_pitch:
-                        avail_inner = []
-                    elif len(avail_inner) >= 2 and last_cm_inner_pitch is not None:
-                        filtered = [c for c in avail_inner if c[2] != last_cm_inner_pitch]
-                        if filtered:
-                            avail_inner = filtered
+                    if not avail_inner and beat < first_cm_beat - 1e-6:
+                        avail_inner = [
+                            c for c in arpeggio_treble
+                            if not is_cm_reserved(c[0], beat)
+                            and c[2] < ceil_p
+                            and is_playable_cm_inner(bass, act_cm, c)
+                        ]
                     if avail_inner:
-                        vel_in = max(46, min(58, round(slot_vels[slot] * 0.60 * phrase_vel_scale)))
-                        request_treble(beat, avail_inner, bass_pitch, vel_in, 'single', slot_dir)
-                        cm_inner_used += 1
-                        last_cm_inner_beat = beat
-                        last_cm_inner_pitch = avail_inner[0][2] if len(avail_inner) == 1 else None
+                        vel_cap = max(48, int((min_cm_bar_vel - 10) / dyn_div))
+                        vel_in = max(48, min(60, vel_cap, round(slot_vels[slot] * 0.66 * phrase_vel_scale)))
+                        request_treble(beat, avail_inner, bass_pitch, vel_in, 'cm_inner', slot_dir)
                 continue
 
             is_bass_slot = (slot == 0) or is_segment_boundary or is_pm_beat or (
@@ -2184,7 +2238,38 @@ def arrange_advanced(
             sel_treble = treble_line[req_index]
             if sel_treble is None:
                 continue
-            insert(bar, beat, step_dur, sel_treble, velocity, direction=dir_tag)
+            dur_treble = step_dur
+            if kind == 'cm_inner':
+                if (
+                    sel_treble[0] <= 3
+                    and last_cm_acc_treble_pitch is not None
+                    and sel_treble[2] == last_cm_acc_treble_pitch
+                ):
+                    req_cands = treble_requests[req_index]['candidates']
+                    t_str_req = float(treble_requests[req_index].get('target_string', 2.0))
+                    alt_cands = [
+                        c for c in req_cands
+                        if c[0] > 3 or c[2] != last_cm_acc_treble_pitch
+                    ]
+                    if alt_cands:
+                        sel_treble = min(alt_cands, key=lambda c: (abs(float(c[0]) - t_str_req), abs(c[2] - sel_treble[2])))
+                    else:
+                        continue
+                next_same_s = min(
+                    (it[1] for it in cm_reservations if it[0] == sel_treble[0] and it[1] > beat + 1e-6),
+                    default=None,
+                )
+                if next_same_s is not None:
+                    dur_treble = min(dur_treble, next_same_s - beat)
+                if sel_treble[0] >= 4:
+                    next_any_cm = min((b_on for b_on in cm_onset_beats if b_on > beat + 1e-6), default=None)
+                    if next_any_cm is not None:
+                        dur_treble = min(dur_treble, next_any_cm - beat)
+                if dur_treble <= 1e-6:
+                    continue
+                if sel_treble[0] <= 3:
+                    last_cm_acc_treble_pitch = sel_treble[2]
+            insert(bar, beat, dur_treble, sel_treble, velocity, direction=dir_tag)
             if isinstance(kind, tuple) and kind[0] == 'dyad':
                 sel_primary = sel_treble
                 adjacent = [c for c in kind[1] if c[0] != sel_primary[0] and abs(c[0] - sel_primary[0]) == 1]
