@@ -730,14 +730,22 @@ def _simulation_demos():
     return dict(available=bool(demos), demos=demos, reason=None if demos else 'No simulation WAV files are installed')
 
 
-def _gpu_available():
+_GPU_AVAILABLE_CACHE: bool | None = None
+
+
+def _gpu_available() -> bool:
+    global _GPU_AVAILABLE_CACHE
+    if _GPU_AVAILABLE_CACHE is not None:
+        return _GPU_AVAILABLE_CACHE
     try:
         import torch
     except ModuleNotFoundError as exc:
         if exc.name != 'torch':
             raise
+        _GPU_AVAILABLE_CACHE = False
         return False
-    return bool(torch.cuda.is_available())
+    _GPU_AVAILABLE_CACHE = bool(torch.cuda.is_available())
+    return _GPU_AVAILABLE_CACHE
 
 
 def get_state_payload(session):
@@ -1179,6 +1187,10 @@ def create_app() -> FastAPI:
         if atlas_path.is_file():
             return FileResponse(atlas_path)
         raise HTTPException(404, 'Evolution atlas page is not installed')
+
+    @application.get('/api/health')
+    def health():
+        return {'ok': True, 'app': 'melodydesk'}
 
     @application.get('/api/state')
     def state():
@@ -2074,4 +2086,15 @@ for(const b of document.querySelectorAll('[data-route]'))b.onclick=()=>call(b.da
 </script></html>'''
 
 
-app = create_app()
+_DEFAULT_APP: FastAPI | None = None
+_DEFAULT_APP_LOCK = threading.Lock()
+
+
+def __getattr__(name: str):
+    global _DEFAULT_APP
+    if name == 'app':
+        with _DEFAULT_APP_LOCK:
+            if _DEFAULT_APP is None:
+                _DEFAULT_APP = create_app()
+            return _DEFAULT_APP
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

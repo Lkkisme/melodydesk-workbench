@@ -5,6 +5,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
+import threading
 import uvicorn
 
 MELODY_ROOT = Path(__file__).resolve().parent
@@ -27,7 +28,19 @@ def _configure_writable_caches() -> None:
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 
-app = create_app()
+_DEFAULT_APP = None
+_DEFAULT_APP_LOCK = threading.Lock()
+
+
+def __getattr__(name: str):
+    global _DEFAULT_APP
+    if name == "app":
+        with _DEFAULT_APP_LOCK:
+            if _DEFAULT_APP is None:
+                _configure_writable_caches()
+                _DEFAULT_APP = create_app()
+            return _DEFAULT_APP
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def main() -> None:
@@ -36,7 +49,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=7865, help="Bind port (default: 7865)")
     args = parser.parse_args()
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(create_app(), host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":

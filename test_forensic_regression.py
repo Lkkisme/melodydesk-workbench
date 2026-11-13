@@ -2242,5 +2242,207 @@ class ForensicRegressionTests(unittest.TestCase):
             self.assertEqual(app_u.state.upload_generation, gen0 + 1)
 
 
+    def test_desktop_gui_health_probe_reuse_and_bundle_integrity(self):
+        """Verify single-request /api/health probe, proxy bypass, non-HTTP resilience, SO_REUSEADDR port check, re-entrant logging, IPv6 URLs, sandboxed GUI reuse, and frozen bundle guard."""
+        from fastapi.testclient import TestClient
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import json as _json
+        import logging as _logging
+        import os as _os
+        import socket as _socket
+        import threading as _threading
+        from unittest.mock import patch
+        import melodydesk_desktop as desk
+        import runtime_paths as rp
+        from subpkgs.score_web import server as _srv
+
+        probe_client = TestClient(_srv.create_app())
+        health_resp = probe_client.get("/api/health")
+        self.assertEqual(health_resp.status_code, 200)
+        health_json = health_resp.json()
+        self.assertEqual(health_json, {"ok": True, "app": "melodydesk"})
+        state_resp = probe_client.get("/api/state")
+        self.assertEqual(state_resp.status_code, 200)
+        health_bytes = _json.dumps(health_json).encode("utf-8")
+        state_bytes = _json.dumps(state_resp.json()).encode("utf-8")
+
+        # Verify IPv6 & wildcard host formatting
+        self.assertEqual(desk._format_url_host("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(desk._format_url_host("0.0.0.0"), "127.0.0.1")
+        self.assertEqual(desk._format_url_host("::"), "[::1]")
+        self.assertEqual(desk._format_url_host("::1"), "[::1]")
+        self.assertEqual(desk._format_url_host("[::1]"), "[::1]")
+
+        # Verify _LogStreamAdapter re-entrancy guard never raises RecursionError on handler failure
+        rec_logger = _logging.getLogger("melodydesk.test.reentrant")
+        rec_logger.handlers.clear()
+        rec_logger.propagate = False
+        adapter = desk._LogStreamAdapter(rec_logger, _logging.ERROR)
+
+        class _BoomHandler(_logging.Handler):
+            def emit(self, record):
+                adapter.write("nested stderr failure\n")
+
+        rec_logger.addHandler(_BoomHandler())
+        rec_logger.setLevel(_logging.INFO)
+        adapter.write("outer line\n")
+        adapter.flush()
+
+        mt_errors: list[BaseException] = []
+
+        def _mt_writer(tid: int) -> None:
+            try:
+                for i in range(40):
+                    adapter.write(f"thread-{tid}-chunk-{i}-")
+                    adapter.write("end\n")
+                adapter.write(f"thread-{tid}-tail")
+                adapter.flush()
+            except BaseException as exc:  # noqa: BLE001
+                mt_errors.append(exc)
+
+        mt_threads = [_threading.Thread(target=_mt_writer, args=(idx,)) for idx in range(8)]
+        for t_m in mt_threads:
+            t_m.start()
+        for t_m in mt_threads:
+            t_m.join(timeout=5.0)
+        self.assertEqual(mt_errors, [])
+
+        # Verify non-HTTP raw TCP listener does not crash probe_melodydesk_server (BadStatusLine)
+        # AND _is_tcp_port_free rejects SO_REUSEADDR active listeners on Windows
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as raw_srv:
+            raw_srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            raw_srv.bind(("127.0.0.1", 0))
+            raw_srv.listen(2)
+            raw_port = raw_srv.getsockname()[1]
+            self.assertFalse(desk._is_tcp_port_free("127.0.0.1", raw_port))
+
+            def _serve_garbage():
+                try:
+                    conn, _ = raw_srv.accept()
+                    with conn:
+                        conn.sendall(b"\x16\x03\x01\x00\x05NOT_HTTP\r\n\r\n")
+                except OSError:
+                    pass
+
+            t_raw = _threading.Thread(target=_serve_garbage, daemon=True)
+            t_raw.start()
+            self.assertFalse(desk.probe_melodydesk_server("127.0.0.1", raw_port, timeout=1.0))
+            t_raw.join(timeout=1.0)
+
+        probe_mode = {"mode": "health"}
+        requested_paths: list[str] = []
+
+        class _ProbeHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requested_paths.append(self.path)
+                mode = probe_mode["mode"]
+                if mode == "health" and self.path == "/api/health":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(health_bytes)
+                elif mode == "legacy_state_only":
+                    if self.path == "/api/health":
+                        self.send_response(404)
+                        self.end_headers()
+                    elif self.path == "/api/state":
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(state_bytes)
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"other_service": true}')
+
+            def log_message(self, fmt, *args):
+                return
+
+        httpd = HTTPServer(("127.0.0.1", 0), _ProbeHandler)
+        t_srv = _threading.Thread(target=httpd.serve_forever, daemon=True)
+        t_srv.start()
+        root_logger = _logging.getLogger()
+        saved_handlers = list(root_logger.handlers)
+        saved_level = root_logger.level
+        try:
+            # Verify HTTP_PROXY is bypassed for loopback probes and /api/health makes exactly 1 request
+            with patch.dict("os.environ", {"HTTP_PROXY": "http://127.0.0.1:1", "http_proxy": "http://127.0.0.1:1"}, clear=False):
+                requested_paths.clear()
+                self.assertTrue(desk.probe_melodydesk_server("127.0.0.1", httpd.server_port, timeout=1.5))
+                self.assertEqual(requested_paths, ["/api/health"])
+
+                probe_mode["mode"] = "legacy_state_only"
+                requested_paths.clear()
+                self.assertTrue(desk.probe_melodydesk_server("127.0.0.1", httpd.server_port, timeout=1.5))
+                self.assertEqual(requested_paths, ["/api/health", "/api/state"])
+
+                probe_mode["mode"] = "foreign"
+                self.assertFalse(desk.probe_melodydesk_server("127.0.0.1", httpd.server_port, timeout=1.5))
+
+            probe_mode["mode"] = "health"
+            with tempfile.TemporaryDirectory() as sandbox_work:
+                try:
+                    env_overrides = {
+                        "MELODYDESK_WORK_DIR": sandbox_work,
+                        "PATH": _os.environ.get("PATH", ""),
+                    }
+                    with patch.dict("os.environ", env_overrides, clear=False):
+                        for k_unset in ("TORCH_HOME", "NUMBA_CACHE_DIR", "HF_HOME"):
+                            _os.environ.pop(k_unset, None)
+                        root_logger.handlers.clear()
+                        captured_runners = []
+
+                        def _fake_studio_window(runner_obj, open_browser, log_file):
+                            captured_runners.append((runner_obj, open_browser, log_file))
+                            return 0
+
+                        with patch.object(desk, "_run_studio_window", side_effect=_fake_studio_window):
+                            rc_gui_reuse = desk.main(["--no-browser", "--port", str(httpd.server_port)])
+                            self.assertEqual(rc_gui_reuse, 0)
+                            self.assertEqual(len(captured_runners), 1)
+                            self.assertTrue(getattr(captured_runners[0][0], "is_attached", False))
+                            self.assertFalse(captured_runners[0][1])
+
+                        rc_headless_reuse = desk.main(["--headless", "--no-browser", "--port", str(httpd.server_port)])
+                        self.assertEqual(rc_headless_reuse, 0)
+                finally:
+                    for h in list(root_logger.handlers):
+                        root_logger.removeHandler(h)
+                        h.close()
+        finally:
+            for h in list(root_logger.handlers):
+                if h not in saved_handlers:
+                    root_logger.removeHandler(h)
+                    h.close()
+            root_logger.handlers[:] = saved_handlers
+            root_logger.setLevel(saved_level)
+            httpd.shutdown()
+            httpd.server_close()
+
+        with tempfile.TemporaryDirectory() as tmp_zip:
+            incomplete_root = Path(tmp_zip) / "TempZip"
+            incomplete_meipass = incomplete_root / "_internal"
+            incomplete_meipass.mkdir(parents=True)
+            fake_zip_exe = incomplete_root / "MelodyDesk.exe"
+            fake_zip_exe.write_bytes(b"MZ")
+            with (
+                patch.dict("os.environ", {"MELODYDESK_HOME": "", "MELODYDESK_WORK_DIR": "", "MELODYDESK_MODEL_CACHE": "", "MELODYDESK_GUITAR_SAMPLES": ""}, clear=False),
+                patch.object(rp.sys, "frozen", True, create=True),
+                patch.object(rp.sys, "_MEIPASS", str(incomplete_meipass), create=True),
+                patch.object(rp.sys, "executable", str(fake_zip_exe)),
+            ):
+                with self.assertRaises(RuntimeError):
+                    desk.verify_portable_bundle_integrity()
+                (incomplete_meipass / "static").mkdir(parents=True, exist_ok=True)
+                (incomplete_meipass / "static" / "index.html").write_text("<html></html>", encoding="utf-8")
+                (incomplete_root / "work" / "guitar_samples").mkdir(parents=True, exist_ok=True)
+                (incomplete_root / "work" / "model-cache" / "mdx").mkdir(parents=True, exist_ok=True)
+                desk.verify_portable_bundle_integrity()
+
+
 if __name__ == "__main__":
     unittest.main()

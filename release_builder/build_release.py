@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -22,6 +23,8 @@ if str(REPO_ROOT) not in sys.path:
 from melodydesk_desktop import probe_melodydesk_server  # noqa: E402
 from release_builder.generate_icon import build_rosette_icon  # noqa: E402
 from runtime_paths import get_work_root  # noqa: E402
+
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 GITHUB_MAX_ASSET_BYTES = 2 * 1024 * 1024 * 1024 - (32 * 1024 * 1024)  # 1.96875 GiB ceiling (< 2.0 GiB limit)
 
@@ -152,6 +155,11 @@ def _write_portable_readme(bundle_root: Path, version: str, sample_count: int, r
   * 词级时间戳对齐：Faster-Whisper Small (int8 离线量化版)
   * 神经节拍/和声/转谱：Beat This! + BTC 170-Chord + PANNs + RMVPE/ROSVOT
 
+【常见问题】
+1. 若双击后 Windows 弹出蓝色「Windows 已保护你的电脑」提示框，这是未购买商业 EV 证书的开源软件正常提示：
+   请点击弹窗中的「更多信息」->「仍要运行」即可正常打开。
+2. 请务必将整个压缩包完整解压后再运行 `MelodyDesk.exe`，请勿在压缩软件预览窗口内直接双击或单独拖出 exe 文件。
+
 【命令行参数（可选）】
   MelodyDesk.exe --port 7865          指定监听端口
   MelodyDesk.exe --no-browser         启动但不自动弹浏览器
@@ -161,15 +169,106 @@ def _write_portable_readme(bundle_root: Path, version: str, sample_count: int, r
     (bundle_root / "README-Windows便携版说明.txt").write_text(text, encoding="utf-8-sig")
 
 
+def _find_visible_tk_window(pid: int) -> int | None:
+    """Return the visible `TkTopLevel` HWND belonging to `pid` on Windows, if present."""
+    if os.name != "nt":
+        return None
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    enum_proc_t = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    user32.EnumWindows.argtypes = [enum_proc_t, ctypes.c_void_p]
+    user32.EnumWindows.restype = ctypes.c_int
+    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    user32.GetWindowThreadProcessId.restype = ctypes.c_uint32
+    user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    user32.IsWindowVisible.restype = ctypes.c_int
+    user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+
+    matched: list[int] = []
+
+    def _cb(hwnd: int | None, _lparam: int | None) -> int:
+        if not hwnd or not user32.IsWindowVisible(hwnd):
+            return 1
+        win_pid = ctypes.c_uint32(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
+        if int(win_pid.value) != int(pid):
+            return 1
+        cls_buf = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, cls_buf, 64)
+        if cls_buf.value == "TkTopLevel":
+            matched.append(int(hwnd))
+            return 0
+        return 1
+
+    cb_ref = enum_proc_t(_cb)
+    user32.EnumWindows(cb_ref, 0)
+    return matched[0] if matched else None
+
+
+def _post_wm_close(hwnd: int) -> None:
+    if os.name != "nt":
+        return
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_ssize_t]
+    user32.PostMessageW.restype = ctypes.c_int
+    user32.PostMessageW(int(hwnd), 0x0010, 0, 0)
+
+
+def _kill_port_listeners_windows(port: int) -> None:
+    if os.name != "nt":
+        return
+    net_res = subprocess.run(
+        ["netstat", "-ano", "-p", "TCP"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=False,
+    )
+    target_suffix = f":{int(port)}"
+    pids: set[str] = set()
+    for line in net_res.stdout.splitlines():
+        cols = line.split()
+        if len(cols) >= 5 and cols[1].endswith(target_suffix) and cols[3].upper() == "LISTENING" and cols[4].isdigit():
+            if int(cols[4]) > 0:
+                pids.add(cols[4])
+    for pid_str in pids:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", pid_str], capture_output=True, check=False)
+
+
+def _clean_smoke_artifacts(bundle_root: Path) -> None:
+    for temp_dir in (
+        bundle_root / "work" / "logs",
+        bundle_root / "work" / "uploads",
+        bundle_root / "work" / "numba-cache",
+        bundle_root / "work" / "model-cache" / "hf",
+    ):
+        for attempt in range(6):
+            if not temp_dir.exists():
+                break
+            if attempt < 5:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                if temp_dir.exists():
+                    time.sleep(0.35)
+            else:
+                shutil.rmtree(temp_dir)
+        if temp_dir.exists():
+            raise RuntimeError(f"Smoke artifact directory could not be cleaned prior to zip packaging: {temp_dir}")
+
+
 def _read_smoke_log_tail(bundle_root: Path) -> str:
-    candidates = [bundle_root / "work" / "logs" / "melodydesk.log"]
+    candidates = [
+        bundle_root / "work" / "logs" / "melodydesk.log",
+        bundle_root / "work" / "logs" / "melodydesk-ui.log",
+    ]
     local_app = os.environ.get("LOCALAPPDATA", "").strip()
     if local_app:
         candidates.append(Path(local_app) / "MelodyDesk" / "work" / "logs" / "melodydesk.log")
+        candidates.append(Path(local_app) / "MelodyDesk" / "work" / "logs" / "melodydesk-ui.log")
+    parts: list[str] = []
     for log_path in candidates:
         if log_path.is_file():
-            return log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
-    return ""
+            parts.append(f"--- {log_path.name} ---\n" + log_path.read_text(encoding="utf-8", errors="replace")[-1500:])
+    return "\n".join(parts)
 
 
 def smoke_verify_frozen_exe(bundle_root: Path, port: int | None = None) -> dict:
@@ -203,27 +302,100 @@ def smoke_verify_frozen_exe(bundle_root: Path, port: int | None = None) -> dict:
     env["TRANSFORMERS_OFFLINE"] = "1"
     env["MELODYDESK_OFFLINE"] = "1"
 
-    # 1. Verify `--version` under `console=False` (`sys.stdout` / `sys.stderr` safety)
-    ver_res = subprocess.run([str(exe_path), "--version"], cwd=tempfile.gettempdir(), env=env, timeout=20)
-    if ver_res.returncode != 0:
-        raise RuntimeError(f"MelodyDesk.exe --version failed with rc={ver_res.returncode}")
-
-    # 2. Verify `--self-check-frozen` (ROSVOT/RMVPE, pretty_midi, unidecode, audio_separator, bundled ffmpeg, BTC)
-    chk_res = subprocess.run([str(exe_path), "--self-check-frozen"], cwd=tempfile.gettempdir(), env=env, timeout=90)
-    if chk_res.returncode != 0:
-        log_tail = _read_smoke_log_tail(bundle_root)
-        raise RuntimeError(f"MelodyDesk.exe --self-check-frozen failed (rc={chk_res.returncode}):\n{log_tail}")
-
-    # 3. Verify live `--headless` server + `probe_melodydesk_server()` + HTTP/SVG/Audio endpoints
-    proc = subprocess.Popen(
-        [str(exe_path), "--headless", "--no-browser", "--host", "127.0.0.1", "--port", str(port)],
-        cwd=tempfile.gettempdir(),
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    base_url = f"http://127.0.0.1:{port}"
+    gui_proc: subprocess.Popen | None = None
+    gui_port: int | None = None
+    proc: subprocess.Popen | None = None
     try:
+        # 1. Verify `--version` under `console=False` (`sys.stdout` / `sys.stderr` safety)
+        ver_res = subprocess.run([str(exe_path), "--version"], cwd=tempfile.gettempdir(), env=env, timeout=20)
+        if ver_res.returncode != 0:
+            raise RuntimeError(f"MelodyDesk.exe --version failed with rc={ver_res.returncode}")
+
+        # 2. Verify `--self-check-frozen` (ROSVOT/RMVPE, pretty_midi, unidecode, audio_separator, bundled ffmpeg, BTC)
+        chk_res = subprocess.run([str(exe_path), "--self-check-frozen"], cwd=tempfile.gettempdir(), env=env, timeout=90)
+        if chk_res.returncode != 0:
+            log_tail = _read_smoke_log_tail(bundle_root)
+            raise RuntimeError(f"MelodyDesk.exe --self-check-frozen failed (rc={chk_res.returncode}):\n{log_tail}")
+
+        # 2.5 Verify REAL default desktop GUI mode (double-click launch WITHOUT `--headless`!)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as gui_sock:
+            gui_sock.bind(("127.0.0.1", 0))
+            gui_port = int(gui_sock.getsockname()[1])
+
+        t_gui0 = time.monotonic()
+        gui_proc = subprocess.Popen(
+            [str(exe_path), "--no-browser", "--host", "127.0.0.1", "--port", str(gui_port)],
+            cwd=tempfile.gettempdir(),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        gui_base_url = f"http://127.0.0.1:{gui_port}"
+        gui_hwnd: int | None = None
+        try:
+            gui_deadline = time.monotonic() + 45.0
+            gui_ready = False
+            while time.monotonic() < gui_deadline:
+                if gui_proc.poll() is not None:
+                    log_tail = _read_smoke_log_tail(bundle_root)
+                    raise RuntimeError(f"GUI MelodyDesk.exe exited prematurely (rc={gui_proc.returncode}):\n{log_tail}")
+                if gui_hwnd is None:
+                    gui_hwnd = _find_visible_tk_window(gui_proc.pid)
+                if probe_melodydesk_server("127.0.0.1", gui_port, timeout=1.5) and (gui_hwnd is not None or os.name != "nt"):
+                    gui_ready = True
+                    break
+                time.sleep(0.25)
+
+            if not gui_ready:
+                log_tail = _read_smoke_log_tail(bundle_root)
+                raise TimeoutError(
+                    f"Default GUI mode failed readiness (hwnd={gui_hwnd}) within 45s:\n{log_tail}"
+                )
+            gui_startup_sec = round(time.monotonic() - t_gui0, 2)
+
+            with _NO_PROXY_OPENER.open(f"{gui_base_url}/api/health", timeout=3.0) as r_gh:
+                gh_data = json.loads(r_gh.read().decode("utf-8"))
+                if r_gh.status != 200 or gh_data.get("ok") is not True or gh_data.get("app") != "melodydesk":
+                    raise RuntimeError(f"GUI /api/health returned unexpected payload: {gh_data}")
+
+            with _NO_PROXY_OPENER.open(f"{gui_base_url}/api/state", timeout=20.0) as r_gs:
+                gs_data = json.loads(r_gs.read().decode("utf-8"))
+                if "<svg" not in gs_data.get("publication_html", ""):
+                    raise RuntimeError("GUI mode /api/state did not return valid SVG score")
+
+            if gui_hwnd is not None:
+                _post_wm_close(gui_hwnd)
+                gui_rc = gui_proc.wait(timeout=12)
+                if gui_rc != 0:
+                    raise RuntimeError(f"GUI MelodyDesk.exe exited with non-zero code after WM_CLOSE: {gui_rc}")
+                port_freed = False
+                free_deadline = time.monotonic() + 6.0
+                while time.monotonic() < free_deadline:
+                    if not probe_melodydesk_server("127.0.0.1", gui_port, timeout=0.6):
+                        port_freed = True
+                        break
+                    time.sleep(0.2)
+                if not port_freed:
+                    raise RuntimeError("Child headless server remained alive after Studio Console WM_CLOSE!")
+        finally:
+            if gui_proc.poll() is None:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(gui_proc.pid)], capture_output=True, check=False)
+                else:
+                    gui_proc.kill()
+                gui_proc.wait(timeout=5)
+            if gui_port is not None and probe_melodydesk_server("127.0.0.1", gui_port, timeout=0.4):
+                _kill_port_listeners_windows(gui_port)
+
+        # 3. Verify live `--headless` server + `probe_melodydesk_server()` + HTTP/SVG/Audio endpoints
+        proc = subprocess.Popen(
+            [str(exe_path), "--headless", "--no-browser", "--host", "127.0.0.1", "--port", str(port)],
+            cwd=tempfile.gettempdir(),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        base_url = f"http://127.0.0.1:{port}"
         deadline = time.monotonic() + 75.0
         ready = False
         while time.monotonic() < deadline:
@@ -238,18 +410,18 @@ def smoke_verify_frozen_exe(bundle_root: Path, port: int | None = None) -> dict:
         if not ready:
             raise TimeoutError("Timed out waiting for frozen MelodyDesk.exe probe_melodydesk_server() readiness.")
 
-        with urllib.request.urlopen(f"{base_url}/api/state", timeout=5.0) as r_state:
+        with _NO_PROXY_OPENER.open(f"{base_url}/api/state", timeout=20.0) as r_state:
             state_data = json.loads(r_state.read().decode("utf-8"))
             pub_html = state_data.get("publication_html", "")
             if not isinstance(pub_html, str) or "<svg" not in pub_html:
                 raise RuntimeError("Rendered publication_html did not contain expected <svg> score markup.")
 
-        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as r_index:
+        with _NO_PROXY_OPENER.open(f"{base_url}/", timeout=15.0) as r_index:
             index_html = r_index.read().decode("utf-8")
             if r_index.status != 200 or 'class="dock"' not in index_html:
                 raise RuntimeError("Index HTML missing studio dock")
 
-        with urllib.request.urlopen(f"{base_url}/evolution_atlas", timeout=5.0) as r_atlas:
+        with _NO_PROXY_OPENER.open(f"{base_url}/evolution_atlas", timeout=15.0) as r_atlas:
             atlas_html = r_atlas.read().decode("utf-8")
             if r_atlas.status != 200 or "MelodyDesk 2.0" not in atlas_html:
                 raise RuntimeError("/evolution_atlas returned unexpected HTML payload")
@@ -264,17 +436,17 @@ def smoke_verify_frozen_exe(bundle_root: Path, port: int | None = None) -> dict:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=15.0) as r_reharm:
+        with _NO_PROXY_OPENER.open(req, timeout=15.0) as r_reharm:
             reharm_data = json.loads(r_reharm.read().decode("utf-8"))
             if r_reharm.status != 200 or reharm_data.get("preset") != "emotional_pop":
                 raise RuntimeError("POST /api/reharmonize did not apply emotional_pop preset")
 
-        with urllib.request.urlopen(f"{base_url}/api/audio/guitar-only.wav", timeout=45.0) as r_gtr:
+        with _NO_PROXY_OPENER.open(f"{base_url}/api/audio/guitar-only.wav", timeout=45.0) as r_gtr:
             gtr_bytes = r_gtr.read()
             if r_gtr.status != 200 or gtr_bytes[:4] != b"RIFF" or len(gtr_bytes) <= 500_000:
                 raise RuntimeError("GET /api/audio/guitar-only.wav failed validation")
 
-        with urllib.request.urlopen(f"{base_url}/api/audio/vocal-guitar-mix.wav", timeout=45.0) as r_mix:
+        with _NO_PROXY_OPENER.open(f"{base_url}/api/audio/vocal-guitar-mix.wav", timeout=45.0) as r_mix:
             mix_bytes = r_mix.read()
             if r_mix.status != 200 or mix_bytes[:4] != b"RIFF" or len(mix_bytes) <= 500_000:
                 raise RuntimeError("GET /api/audio/vocal-guitar-mix.wav failed validation")
@@ -327,13 +499,13 @@ def smoke_verify_frozen_exe(bundle_root: Path, port: int | None = None) -> dict:
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
             method="POST",
         )
-        with urllib.request.urlopen(up_req, timeout=15.0) as r_up:
+        with _NO_PROXY_OPENER.open(up_req, timeout=15.0) as r_up:
             job_id = json.loads(r_up.read().decode("utf-8"))["job_id"]
 
         up_deadline = time.monotonic() + 90.0
         job_final = None
         while time.monotonic() < up_deadline:
-            with urllib.request.urlopen(f"{base_url}/api/job/{job_id}", timeout=5.0) as r_job:
+            with _NO_PROXY_OPENER.open(f"{base_url}/api/job/{job_id}", timeout=15.0) as r_job:
                 job_state = json.loads(r_job.read().decode("utf-8"))
             if job_state.get("status") in ("done", "error", "superseded"):
                 job_final = job_state
@@ -343,7 +515,7 @@ def smoke_verify_frozen_exe(bundle_root: Path, port: int | None = None) -> dict:
             raise RuntimeError(f"Offline MP3 upload smoke test failed: {job_final}")
         upload_elapsed_s = round(time.monotonic() - t_up0, 2)
 
-        with urllib.request.urlopen(f"{base_url}/api/state", timeout=5.0) as r_after:
+        with _NO_PROXY_OPENER.open(f"{base_url}/api/state", timeout=15.0) as r_after:
             after_state = json.loads(r_after.read().decode("utf-8"))
             if after_state.get("title") != "自定义上传测试曲" or "<svg" not in after_state.get("publication_html", ""):
                 raise RuntimeError("Uploaded MP3 state did not render expected title and SVG score")
@@ -358,26 +530,23 @@ def smoke_verify_frozen_exe(bundle_root: Path, port: int | None = None) -> dict:
             "guitar_wav_bytes": len(gtr_bytes),
             "vocal_mix_wav_bytes": len(mix_bytes),
             "self_check_frozen": True,
+            "gui_startup_sec": gui_startup_sec,
             "offline_mp3_upload_sec": upload_elapsed_s,
         }
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
-            else:
-                proc.kill()
-            proc.wait(timeout=3)
-        for temp_dir in (
-            bundle_root / "work" / "logs",
-            bundle_root / "work" / "uploads",
-            bundle_root / "work" / "numba-cache",
-            bundle_root / "work" / "model-cache" / "hf",
-        ):
-            if temp_dir.exists():
-                shutil.rmtree(temp_dir, ignore_errors=True)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, check=False)
+                else:
+                    proc.kill()
+                proc.wait(timeout=3)
+        if port is not None and probe_melodydesk_server("127.0.0.1", port, timeout=0.4):
+            _kill_port_listeners_windows(port)
+        _clean_smoke_artifacts(bundle_root)
 
 
 def create_zip_archive(source_dir: Path, zip_path: Path) -> tuple[int, str]:
@@ -401,7 +570,7 @@ def create_zip_archive(source_dir: Path, zip_path: Path) -> tuple[int, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build standalone MelodyDesk Windows .exe release")
-    parser.add_argument("--version", default="2.0.1", help="Semantic version string (default: 2.0.1)")
+    parser.add_argument("--version", default="2.0.2", help="Semantic version string (default: 2.0.2)")
     parser.add_argument("--stage-dir", default=None, help="Output staging directory")
     parser.add_argument("--skip-rosvot", action="store_true", help="Exclude 603 MB ROSVOT weights from main zip")
     args = parser.parse_args()
