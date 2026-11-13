@@ -110,7 +110,9 @@
     .track.active .track-tag { color: var(--accent-deep); }
     #song-upload-toggle .track-name { font-size: 12.5px; font-weight: 500; color: var(--ink-2); }
     #upload-panel { margin: 10px 2px 2px; padding: 12px; border-radius: 8px; background: var(--well); }
-    #upload-status { display: none; margin-top: 8px; font-size: 11.5px; color: var(--accent-deep); font-weight: 550; }
+    #upload-status { display: none; margin-top: 8px; font-size: 11.5px; color: var(--accent-deep); font-weight: 550; line-height: 1.45; }
+    .upload-prog-track { height: 4px; border-radius: 999px; background: var(--hair); overflow: hidden; margin-top: 6px; }
+    .upload-prog-fill { height: 100%; width: 0%; background: var(--accent); transition: width 0.35s ease; }
 
     /* II · Artistry — airy 2 × 2 editorial cards */
     .aes-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
@@ -1691,6 +1693,18 @@
     }
 
     // 01 · Repertoire switching
+    let activeUploadPoll = null;
+    let restoreUploadBtn = null;
+    function cancelActiveUploadClient() {
+      if (activeUploadPoll !== null) {
+        clearInterval(activeUploadPoll);
+        activeUploadPoll = null;
+      }
+      if (typeof restoreUploadBtn === 'function') {
+        restoreUploadBtn();
+        restoreUploadBtn = null;
+      }
+    }
     function selectTrack(demo) {
       document.querySelectorAll('.track').forEach(t => {
         t.classList.toggle('active', demo === 'upload' ? t.id === 'song-upload-toggle' : t.dataset.demo === demo);
@@ -1698,6 +1712,7 @@
     }
     document.querySelectorAll('.track[data-demo]').forEach(card => {
       card.addEventListener('click', () => {
+        cancelActiveUploadClient();
         activeDemo = card.dataset.demo;
         selectedBarIndex = 0;
         resetTransport();
@@ -1712,53 +1727,89 @@
     });
 
     document.getElementById('btn-start-upload').addEventListener('click', async () => {
+      const btn = document.getElementById('btn-start-upload');
       const fileInp = document.getElementById('upload-file');
       if (!fileInp.files || !fileInp.files[0]) {
-        showError('请先选择一个音频文件 (.wav / .mp3)');
+        showError('请先选择一个音频文件 (.wav / .mp3 / .flac / .ogg / .m4a)');
         return;
       }
+      if (btn.disabled) return;
+      btn.disabled = true;
+      const origLabel = btn.textContent;
+      btn.textContent = '正在全自动扒谱与编配…';
       const statusEl = document.getElementById('upload-status');
-      statusEl.style.display = 'block';
-      statusEl.textContent = '正在上传并分离人声…';
+      const t0 = Date.now();
+      const renderUploadProgress = (msg, pct) => {
+        const sec = Math.max(0, Math.round((Date.now() - t0) / 1000));
+        const clamped = Math.max(5, Math.min(100, Math.round((pct || 0.08) * 100)));
+        statusEl.style.display = 'block';
+        statusEl.innerHTML = '';
+        const txt = document.createElement('div');
+        txt.textContent = `${msg}（已用时 ${sec}s）`;
+        const bar = document.createElement('div');
+        bar.className = 'upload-prog-track';
+        const fill = document.createElement('div');
+        fill.className = 'upload-prog-fill';
+        fill.style.width = clamped + '%';
+        bar.appendChild(fill);
+        statusEl.appendChild(txt);
+        statusEl.appendChild(bar);
+      };
+      renderUploadProgress('[1/6] 正在上传音频并启动人声分离…', 0.06);
       const fd = new FormData();
       fd.append('file', fileInp.files[0]);
       fd.append('lyrics', document.getElementById('upload-lyrics').value || '');
+      const restoreBtn = () => {
+        btn.disabled = false;
+        btn.textContent = origLabel;
+      };
+      restoreUploadBtn = restoreBtn;
       try {
         const r = await fetch('/api/analyze_audio', { method: 'POST', body: fd });
         const j = await r.json();
         if (!r.ok) throw new Error(j.detail || '上传失败');
+        if (restoreUploadBtn !== restoreBtn) {
+          return;
+        }
         const poll = setInterval(async () => {
           try {
             const sr = await fetch('/api/job/' + j.job_id);
             if (!sr.ok) {
-              clearInterval(poll);
+              cancelActiveUploadClient();
               showError('查询分析任务状态失败');
               return;
             }
             const sj = await sr.json();
-            statusEl.textContent = sj.message || '处理中…';
+            renderUploadProgress(sj.message || '处理中…', sj.progress || 0.2);
             if (sj.status === 'done') {
-              clearInterval(poll);
-              statusEl.textContent = '已生成艺术吉他编配谱与伴奏';
-              document.getElementById('upload-panel').style.display = 'none';
+              cancelActiveUploadClient();
+              if (sj.degraded && sj.message) {
+                statusEl.textContent = sj.message;
+                statusEl.style.display = 'block';
+              } else {
+                statusEl.textContent = '已生成艺术吉他编配谱与伴奏';
+                document.getElementById('upload-panel').style.display = 'none';
+              }
               activeDemo = 'upload';
               selectedBarIndex = 0;
               resetTransport();
               selectTrack(activeDemo);
               apiCall('state', undefined, true);
             } else if (sj.status === 'superseded') {
-              clearInterval(poll);
+              cancelActiveUploadClient();
               statusEl.textContent = sj.message || '分析请求已被新曲目切换取代';
             } else if (sj.status === 'error') {
-              clearInterval(poll);
+              cancelActiveUploadClient();
               showError('分析出错：' + sj.message);
             }
           } catch (pollErr) {
-            clearInterval(poll);
+            cancelActiveUploadClient();
             showError('轮询分析进度中断：' + pollErr.message);
           }
-        }, 1000);
+        }, 800);
+        activeUploadPoll = poll;
       } catch (e) {
+        cancelActiveUploadClient();
         showError(e.message);
       }
     });

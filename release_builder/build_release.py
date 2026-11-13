@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -85,6 +86,8 @@ def _copy_core_models(src_cache: Path, dst_cache: Path, include_rosvot: bool = T
         ("btc-chord", True),
         ("panns-cnn6.pth", False),
         ("hub/checkpoints/beat_this-final0.ckpt", False),
+        ("mdx", True),
+        ("whisper-small-int8", True),
     ]
     if include_rosvot:
         items.append(("rosvot/checkpoints", True))
@@ -97,7 +100,11 @@ def _copy_core_models(src_cache: Path, dst_cache: Path, include_rosvot: bool = T
         if is_dir:
             if dst.exists():
                 shutil.rmtree(dst)
-            shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git"))
+            shutil.copytree(
+                src,
+                dst,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git", ".cache", "btc_model.pt"),
+            )
             total_bytes += sum(f.stat().st_size for f in dst.rglob("*") if f.is_file())
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -140,9 +147,10 @@ def _write_portable_readme(bundle_root: Path, version: str, sample_count: int, r
 - {sample_count} 个真实录音棚木吉他多力度/多轮循采样（Meta Steel + FSS + Shinyguitar + Emilyguitar）
 - {repertoire_count} 首全曲真唱与 2026 SOTA 编配曲谱（《成都》《普通朋友》《Country Roads》《Tears in Heaven》
   《Scarborough Fair》《Lady Greensleeves》《Let's Go Fishin'》）
-- 离线节拍、和声与人声转简谱模型权重（Beat This! + BTC 170-Chord + PANNs + RMVPE/ROSVOT）
-- 首次上传自定义歌曲分离人声或对齐歌词时，若本地尚未缓存 RoFormer / Whisper / MMS_FA 权重，
-  程序会自动下载并缓存在可写 `work\\model-cache` 目录（即使解压在只读目录亦自动回退至 AppData）。
+- 全离线全链路 AI 扒谱模型权重（零首次下载等待、断网可用）：
+  * 人声伴奏极速分离：MDX-Net ONNX（UVR_MDXNET_KARA_2 + Kim_Vocal_2，支持 Windows DirectML 显卡加速与 AVX2 多核推理）
+  * 词级时间戳对齐：Faster-Whisper Small (int8 离线量化版)
+  * 神经节拍/和声/转谱：Beat This! + BTC 170-Chord + PANNs + RMVPE/ROSVOT
 
 【命令行参数（可选）】
   MelodyDesk.exe --port 7865          指定监听端口
@@ -153,18 +161,47 @@ def _write_portable_readme(bundle_root: Path, version: str, sample_count: int, r
     (bundle_root / "README-Windows便携版说明.txt").write_text(text, encoding="utf-8-sig")
 
 
-def smoke_verify_frozen_exe(bundle_root: Path, port: int = 17891) -> dict:
+def _read_smoke_log_tail(bundle_root: Path) -> str:
+    candidates = [bundle_root / "work" / "logs" / "melodydesk.log"]
+    local_app = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app:
+        candidates.append(Path(local_app) / "MelodyDesk" / "work" / "logs" / "melodydesk.log")
+    for log_path in candidates:
+        if log_path.is_file():
+            return log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+    return ""
+
+
+def smoke_verify_frozen_exe(bundle_root: Path, port: int | None = None) -> dict:
     """Launch `MelodyDesk.exe` in a sanitized environment and verify CLI, MIR self-check, HTTP, SVG, Reharm, and WAV."""
     exe_path = bundle_root / "MelodyDesk.exe"
     if not exe_path.is_file():
         raise FileNotFoundError(f"Compiled executable not found: {exe_path}")
 
+    if port is None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+
     env = os.environ.copy()
-    for var in ("PYTHONPATH", "PYTHONHOME", "MELODYDESK_HOME", "MELODYDESK_WORK_DIR", "MELODYDESK_MODEL_CACHE", "MELODYDESK_GUITAR_SAMPLES"):
+    for var in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "MELODYDESK_HOME",
+        "MELODYDESK_WORK_DIR",
+        "MELODYDESK_MODEL_CACHE",
+        "MELODYDESK_GUITAR_SAMPLES",
+        "CUDA_PATH",
+    ):
         env.pop(var, None)
-    # Strip host FFmpeg directories from PATH so `--self-check-frozen` proves `<bundle>/bin/ffmpeg.exe` works!
+    for key in [k for k in env if k.upper().startswith("CUDA_PATH_")]:
+        env.pop(key, None)
+    # Strip host FFmpeg & CUDA directories from PATH so `--self-check-frozen` proves `<bundle>/bin/ffmpeg.exe` works!
     win_sys = os.environ.get("SystemRoot", r"C:\Windows")
     env["PATH"] = os.pathsep.join([str(Path(win_sys) / "System32"), str(Path(win_sys))])
+    env["HF_HUB_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
+    env["MELODYDESK_OFFLINE"] = "1"
 
     # 1. Verify `--version` under `console=False` (`sys.stdout` / `sys.stderr` safety)
     ver_res = subprocess.run([str(exe_path), "--version"], cwd=tempfile.gettempdir(), env=env, timeout=20)
@@ -174,10 +211,7 @@ def smoke_verify_frozen_exe(bundle_root: Path, port: int = 17891) -> dict:
     # 2. Verify `--self-check-frozen` (ROSVOT/RMVPE, pretty_midi, unidecode, audio_separator, bundled ffmpeg, BTC)
     chk_res = subprocess.run([str(exe_path), "--self-check-frozen"], cwd=tempfile.gettempdir(), env=env, timeout=90)
     if chk_res.returncode != 0:
-        log_tail = ""
-        log_path = bundle_root / "work" / "logs" / "melodydesk.log"
-        if log_path.is_file():
-            log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+        log_tail = _read_smoke_log_tail(bundle_root)
         raise RuntimeError(f"MelodyDesk.exe --self-check-frozen failed (rc={chk_res.returncode}):\n{log_tail}")
 
     # 3. Verify live `--headless` server + `probe_melodydesk_server()` + HTTP/SVG/Audio endpoints
@@ -185,8 +219,8 @@ def smoke_verify_frozen_exe(bundle_root: Path, port: int = 17891) -> dict:
         [str(exe_path), "--headless", "--no-browser", "--host", "127.0.0.1", "--port", str(port)],
         cwd=tempfile.gettempdir(),
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     base_url = f"http://127.0.0.1:{port}"
     try:
@@ -194,8 +228,7 @@ def smoke_verify_frozen_exe(bundle_root: Path, port: int = 17891) -> dict:
         ready = False
         while time.monotonic() < deadline:
             if proc.poll() is not None:
-                log_path = bundle_root / "work" / "logs" / "melodydesk.log"
-                log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:] if log_path.is_file() else ""
+                log_tail = _read_smoke_log_tail(bundle_root)
                 raise RuntimeError(f"MelodyDesk.exe exited prematurely (rc={proc.returncode}):\n{log_tail}")
             if probe_melodydesk_server("127.0.0.1", port, timeout=1.5):
                 ready = True
@@ -246,21 +279,103 @@ def smoke_verify_frozen_exe(bundle_root: Path, port: int = 17891) -> dict:
             if r_mix.status != 200 or mix_bytes[:4] != b"RIFF" or len(mix_bytes) <= 500_000:
                 raise RuntimeError("GET /api/audio/vocal-guitar-mix.wav failed validation")
 
+        # 4. End-to-end offline custom .mp3 upload verification (POST /api/analyze_audio -> /api/job/<id>)
+        import math
+        import wave
+
+        bundled_ffmpeg = bundle_root / "bin" / "ffmpeg.exe"
+        with tempfile.TemporaryDirectory() as up_tmp:
+            sr_u = 22050
+            dur_u = 6.0
+            n_u = int(sr_u * dur_u)
+            pcm_buf = bytearray()
+            for idx_s in range(n_u):
+                t_s = idx_s / sr_u
+                f0 = 261.63 if t_s < 3.0 else 329.63
+                val = 0.45 * math.sin(2.0 * math.pi * f0 * t_s) + 0.2 * math.sin(4.0 * math.pi * f0 * t_s)
+                samp = max(-32767, min(32767, int(val * 32767.0)))
+                pcm_buf.extend(samp.to_bytes(2, byteorder="little", signed=True))
+                pcm_buf.extend(samp.to_bytes(2, byteorder="little", signed=True))
+            raw_wav = Path(up_tmp) / "smoke_song.wav"
+            with wave.open(str(raw_wav), "wb") as wf:
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(sr_u)
+                wf.writeframes(bytes(pcm_buf))
+            smoke_mp3 = Path(up_tmp) / "自定义上传测试曲.mp3"
+            subprocess.run(
+                [str(bundled_ffmpeg), "-nostdin", "-y", "-i", str(raw_wav), "-b:a", "128k", str(smoke_mp3)],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+            mp3_bytes = smoke_mp3.read_bytes()
+
+        boundary = "----MelodyDeskSmokeBoundary7MA4YWxkTrZu0gW"
+        body_parts = [
+            f"--{boundary}\r\n".encode("utf-8"),
+            'Content-Disposition: form-data; name="file"; filename="自定义上传测试曲.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n'.encode("utf-8"),
+            mp3_bytes,
+            f"\r\n--{boundary}\r\n".encode("utf-8"),
+            'Content-Disposition: form-data; name="lyrics"\r\n\r\n今夜微风轻吹\r\n'.encode("utf-8"),
+            f"--{boundary}--\r\n".encode("utf-8"),
+        ]
+        t_up0 = time.monotonic()
+        up_req = urllib.request.Request(
+            f"{base_url}/api/analyze_audio",
+            data=b"".join(body_parts),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(up_req, timeout=15.0) as r_up:
+            job_id = json.loads(r_up.read().decode("utf-8"))["job_id"]
+
+        up_deadline = time.monotonic() + 90.0
+        job_final = None
+        while time.monotonic() < up_deadline:
+            with urllib.request.urlopen(f"{base_url}/api/job/{job_id}", timeout=5.0) as r_job:
+                job_state = json.loads(r_job.read().decode("utf-8"))
+            if job_state.get("status") in ("done", "error", "superseded"):
+                job_final = job_state
+                break
+            time.sleep(0.5)
+        if not job_final or job_final.get("status") != "done":
+            raise RuntimeError(f"Offline MP3 upload smoke test failed: {job_final}")
+        upload_elapsed_s = round(time.monotonic() - t_up0, 2)
+
+        with urllib.request.urlopen(f"{base_url}/api/state", timeout=5.0) as r_after:
+            after_state = json.loads(r_after.read().decode("utf-8"))
+            if after_state.get("title") != "自定义上传测试曲" or "<svg" not in after_state.get("publication_html", ""):
+                raise RuntimeError("Uploaded MP3 state did not render expected title and SVG score")
+
+        unbundled_mms = bundle_root / "work" / "model-cache" / "hub" / "checkpoints" / "model.pt"
+        if unbundled_mms.exists():
+            raise RuntimeError(f"Unexpected live download into bundle during offline smoke test: {unbundled_mms}")
+
         return {
             "bar_count": bar_count,
             "svg_verified": True,
             "guitar_wav_bytes": len(gtr_bytes),
             "vocal_mix_wav_bytes": len(mix_bytes),
             "self_check_frozen": True,
+            "offline_mp3_upload_sec": upload_elapsed_s,
         }
     finally:
         proc.terminate()
         try:
             proc.wait(timeout=8)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+            else:
+                proc.kill()
             proc.wait(timeout=3)
-        for temp_dir in (bundle_root / "work" / "logs", bundle_root / "work" / "numba-cache", bundle_root / "work" / "model-cache" / "hf"):
+        for temp_dir in (
+            bundle_root / "work" / "logs",
+            bundle_root / "work" / "uploads",
+            bundle_root / "work" / "numba-cache",
+            bundle_root / "work" / "model-cache" / "hf",
+        ):
             if temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -286,7 +401,7 @@ def create_zip_archive(source_dir: Path, zip_path: Path) -> tuple[int, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build standalone MelodyDesk Windows .exe release")
-    parser.add_argument("--version", default="2.0.0", help="Semantic version string (default: 2.0.0)")
+    parser.add_argument("--version", default="2.0.1", help="Semantic version string (default: 2.0.1)")
     parser.add_argument("--stage-dir", default=None, help="Output staging directory")
     parser.add_argument("--skip-rosvot", action="store_true", help="Exclude 603 MB ROSVOT weights from main zip")
     args = parser.parse_args()

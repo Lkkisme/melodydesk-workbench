@@ -101,17 +101,16 @@ def get_model_cache_root(*, require_writable: bool = False) -> Path:
 
 def candidate_model_cache_roots() -> list[Path]:
     """Return ordered unique `model-cache` directories to search for pre-installed weights."""
-    roots: list[Path] = []
     env_cache = os.environ.get("MELODYDESK_MODEL_CACHE", "").strip()
-    raw_candidates = []
     if env_cache:
-        raw_candidates.append(Path(env_cache).expanduser())
-    raw_candidates.extend([
+        return [Path(env_cache).expanduser().resolve()]
+    roots: list[Path] = []
+    raw_candidates = [
         get_work_root() / "model-cache",
         get_writable_work_root() / "model-cache",
         get_app_root() / "model-cache",
         Path.home() / ".cache" / "melodydesk",
-    ])
+    ]
     for cand in raw_candidates:
         resolved = cand.resolve()
         if resolved not in roots:

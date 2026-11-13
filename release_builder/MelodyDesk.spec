@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+import importlib.util
 from pathlib import Path
 import sys
 from PyInstaller.utils.hooks import (
@@ -68,7 +69,7 @@ for pkg in (
     except Exception:
         pass
 
-for meta_pkg in ("audio-separator", "onnxruntime", "faster-whisper", "transformers", "huggingface-hub", "pretty_midi"):
+for meta_pkg in ("audio-separator", "onnxruntime", "onnxruntime-directml", "faster-whisper", "transformers", "huggingface-hub", "pretty_midi"):
     try:
         datas.extend(copy_metadata(meta_pkg))
     except Exception:
@@ -85,6 +86,16 @@ for dyn_pkg in ("ctranslate2", "onnxruntime", "av"):
         binaries.extend(collect_dynamic_libs(dyn_pkg))
     except Exception:
         pass
+
+# Bundle Stable-ABI / torch.ops.load_library native extensions (.pyd/.dll) for torchvision & torchaudio
+for ext_pkg in ("torchvision", "torchaudio"):
+    spec_pkg = importlib.util.find_spec(ext_pkg)
+    if spec_pkg and spec_pkg.submodule_search_locations:
+        pkg_root = Path(list(spec_pkg.submodule_search_locations)[0]).resolve()
+        for bin_file in pkg_root.rglob("*"):
+            if bin_file.is_file() and bin_file.suffix.lower() in (".pyd", ".dll"):
+                rel_parent = bin_file.parent.relative_to(pkg_root.parent).as_posix()
+                binaries.append((str(bin_file), rel_parent))
 
 # Bundle Tcl/Tk 8.6 runtime data when building from Conda/CPython on Windows
 base_prefix = Path(sys.base_prefix)

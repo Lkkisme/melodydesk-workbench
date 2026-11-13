@@ -32,7 +32,8 @@ def load_model():
         from third_party.panns.cnn6 import Cnn6
         if not ready():
             raise RuntimeError('人声筛选模型未安装，请运行 install_singing_model.py。')
-        torch.set_num_threads(min(4,torch.get_num_threads()))
+        if torch.get_num_threads() > 16:
+            torch.set_num_threads(16)
         model=Cnn6(32000,1024,320,64,50,14000,527).eval()
         state=torch.load(_active_weights(),map_location='cpu',weights_only=True)
         model.load_state_dict(state['model'],strict=True)

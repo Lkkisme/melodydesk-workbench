@@ -41,7 +41,7 @@ from runtime_paths import (  # noqa: E402
     get_writable_work_root,
 )
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 
 
 class _LogStreamAdapter:
@@ -288,12 +288,20 @@ def _run_frozen_self_check() -> int:
 
     importlib.import_module("unidecode")
     importlib.import_module("pretty_midi")
+    importlib.import_module("audio_separator.separator.architectures.mdx_separator")
     importlib.import_module("audio_separator.separator.architectures.mdxc_separator")
 
-    from audio_separator.separator import Separator
+    from faster_whisper import WhisperModel
+    from runtime_paths import resolve_model_path
+    from subpkgs.stem_mir.separator_engine import _instantiate_separator, _resolve_separator_cache_dir
 
+    mdx_dir = _resolve_separator_cache_dir(
+        "mdx",
+        "UVR_MDXNET_KARA_2.onnx",
+        extra_required=("Kim_Vocal_2.onnx",),
+    )
     with tempfile.TemporaryDirectory() as tmp:
-        sep = Separator(output_dir=tmp, output_format="WAV")
+        sep = _instantiate_separator(output_dir=tmp, model_file_dir=mdx_dir, use_soundfile=True)
         if sep is None:
             raise RuntimeError("audio_separator failed to initialize")
 
@@ -304,6 +312,9 @@ def _run_frozen_self_check() -> int:
     btc = chord_recognizer._get_btc_runtime()
     if btc is None:
         raise RuntimeError("BTC 170-chord model failed to load")
+    local_w = resolve_model_path("whisper-small-int8", require_writable_parent=False)
+    if (local_w / "model.bin").is_file():
+        WhisperModel(str(local_w), device="cpu", compute_type="int8", local_files_only=True)
 
     logging.getLogger("melodydesk.selfcheck").info("SELF_CHECK_OK ffmpeg=%s", ffmpeg_bin)
     return 0

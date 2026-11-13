@@ -1137,6 +1137,7 @@ def create_app() -> FastAPI:
     application.state.session = _initial_session()
     application.state.session_lock = threading.RLock()
     application.state.project_generation = 0
+    application.state.upload_generation = 0
 
     def snapshot():
         with application.state.session_lock:
@@ -1148,7 +1149,7 @@ def create_app() -> FastAPI:
             _guitar_samples(application.state.session)
             return _snapshot(application.state.session)
 
-    def mutate(operation, bump_generation: bool = False):
+    def mutate(operation, bump_generation: bool = False, bump_upload_generation: bool = False):
         with application.state.session_lock:
             previous = application.state.session
             candidate = _snapshot(previous)
@@ -1160,6 +1161,8 @@ def create_app() -> FastAPI:
                 raise HTTPException(422, str(exc)) from exc
             if bump_generation:
                 application.state.project_generation += 1
+            if bump_upload_generation:
+                application.state.upload_generation += 1
             candidate.undo_stack = (previous.undo_stack+[_snapshot(previous)])[-30:]
             application.state.session = candidate
             return payload
@@ -1643,7 +1646,7 @@ def create_app() -> FastAPI:
         def operation(candidate):
             fresh = _build_session(request.demo)
             candidate.__dict__.update(vars(fresh))
-        return mutate(operation, bump_generation=True)
+        return mutate(operation, bump_generation=True, bump_upload_generation=True)
 
     @application.get('/api/audio/guitar-only.wav')
     def guitar_audio():
@@ -1675,16 +1678,42 @@ def create_app() -> FastAPI:
 
     @application.post('/api/analyze_audio')
     async def analyze_audio(file: UploadFile = File(...), lyrics: str = Form('')):
+        import shutil
+        import subprocess
+        import time
         import uuid
         job_id = uuid.uuid4().hex
         upload_dir = get_writable_work_root() / 'uploads' / job_id
         upload_dir.mkdir(parents=True, exist_ok=True)
-        audio_path = upload_dir / (Path(file.filename or 'song.wav').name)
+        raw_filename = Path(file.filename or 'song.wav').name
+        audio_path = upload_dir / raw_filename
         audio_path.write_bytes(await file.read())
+        song_title = Path(raw_filename).stem or 'Uploaded Song'
+        t_job_start = time.monotonic()
+
+        def _update_job(progress_val: float, msg: str, status: str = 'running', **extra) -> None:
+            payload = {
+                'status': status,
+                'progress': round(float(progress_val), 3),
+                'message': msg,
+                'elapsed_sec': round(time.monotonic() - t_job_start, 1),
+            }
+            payload.update(extra)
+            application.state.jobs[job_id] = payload
+
+        class _UploadSuperseded(Exception):
+            pass
+
         with application.state.session_lock:
             application.state.project_generation += 1
-            my_generation = application.state.project_generation
-        application.state.jobs[job_id] = {'status': 'running', 'progress': 0.1, 'message': '正在分离人声与伴奏...'}
+            application.state.upload_generation += 1
+            my_upload_gen = application.state.upload_generation
+
+        def _raise_if_superseded() -> None:
+            if my_upload_gen != application.state.upload_generation:
+                raise _UploadSuperseded()
+
+        _update_job(0.08, '[1/6] 正在分离人声与伴奏音轨…')
 
         def _worker():
             try:
@@ -1697,9 +1726,28 @@ def create_app() -> FastAPI:
                 from subpkgs.singing_lyrics import transcribe_vocal_notes, regulate_singing_notes_for_score
                 import soundfile as sf
 
+                work_audio_path = audio_path
+                try:
+                    sf.info(str(work_audio_path))
+                except Exception:
+                    ffmpeg_bin = shutil.which('ffmpeg')
+                    if ffmpeg_bin:
+                        decoded_wav = upload_dir / '_decoded_source.wav'
+                        creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+                        subprocess.run(
+                            [ffmpeg_bin, '-nostdin', '-y', '-i', str(audio_path), '-vn', '-acodec', 'pcm_s16le', '-ar', '44100', str(decoded_wav)],
+                            check=True,
+                            capture_output=True,
+                            timeout=120,
+                            creationflags=creationflags,
+                        )
+                        work_audio_path = decoded_wav
+
                 # Step 1 — Stem Separation
-                stems = separate_stems(audio_path, upload_dir / 'stems', prefer_cuda=True)
-                application.state.jobs[job_id] = {'status': 'running', 'progress': 0.3, 'message': '正在提取人声词语时间戳...'}
+                _raise_if_superseded()
+                stems = separate_stems(work_audio_path, upload_dir / 'stems', prefer_cuda=True)
+                _raise_if_superseded()
+                _update_job(0.28, '[2/6] 正在识别歌词与词级时间戳…')
 
                 # Step 2 — Early Vocal Word/Syllable Timestamp Extraction
                 stage_warnings: list[str] = []
@@ -1735,13 +1783,14 @@ def create_app() -> FastAPI:
                     stage_warnings.append(warn_msg)
                     logger.warning("Word timestamp extraction failed: %s", exc)
 
-                application.state.jobs[job_id] = {'status': 'running', 'progress': 0.4, 'message': '正在提取节拍、原曲和声基底与主旋律...'}
+                _raise_if_superseded()
+                _update_job(0.46, '[3/6] 正在追踪全曲节拍与小节强拍…')
 
                 # Step 3 — Hybrid Beat & Downbeat Tracking:
                 # Lock onto full mix when real accompaniment exists; fall back to vocals on pure a-cappella uploads.
                 acc_wav = stems.get('accompaniment')
                 has_accompaniment = _has_audible_accompaniment(acc_wav)
-                beat_source = audio_path if has_accompaniment else stems['vocals']
+                beat_source = work_audio_path if has_accompaniment else stems['vocals']
                 beat_info = track_beats_and_downbeats(
                     beat_source,
                     prefer_cuda=True,
@@ -1754,10 +1803,12 @@ def create_app() -> FastAPI:
                 beat_times_secs: list[float] = [float(t) for t in (beat_info.get('beat_times') or [])]
                 bar_start_secs: list[float] = [float(t) for t in (beat_info.get('bar_start_seconds') or [])]
 
-                info = sf.info(str(audio_path))
+                info = sf.info(str(work_audio_path))
                 clip_duration = float(info.duration)
 
                 # Step 4 — Vocal Note Transcription & Regulation
+                _raise_if_superseded()
+                _update_job(0.64, '[4/6] 正在转写人声主旋律音符…')
                 from subpkgs.singing_lyrics import filter_pre_lyric_bleed_notes
                 first_lyric_sec = word_boundaries[0] if word_boundaries else None
                 word_boundaries = [t for t in word_boundaries if t >= beat_origin]
@@ -1792,6 +1843,8 @@ def create_app() -> FastAPI:
                         notes = raw_notes
 
                 # Step 5 — Hybrid Key & Base Harmony Extraction:
+                _raise_if_superseded()
+                _update_job(0.82, '[5/6] 正在识别伴奏和弦与调性…')
                 # Extract true accompaniment chords & concert key when accompaniment is audible;
                 # fall back automatically to vocal key + melody-conditioned harmony on pure a-cappella.
                 tonic_pc, is_minor = 0, False
@@ -1851,7 +1904,7 @@ def create_app() -> FastAPI:
                 rel_major_pc = (tonic_pc + 3) % 12 if is_minor else tonic_pc
                 rel_tonic = NAMES[rel_major_pc]
                 project = Project(
-                    title=audio_path.stem, tonic=rel_tonic, meter=meter, bpm=bpm, beat_origin=beat_origin,
+                    title=song_title, tonic=rel_tonic, meter=meter, bpm=bpm, beat_origin=beat_origin,
                     clip_duration=clip_duration, source=str(audio_path),
                     audio={'vocals': stems['vocals']},
                     notes=notes, reference_notes=deepcopy(notes),
@@ -1894,6 +1947,8 @@ def create_app() -> FastAPI:
                 project.warnings = list(stage_warnings)
 
                 # Step 6 — Apply session state and align lyrics when raw_lyrics or word_timestamps are available
+                _raise_if_superseded()
+                _update_job(0.94, '[6/6] 正在生成六线吉他编配与出版级总谱…')
                 rec_init = (
                     recommend_artistry(project, base_chords, bar_dyn)
                     if callable(recommend_artistry)
@@ -1951,25 +2006,28 @@ def create_app() -> FastAPI:
                             project.warnings = list(stage_warnings)
                     candidate.reference_note_lyrics = list(candidate.note_lyrics)
                 with application.state.session_lock:
-                    if my_generation != application.state.project_generation:
-                        application.state.jobs[job_id] = {
-                            'status': 'superseded',
-                            'progress': 1.0,
-                            'message': '分析结果已被更新的曲目或上传请求取代',
-                        }
-                        return
+                    if my_upload_gen != application.state.upload_generation:
+                        raise _UploadSuperseded()
                     mutate(_apply)
-                    application.state.jobs[job_id] = {
-                        'status': 'done',
-                        'degraded': bool(stage_warnings),
-                        'progress': 1.0,
-                        'message': '已完成分析' if not stage_warnings else f'已完成分析（部分环节降级：{"; ".join(stage_warnings)}）',
-                        'warnings': list(stage_warnings),
-                        'lyric_extraction_failed': lyric_extraction_failed,
-                        'harmony_synthesis_failed': harmony_synthesis_failed,
-                    }
+                    _update_job(
+                        1.0,
+                        '已完成分析' if not stage_warnings else f'已完成分析（部分环节降级：{"; ".join(stage_warnings)}）',
+                        status='done',
+                        degraded=bool(stage_warnings),
+                        warnings=list(stage_warnings),
+                        lyric_extraction_failed=lyric_extraction_failed,
+                        harmony_synthesis_failed=harmony_synthesis_failed,
+                    )
+                if work_audio_path != audio_path:
+                    Path(work_audio_path).unlink(missing_ok=True)
+                if acc_wav and Path(acc_wav) != Path(stems['vocals']) and Path(acc_wav).parent == (upload_dir / 'stems'):
+                    Path(acc_wav).unlink(missing_ok=True)
+            except _UploadSuperseded:
+                _update_job(1.0, '分析结果已被更新的曲目或上传请求取代', status='superseded')
+                shutil.rmtree(upload_dir, ignore_errors=True)
             except Exception as exc:
-                application.state.jobs[job_id] = {'status': 'error', 'progress': 1.0, 'message': str(exc)}
+                _update_job(1.0, str(exc), status='error')
+                shutil.rmtree(upload_dir, ignore_errors=True)
 
         threading.Thread(target=_worker, daemon=True).start()
         return {'job_id': job_id}

@@ -41,7 +41,8 @@ def load_models(device='cpu'):
         from modules.rosvot.rosvot import MidiExtractor, WordbdExtractor
         from modules.pe.rmvpe import RMVPE
         from utils.audio.mel import MelNet
-        torch.set_num_threads(min(4,torch.get_num_threads()))
+        if torch.get_num_threads() > 16:
+            torch.set_num_threads(16)
         hp=yaml.safe_load((ckpts/'rosvot'/'config.yaml').read_text(encoding='utf-8'))
         wp=yaml.safe_load((ckpts/'rwbd'/'config.yaml').read_text(encoding='utf-8'))
         hp['note_bd_threshold']=.5

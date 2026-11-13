@@ -2061,6 +2061,186 @@ class ForensicRegressionTests(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_offline_mdx_stem_separation_and_whisper_int8_routing(self):
+        """Verify CPU/frozen stem separation uses fast MDX ONNX (DirectML/CPU) rather than 35-min CPU RoFormer,
+        decodes containers via ffmpeg fallback, loads local whisper-small-int8 offline, and preserves CPU threads."""
+        import shutil
+        import subprocess
+        import wave
+        import numpy as np
+        import torch
+        from subpkgs.stem_mir import separator_engine as sep_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            if shutil.which("ffmpeg"):
+                sr = 22050
+                wav_src = tmp_p / "src.wav"
+                t = np.linspace(0.0, 1.0, sr, endpoint=False, dtype=np.float32)
+                pcm = (0.4 * np.sin(2.0 * np.pi * 440.0 * t) * 32767.0).astype("<i2")
+                with wave.open(str(wav_src), "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sr)
+                    wf.writeframes(pcm.tobytes())
+                m4a_src = tmp_p / "src.m4a"
+                subprocess.run(
+                    ["ffmpeg", "-nostdin", "-y", "-i", str(wav_src), "-c:a", "aac", str(m4a_src)],
+                    check=True,
+                    capture_output=True,
+                )
+                samples_m4a, sr_m4a = sep_mod._read_audio(m4a_src)
+                self.assertGreater(samples_m4a.shape[0], 10000)
+                self.assertEqual(sr_m4a, 44100)
+
+            in_wav = tmp_p / "mix_in.wav"
+            t2 = np.linspace(0.0, 1.0, 22050, endpoint=False, dtype=np.float32)
+            pcm2 = (0.5 * np.sin(2.0 * np.pi * 330.0 * t2) * 32767.0).astype("<i2")
+            with wave.open(str(in_wav), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(22050)
+                wf.writeframes(pcm2.tobytes())
+
+            loaded_models = []
+            configured_providers = []
+
+            class _FakeSeparator:
+                def __init__(self, output_dir=None, **kwargs):
+                    self.output_dir = Path(output_dir)
+                    self.onnx_execution_provider = ["CPUExecutionProvider"]
+
+                def load_model(self, model_filename=None):
+                    loaded_models.append(model_filename)
+                    configured_providers.append(list(self.onnx_execution_provider))
+
+                def separate(self, audio_file_path, custom_output_names=None):
+                    for stem_out in ("vocals.wav", "no_vocals.wav"):
+                        shutil.copy2(in_wav, self.output_dir / stem_out)
+                    return ["vocals.wav", "no_vocals.wav"]
+
+            from unittest.mock import patch
+            import onnxruntime as ort
+            with (
+                patch.object(sep_mod, "resolve_device", return_value="cpu"),
+                patch("audio_separator.separator.Separator", _FakeSeparator),
+                patch.object(ort, "get_available_providers", return_value=["DmlExecutionProvider", "CPUExecutionProvider"]),
+            ):
+                res = sep_mod.separate_stems(in_wav, tmp_p / "out_stems", prefer_cuda=True)
+                self.assertEqual(loaded_models, ["UVR_MDXNET_KARA_2.onnx"])
+                self.assertEqual(configured_providers[0][0], "DmlExecutionProvider")
+                self.assertEqual(res["backend"], "audio_separator")
+                self.assertEqual(res["device"], "directml")
+
+            orig_threads = torch.get_num_threads()
+            try:
+                torch.set_num_threads(8)
+                import singing_model
+                import vocal_activity
+                if singing_model.ready():
+                    singing_model._MODELS.clear()
+                    singing_model.load_models("cpu")
+                if vocal_activity.ready():
+                    vocal_activity._MODEL = None
+                    vocal_activity.load_model()
+                self.assertEqual(torch.get_num_threads(), 8)
+            finally:
+                torch.set_num_threads(orig_threads)
+
+            # Verify offline _try_mms_fa bypasses 1.26 GB torch.hub download when model.pt is absent,
+            # and verify both lyric_aligner.transcribe_word_timestamps & lyrics.recognize route to local whisper-small-int8 offline
+            from types import SimpleNamespace
+            import lyrics as lyrics_mod
+            from runtime_paths import resolve_model_path
+            from subpkgs.singing_lyrics import lyric_aligner as la_mod
+
+            real_int8 = resolve_model_path("whisper-small-int8", require_writable_parent=False)
+            if (real_int8 / "model.bin").is_file():
+                from faster_whisper import WhisperModel as RealWhisperModel
+
+                real_wm = RealWhisperModel(str(real_int8), device="cpu", compute_type="int8", local_files_only=True)
+                self.assertIsNotNone(real_wm)
+
+            empty_cache = tmp_p / "empty_model_cache"
+            fake_int8_dir = empty_cache / "whisper-small-int8"
+            fake_int8_dir.mkdir(parents=True, exist_ok=True)
+            (fake_int8_dir / "model.bin").write_bytes(b"ct2-int8-stub")
+
+            whisper_calls = []
+
+            class _RecordingWhisperModel:
+                def __init__(self, model_size_or_path, **kwargs):
+                    whisper_calls.append((str(model_size_or_path), dict(kwargs)))
+
+                def transcribe(self, _audio, **_kwargs):
+                    words = [
+                        SimpleNamespace(word="今", start=0.10, end=0.35, probability=0.95),
+                        SimpleNamespace(word="夜", start=0.36, end=0.65, probability=0.93),
+                    ]
+                    seg = SimpleNamespace(
+                        start=0.10,
+                        end=0.65,
+                        text="今夜",
+                        avg_logprob=-0.2,
+                        no_speech_prob=0.02,
+                        words=words,
+                    )
+                    info = SimpleNamespace(duration=1.0)
+                    return [seg], info
+
+            prev_lyrics_model = lyrics_mod._MODEL
+            try:
+                with (
+                    patch.dict(
+                        "os.environ",
+                        {"MELODYDESK_MODEL_CACHE": str(empty_cache), "HF_HUB_OFFLINE": "1"},
+                        clear=False,
+                    ),
+                    patch("faster_whisper.WhisperModel", _RecordingWhisperModel),
+                    patch.object(lyrics_mod, "filter_vocal_lines", side_effect=lambda lines, *_a, **_kw: lines),
+                ):
+                    la_mod._MMS_FA_CACHE.clear()
+                    self.assertIsNone(la_mod._try_mms_fa(in_wav, "今夜", prefer_cuda=False))
+
+                    aligned_offline = la_mod.transcribe_word_timestamps(
+                        in_wav, prefer_cuda=False, ground_truth_text="今夜"
+                    )
+                    self.assertGreaterEqual(len(aligned_offline["word_timestamps"]), 2)
+
+                    lyrics_mod._MODEL = None
+                    rec_lines = lyrics_mod.recognize(in_wav)
+                    self.assertEqual(len(rec_lines), 1)
+                    self.assertEqual(rec_lines[0]["text"], "今夜")
+
+                    self.assertEqual(len(whisper_calls), 2)
+                    expected_int8_path = str(fake_int8_dir.resolve())
+                    for called_path, called_kw in whisper_calls:
+                        self.assertEqual(called_path, expected_int8_path)
+                        self.assertTrue(called_kw.get("local_files_only"))
+                        self.assertEqual(called_kw.get("device"), "cpu")
+                        self.assertEqual(called_kw.get("compute_type"), "int8")
+                        self.assertNotIn("download_root", called_kw)
+            finally:
+                lyrics_mod._MODEL = prev_lyrics_model
+
+            # Verify Undo / Restore Reference do NOT cancel an in-flight upload_generation, while load_demo does
+            from fastapi.testclient import TestClient
+            from subpkgs.score_web.server import create_app
+
+            app_u = create_app()
+            client_g = TestClient(app_u)
+            gen0 = app_u.state.upload_generation
+            client_g.post("/api/reharmonize", json={"preset": "emotional_pop"})
+            client_g.post("/api/undo")
+            client_g.post("/api/restore_reference")
+            self.assertEqual(app_u.state.upload_generation, gen0)
+            r_bad = client_g.post("/api/load_demo", json={"demo": "__invalid_demo__"})
+            self.assertEqual(r_bad.status_code, 422)
+            self.assertEqual(app_u.state.upload_generation, gen0)
+            r_ok = client_g.post("/api/load_demo", json={"demo": "manual"})
+            self.assertEqual(r_ok.status_code, 200)
+            self.assertEqual(app_u.state.upload_generation, gen0 + 1)
+
 
 if __name__ == "__main__":
     unittest.main()

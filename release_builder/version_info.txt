@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2, 0, 0, 0),
-    prodvers=(2, 0, 0, 0),
+    filevers=(2, 0, 1, 0),
+    prodvers=(2, 0, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,12 +17,12 @@ VSVersionInfo(
         '080404b0',
         [StringStruct('CompanyName', 'MelodyDesk Studio'),
         StringStruct('FileDescription', '弦语 MelodyDesk 2.0 · AI 人声驱动木吉他编配与六线谱工作台'),
-        StringStruct('FileVersion', '2.0.0.0'),
+        StringStruct('FileVersion', '2.0.1.0'),
         StringStruct('InternalName', 'MelodyDesk'),
         StringStruct('LegalCopyright', 'Copyright (c) 2026 Kangkai Liang'),
         StringStruct('OriginalFilename', 'MelodyDesk.exe'),
         StringStruct('ProductName', 'MelodyDesk 2.0 Urtext Studio'),
-        StringStruct('ProductVersion', '2.0.0')])
+        StringStruct('ProductVersion', '2.0.1')])
       ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
   ]

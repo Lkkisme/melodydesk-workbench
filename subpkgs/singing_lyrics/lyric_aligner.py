@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 import logging
 import math
+import os
 import re
 import sys
 import unicodedata
@@ -214,6 +215,16 @@ def _try_mms_fa(audio_path: Path, ground_truth_text: str, prefer_cuda: bool) -> 
         import torch
         import torchaudio
         import librosa
+        from runtime_paths import is_frozen, resolve_model_path
+
+        mms_ckpt = resolve_model_path("hub", "checkpoints", "model.pt", require_writable_parent=False)
+        offline_mode = (
+            is_frozen()
+            or os.environ.get("HF_HUB_OFFLINE", "").strip() == "1"
+            or os.environ.get("MELODYDESK_OFFLINE", "").strip() == "1"
+        )
+        if not mms_ckpt.is_file() and offline_mode:
+            return None
 
         device = "cuda" if prefer_cuda and torch.cuda.is_available() else "cpu"
 
@@ -222,7 +233,12 @@ def _try_mms_fa(audio_path: Path, ground_truth_text: str, prefer_cuda: bool) -> 
         else:
             bundle = torchaudio.pipelines.MMS_FA
             dictionary = bundle.get_dict()
-            model = bundle.get_model(with_star=True).to(device).eval()
+            if mms_ckpt.is_file():
+                ckpt_dir = mms_ckpt.parent
+            else:
+                ckpt_dir = resolve_model_path("hub", "checkpoints", require_writable_parent=True)
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+            model = bundle.get_model(with_star=True, dl_kwargs={"model_dir": str(ckpt_dir)}).to(device).eval()
             aligner = bundle.get_aligner()
             _MMS_FA_CACHE[device] = (bundle, dictionary, model, aligner)
 
@@ -661,19 +677,48 @@ def transcribe_word_timestamps(
             return mms_result
         failures.append("mms-fa: fell through")
 
-    devices = ["cuda", "cpu"] if prefer_cuda else ["cpu"]
+    from runtime_paths import is_frozen, resolve_model_path
+
+    cuda_usable = False
+    if prefer_cuda:
+        try:
+            import torch
+
+            cuda_usable = bool(torch.cuda.is_available())
+        except ImportError:
+            cuda_usable = False
+        if not cuda_usable and not is_frozen():
+            try:
+                import ctranslate2
+
+                cuda_usable = int(ctranslate2.get_cuda_device_count()) > 0
+            except Exception:
+                cuda_usable = False
+    devices = ["cuda", "cpu"] if cuda_usable else ["cpu"]
+    audio_16k = None
     for device in devices:
         try:
             import librosa
             import numpy as np
             from faster_whisper import WhisperModel
-            from runtime_paths import resolve_model_path
 
-            audio_16k, _ = librosa.load(str(audio_path), sr=16000, mono=True)
-            model = WhisperModel(
-                "small", device=device,
-                compute_type="float16" if device == "cuda" else "int8",
-                download_root=str(resolve_model_path("whisper", require_writable_parent=True)))
+            if audio_16k is None:
+                audio_16k, _ = librosa.load(str(audio_path), sr=16000, mono=True)
+            local_int8 = resolve_model_path("whisper-small-int8", require_writable_parent=False)
+            if (local_int8 / "model.bin").is_file():
+                model = WhisperModel(
+                    str(local_int8),
+                    device=device,
+                    compute_type="int8_float16" if device == "cuda" else "int8",
+                    local_files_only=True,
+                )
+            else:
+                model = WhisperModel(
+                    "small",
+                    device=device,
+                    compute_type="float16" if device == "cuda" else "int8",
+                    download_root=str(resolve_model_path("whisper", require_writable_parent=True)),
+                )
             gt_toks = tokenize_lyrics(ground_truth_text) if ground_truth_text else []
             prompt_tokens = [tok["text"] for tok in gt_toks]
             prompt_hint = _join_tokens(prompt_tokens) if prompt_tokens else None

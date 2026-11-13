@@ -3,9 +3,7 @@ from pathlib import Path
 import threading
 import os
 from runtime_paths import resolve_model_path
-CACHE=resolve_model_path('whisper', require_writable_parent=True)
-os.environ.setdefault('HF_HOME',str(CACHE))
-os.environ.setdefault('HF_HUB_DISABLE_XET','1')
+
 _MODEL=None
 _LOCK=threading.Lock()
 
@@ -24,7 +22,15 @@ def recognize(path,cancel_check=lambda:None,progress=lambda p,s:None):
     progress(3,'加载歌词模型；首次使用需下载 small 多语言模型…')
     with _LOCK:
         if _MODEL is None:
-            _MODEL=WhisperModel('small',device='cpu',compute_type='int8',cpu_threads=4,download_root=str(CACHE))
+            local_int8 = resolve_model_path('whisper-small-int8', require_writable_parent=False)
+            if (local_int8 / 'model.bin').is_file():
+                _MODEL = WhisperModel(str(local_int8), device='cpu', compute_type='int8', local_files_only=True)
+            else:
+                cache_dir = resolve_model_path('whisper', require_writable_parent=True)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                os.environ.setdefault('HF_HOME', str(cache_dir))
+                os.environ.setdefault('HF_HUB_DISABLE_XET', '1')
+                _MODEL = WhisperModel('small', device='cpu', compute_type='int8', download_root=str(cache_dir))
     segments,info=_MODEL.transcribe(str(path),language='zh',beam_size=3,word_timestamps=True,
         condition_on_previous_text=False,vad_filter=False,temperature=0,
         no_speech_threshold=.6,compression_ratio_threshold=2.4)
