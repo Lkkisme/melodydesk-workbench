@@ -9,15 +9,22 @@ import sys
 import threading
 import numpy as np
 from music import Note
+from runtime_paths import get_app_root, resolve_model_path
 
-ROOT = Path(__file__).resolve().parent
-CHECKPOINTS = ROOT.parents[1] / 'work' / 'model-cache' / 'rosvot' / 'checkpoints'
+ROOT = get_app_root()
+_DEFAULT_CHECKPOINTS = resolve_model_path('rosvot', 'checkpoints')
+CHECKPOINTS = _DEFAULT_CHECKPOINTS
 _MODELS = {}
 _LOCK = threading.Lock()
 
 
+def _active_checkpoints():
+    return CHECKPOINTS if CHECKPOINTS != _DEFAULT_CHECKPOINTS else resolve_model_path('rosvot', 'checkpoints')
+
+
 def ready():
-    return all((CHECKPOINTS/name/'model.pt').is_file() for name in ('rosvot','rwbd','rmvpe')) and all((CHECKPOINTS/name/'config.yaml').is_file() for name in ('rosvot','rwbd'))
+    ckpts = _active_checkpoints()
+    return all((ckpts/name/'model.pt').is_file() for name in ('rosvot','rwbd','rmvpe')) and all((ckpts/name/'config.yaml').is_file() for name in ('rosvot','rwbd'))
 
 
 def load_models(device='cpu'):
@@ -27,6 +34,7 @@ def load_models(device='cpu'):
             return _MODELS[device]
         if not ready():
             raise RuntimeError('演唱识别模型尚未安装，请运行 install_singing_model.py；可先选择基础模式。')
+        ckpts = _active_checkpoints()
         sys.path.insert(0,str(ROOT/'third_party'/'rosvot'))
         import torch
         import yaml
@@ -34,17 +42,17 @@ def load_models(device='cpu'):
         from modules.pe.rmvpe import RMVPE
         from utils.audio.mel import MelNet
         torch.set_num_threads(min(4,torch.get_num_threads()))
-        hp=yaml.safe_load((CHECKPOINTS/'rosvot'/'config.yaml').read_text(encoding='utf-8'))
-        wp=yaml.safe_load((CHECKPOINTS/'rwbd'/'config.yaml').read_text(encoding='utf-8'))
+        hp=yaml.safe_load((ckpts/'rosvot'/'config.yaml').read_text(encoding='utf-8'))
+        wp=yaml.safe_load((ckpts/'rwbd'/'config.yaml').read_text(encoding='utf-8'))
         hp['note_bd_threshold']=.5
         wp['word_bd_threshold']=.5
         model=MidiExtractor(hp).eval().to(device)
         words=WordbdExtractor(wp).eval().to(device)
         for name,network in [('rosvot',model),('rwbd',words)]:
-            state=torch.load(CHECKPOINTS/name/'model.pt',map_location='cpu',weights_only=True)['state_dict']
+            state=torch.load(ckpts/name/'model.pt',map_location='cpu',weights_only=True)['state_dict']
             state=state['model'] if 'model' in state else {k[6:]:v for k,v in state.items() if k.startswith('model.')}
             network.load_state_dict(state,strict=True)
-        pitch=RMVPE(str(CHECKPOINTS/'rmvpe'/'model.pt'),device=device)
+        pitch=RMVPE(str(ckpts/'rmvpe'/'model.pt'),device=device)
         melnet=MelNet(hp,device=device)
         loaded=(hp,wp,model,words,pitch,melnet)
         if not isinstance(_MODELS, dict):

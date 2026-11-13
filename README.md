@@ -42,7 +42,15 @@ flowchart LR
 
 ## 二、 快速启动
 
-### 1. 环境准备
+### 0. Windows 免安装独立便携版（推荐，零环境依赖）
+前往 [**GitHub Releases**](https://github.com/Lkkisme/melodydesk-workbench/releases/latest) 下载最新 `MelodyDesk-v2.0.0-win-x64.zip`，完整解压至任意目录后双击 **`MelodyDesk.exe`** 即可启动（已内置 Python 运行时、FFmpeg、987 个原木吉他采样、7 首真唱全曲曲库及离线节拍/和声/转谱模型权重，无需安装 Python 或配置环境变量）。
+
+如需从源码自行打包 Windows `.exe` 发行包：
+```powershell
+python release_builder/build_release.py --version 2.0.0
+```
+
+### 1. 源码开发环境准备
 需要 **Python 3.11 / 3.12** 与 **FFmpeg**（已加入系统 `PATH`）。安装依赖：
 
 ```powershell

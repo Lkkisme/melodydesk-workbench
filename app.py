@@ -11,12 +11,17 @@ import winsound
 
 # The host's Tcl resolves some absolute Windows paths incorrectly. Relative
 # script-library paths work with the project's copied runtime libraries.
-_local_tcl = Path(__file__).resolve().parents[2] / 'work' / 'runtime' / 'tcl'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from runtime_paths import get_install_root, get_work_root
+_local_tcl = get_work_root() / 'runtime' / 'tcl'
 if _local_tcl.is_dir():
-    os.chdir(Path(__file__).resolve().parents[2])
-    os.environ['TCL_LIBRARY'] = os.path.relpath(_local_tcl / 'tcl8.6').replace('\\', '/')
-    os.environ['TK_LIBRARY'] = os.path.relpath(_local_tcl / 'tk8.6').replace('\\', '/')
+    os.chdir(get_install_root())
+    for _env_k, _sub in (('TCL_LIBRARY', 'tcl8.6'), ('TK_LIBRARY', 'tk8.6')):
+        _target = _local_tcl / _sub
+        try:
+            os.environ[_env_k] = os.path.relpath(_target).replace('\\', '/')
+        except ValueError:
+            os.environ[_env_k] = str(_target.resolve()).replace('\\', '/')
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox

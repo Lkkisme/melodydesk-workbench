@@ -484,12 +484,10 @@ def track_beats_and_downbeats(
     duration = len(y) / sr
     beats, downbeats, backend = None, None, "librosa"
     try:
-        import os
         from beat_this.inference import File2Beats
+        from runtime_paths import resolve_model_path
 
-        env_cache = os.environ.get("MELODYDESK_MODEL_CACHE", "").strip()
-        cache_root = Path(env_cache) if env_cache else (Path(__file__).resolve().parents[4] / "work" / "model-cache")
-        ckpt_file = cache_root / "hub" / "checkpoints" / "beat_this-final0.ckpt"
+        ckpt_file = resolve_model_path("hub", "checkpoints", "beat_this-final0.ckpt")
         ckpt_arg = str(ckpt_file) if ckpt_file.is_file() else "final0"
         tracker = File2Beats(checkpoint_path=ckpt_arg, device=resolve_device(prefer_cuda))
         candidate_beats, candidate_downbeats = tracker(str(audio_path))

@@ -26,12 +26,15 @@ from .alphatex_builder import to_alphatex
 from .yoopu_svg_renderer import render_publication_score_html
 from ._score_timing import build_score_timeline
 
-APP_ROOT = Path(__file__).resolve().parents[2]
-INSTALL_ROOT = APP_ROOT.parents[1]
+from runtime_paths import get_app_root, get_install_root, get_work_root, get_writable_work_root
+
+APP_ROOT = get_app_root()
+INSTALL_ROOT = get_install_root()
+WORK_ROOT = get_work_root()
 STATIC_ROOT = APP_ROOT / 'static'
 EXAMPLE_PROJECT = INSTALL_ROOT / 'examples' / 'demo-project.json'
-SIMULATION_ROOT = INSTALL_ROOT / 'work' / 'simulation_demo'
-REPERTOIRE_AUDIO_ROOT = INSTALL_ROOT / 'work' / 'repertoire_audio'
+SIMULATION_ROOT = WORK_ROOT / 'simulation_demo'
+REPERTOIRE_AUDIO_ROOT = WORK_ROOT / 'repertoire_audio'
 _DEFAULT_REPERTOIRE_MANIFEST = REPERTOIRE_AUDIO_ROOT / 'repertoire_manifest.json'
 REPERTOIRE_MANIFEST = _DEFAULT_REPERTOIRE_MANIFEST
 PORTABLE_REPERTOIRE_MANIFEST = APP_ROOT / 'data' / 'repertoire_manifest.json'
@@ -456,7 +459,7 @@ def _resolve_repertoire_path(raw: str | Path | None) -> Path | None:
         return direct.resolve()
     if not direct.is_absolute():
         rel = Path(norm.lstrip('/'))
-        for base in (INSTALL_ROOT, APP_ROOT, REPERTOIRE_AUDIO_ROOT):
+        for base in (INSTALL_ROOT, WORK_ROOT.parent, APP_ROOT, REPERTOIRE_AUDIO_ROOT):
             cand = base / rel
             if cand.is_file():
                 return cand.resolve()
@@ -1674,7 +1677,7 @@ def create_app() -> FastAPI:
     async def analyze_audio(file: UploadFile = File(...), lyrics: str = Form('')):
         import uuid
         job_id = uuid.uuid4().hex
-        upload_dir = INSTALL_ROOT / 'work' / 'uploads' / job_id
+        upload_dir = get_writable_work_root() / 'uploads' / job_id
         upload_dir.mkdir(parents=True, exist_ok=True)
         audio_path = upload_dir / (Path(file.filename or 'song.wav').name)
         audio_path.write_bytes(await file.read())

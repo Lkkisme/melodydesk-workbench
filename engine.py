@@ -9,10 +9,11 @@ import time
 import uuid
 import wave
 from music import Note, Project, performance_timing
+from runtime_paths import get_app_root, get_model_cache_root, get_writable_work_root
 
-ROOT = Path(__file__).resolve().parent
-WORK = ROOT.parent.parent / 'work'
-CACHE = WORK / 'model-cache'
+ROOT = get_app_root()
+WORK = get_writable_work_root()
+CACHE = get_model_cache_root(require_writable=True)
 JOBS = WORK / 'audio-jobs'
 os.environ.setdefault('TORCH_HOME', str(CACHE))
 os.environ.setdefault('NUMBA_CACHE_DIR', str(WORK / 'numba-cache'))

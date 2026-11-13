@@ -166,9 +166,9 @@ def separate_stems(
         try:
             import torch
             from audio_separator.separator import Separator
+            from runtime_paths import resolve_model_path
 
-            env_cache = os.environ.get("MELODYDESK_MODEL_CACHE", "").strip()
-            roformer_cache = Path(env_cache) / "roformer" if env_cache else (Path(__file__).resolve().parents[4] / "work" / "model-cache" / "roformer")
+            roformer_cache = resolve_model_path("roformer", require_writable_parent=True)
             try:
                 roformer_cache.mkdir(parents=True, exist_ok=True)
                 separator = Separator(output_dir=str(tier_dir), output_format="WAV", model_file_dir=str(roformer_cache))
@@ -210,7 +210,8 @@ def separate_stems(
             backend = "audio_separator"
         except Exception as exc:
             logger.warning("audio_separator tier failed: %s", exc)
-    if pair is None:
+    from runtime_paths import is_frozen
+    if pair is None and not is_frozen():
         with tempfile.TemporaryDirectory(dir=out_dir) as temporary:
             tier_dir = Path(temporary)
             try:

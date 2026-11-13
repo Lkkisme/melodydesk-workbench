@@ -32,6 +32,8 @@ from .chord_voicing import STANDARD_TUNING, _integer
 
 
 def _resolve_samples_dirs() -> list[Path]:
+    from runtime_paths import get_app_root, get_work_root
+
     dirs: list[Path] = []
     env_dir = os.environ.get("MELODYDESK_GUITAR_SAMPLES")
     if env_dir:
@@ -39,7 +41,12 @@ def _resolve_samples_dirs() -> list[Path]:
         if cand.is_dir():
             dirs.append(cand.resolve())
     here = Path(__file__).resolve()
-    fallback_cands = [here.parents[2] / "guitar_samples"]
+    fallback_cands = [
+        get_work_root() / "guitar_samples",
+        get_app_root() / "guitar_samples",
+    ]
+    if len(here.parents) >= 3:
+        fallback_cands.append(here.parents[2] / "guitar_samples")
     if len(here.parents) >= 5:
         fallback_cands.append(here.parents[4] / "work" / "guitar_samples")
     if len(here.parents) >= 4:

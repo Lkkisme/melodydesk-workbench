@@ -1,6 +1,9 @@
 import numpy as np
 import torch
-import pretty_midi
+try:
+    import pretty_midi
+except ImportError:
+    pretty_midi = None
 
 def to_lf0(f0):
     f0[f0 < 1.0e-5] = 1.0e-6

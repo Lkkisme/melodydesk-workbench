@@ -667,13 +667,13 @@ def transcribe_word_timestamps(
             import librosa
             import numpy as np
             from faster_whisper import WhisperModel
+            from runtime_paths import resolve_model_path
 
             audio_16k, _ = librosa.load(str(audio_path), sr=16000, mono=True)
             model = WhisperModel(
                 "small", device=device,
                 compute_type="float16" if device == "cuda" else "int8",
-                download_root=str(Path(__file__).resolve().parents[2].parents[1]
-                                  / "work" / "model-cache" / "whisper"))
+                download_root=str(resolve_model_path("whisper", require_writable_parent=True)))
             gt_toks = tokenize_lyrics(ground_truth_text) if ground_truth_text else []
             prompt_tokens = [tok["text"] for tok in gt_toks]
             prompt_hint = _join_tokens(prompt_tokens) if prompt_tokens else None

@@ -11,3 +11,7 @@ scratch_vm/
 guitar_samples/
 guitar_samples
 
+build/
+dist/
+/work/
+/release_stage/

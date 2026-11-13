@@ -114,16 +114,14 @@ def _get_btc_runtime():
             return _BTC_RUNTIME
         if _BTC_LOAD_FAILED:
             return None
+        from runtime_paths import candidate_model_cache_roots
+
         cands = []
         env_dir = os.environ.get("MELODYDESK_BTC_DIR")
         if env_dir:
             cands.append(Path(env_dir))
-        repo_root = Path(__file__).resolve().parents[2]
-        cands.extend([
-            repo_root.parent.parent / "work" / "model-cache" / "btc-chord",
-            repo_root / "model-cache" / "btc-chord",
-            Path.home() / ".cache" / "melodydesk" / "btc-chord",
-        ])
+        for cache_root in candidate_model_cache_roots():
+            cands.append(cache_root / "btc-chord")
         btc_dir = next((p.resolve() for p in cands if (p / "btc_model_large_voca.pt").is_file() and (p / "btc_src").is_dir()), None)
         if btc_dir is None:
             _BTC_LOAD_FAILED = True

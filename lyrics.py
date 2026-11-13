@@ -2,8 +2,8 @@
 from pathlib import Path
 import threading
 import os
-ROOT=Path(__file__).resolve().parents[2]
-CACHE=ROOT/'work/model-cache/whisper'
+from runtime_paths import resolve_model_path
+CACHE=resolve_model_path('whisper', require_writable_parent=True)
 os.environ.setdefault('HF_HOME',str(CACHE))
 os.environ.setdefault('HF_HUB_DISABLE_XET','1')
 _MODEL=None

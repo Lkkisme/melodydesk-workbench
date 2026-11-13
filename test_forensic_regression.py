@@ -1976,6 +1976,91 @@ class ForensicRegressionTests(unittest.TestCase):
         self.assertEqual(r_atlas.status_code, 200)
         self.assertIn("MelodyDesk 2.0", r_atlas.text)
 
+    def test_frozen_portable_runtime_paths_and_desktop_launcher(self):
+        import logging
+        import socket
+        import tempfile
+        from unittest.mock import patch
+        import melodydesk_desktop as desk
+        import runtime_paths as rp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_install = Path(tmp) / "MelodyDesk"
+            fake_meipass = fake_install / "_internal"
+            fake_exe = fake_install / "MelodyDesk.exe"
+            fake_meipass.mkdir(parents=True)
+            fake_exe.write_bytes(b"MZ")
+
+            with patch.dict("os.environ", {"MELODYDESK_HOME": "", "MELODYDESK_WORK_DIR": "", "MELODYDESK_MODEL_CACHE": ""}, clear=False):
+                with patch.object(rp.sys, "frozen", True, create=True), patch.object(rp.sys, "_MEIPASS", str(fake_meipass), create=True), patch.object(rp.sys, "executable", str(fake_exe)):
+                    self.assertTrue(rp.is_frozen())
+                    self.assertEqual(rp.get_app_root(), fake_meipass.resolve())
+                    self.assertEqual(rp.get_install_root(), fake_install.resolve())
+                    self.assertEqual(rp.get_work_root(), (fake_install / "work").resolve())
+                    self.assertEqual(rp.get_writable_work_root(), (fake_install / "work").resolve())
+
+                # Simulate read-only installation directory -> fallback to LOCALAPPDATA
+                local_app = Path(tmp) / "LocalAppData"
+                local_app.mkdir()
+                with patch.dict("os.environ", {"LOCALAPPDATA": str(local_app)}, clear=False), patch.object(rp, "_is_dir_writable", side_effect=lambda p: str(local_app) in str(p)):
+                    self.assertEqual(rp.get_writable_work_root(), (local_app / "MelodyDesk" / "work").resolve())
+
+        # Verify `--noconsole` log stream adapter never raises on isatty()
+        records: list[str] = []
+        test_logger = logging.getLogger("melodydesk.test.stream")
+        test_logger.handlers.clear()
+        test_logger.propagate = False
+
+        class _MemHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        test_logger.addHandler(_MemHandler())
+        test_logger.setLevel(logging.INFO)
+        stream = desk._LogStreamAdapter(test_logger, logging.INFO)
+        self.assertFalse(stream.isatty())
+        stream.write("hello\nworld")
+        stream.flush()
+        self.assertEqual(records, ["hello", "world"])
+
+        # Verify automatic port fallback when preferred port is occupied
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen(1)
+            busy_port = occupied.getsockname()[1]
+            chosen = desk.select_listen_port("127.0.0.1", busy_port, explicit_port=False)
+            self.assertGreater(chosen, busy_port)
+            with self.assertRaises(OSError):
+                desk.select_listen_port("127.0.0.1", busy_port, explicit_port=True)
+
+        # Verify probe_melodydesk_server matches real server.py /api/state schema ('publication_html' + 'arrangement')
+        from fastapi.testclient import TestClient
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import json as _json
+        import threading as _threading
+        from subpkgs.score_web import server as _srv
+
+        state_bytes = _json.dumps(TestClient(_srv.create_app()).get("/api/state").json()).encode("utf-8")
+
+        class _StateHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(state_bytes)
+
+            def log_message(self, fmt, *args):
+                return
+
+        httpd = HTTPServer(("127.0.0.1", 0), _StateHandler)
+        t_srv = _threading.Thread(target=httpd.serve_forever, daemon=True)
+        t_srv.start()
+        try:
+            self.assertTrue(desk.probe_melodydesk_server("127.0.0.1", httpd.server_port, timeout=2.0))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

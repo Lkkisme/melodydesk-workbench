@@ -6,8 +6,10 @@ import shutil
 import zipfile
 import requests
 
-ROOT=Path(__file__).resolve().parents[2]
-CACHE=ROOT/'work'/'model-cache'
+from runtime_paths import get_model_cache_root, get_writable_work_root
+
+WORK=get_writable_work_root()
+CACHE=get_model_cache_root(require_writable=True)
 
 def verify(path,algorithm,expected):
     with path.open('rb') as f:
@@ -34,7 +36,7 @@ def main():
     verify(target,'md5',digest)
     if args.all:
         import gdown
-        archive=ROOT/'work'/'research'/'rosvot-checkpoints.zip'
+        archive=WORK/'research'/'rosvot-checkpoints.zip'
         archive.parent.mkdir(parents=True,exist_ok=True)
         if not archive.exists():
             temp=archive.with_suffix('.download')

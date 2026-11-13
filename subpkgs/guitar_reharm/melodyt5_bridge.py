@@ -49,16 +49,14 @@ _MEM_CACHE: dict[str, list[list[tuple[float, float, int]]]] = {}
 
 
 def _resolve_melodyt5_dir() -> Path | None:
+    from runtime_paths import candidate_model_cache_roots
+
     env_p = os.environ.get("MELODYDESK_MELODYT5_DIR")
     candidates = []
     if env_p:
         candidates.append(Path(env_p))
-    repo_root = Path(__file__).resolve().parents[2]
-    candidates.extend([
-        repo_root.parent.parent / "work" / "model-cache" / "melodyt5",
-        repo_root / "model-cache" / "melodyt5",
-        Path.home() / ".cache" / "melodydesk" / "melodyt5",
-    ])
+    for cache_root in candidate_model_cache_roots():
+        candidates.append(cache_root / "melodyt5")
     for cand in candidates:
         if (cand / "weights.pth").is_file() and (cand / "random_model").is_dir():
             return cand.resolve()
